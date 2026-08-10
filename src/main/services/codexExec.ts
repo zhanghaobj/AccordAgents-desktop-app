@@ -12,8 +12,6 @@ import type {
 import { effectiveChatAgentPermissionsForProvider, normalizeChatAgentMode, normalizeChatAgentPermissions } from "../../shared/agentPermissions";
 
 export const CODEX_APP_SERVER_MCP_TOKEN_ENV = "ACCORD_AGENTS_MCP_TOKEN";
-export const CODEX_AUTO_APPROVALS_REVIEWER = "guardian_subagent";
-
 export type CodexLiveOutputKind = "tool" | "text";
 
 export interface CodexLiveOutputEvent {
@@ -151,16 +149,14 @@ export function buildCodexExecInvocation(request: BuildCodexExecInvocationReques
       `sandbox_workspace_write.writable_roots=[${tomlString(options.remoteSandbox.gitWritableRoot)}]`
     );
   }
-  if (mode === "auto") {
-    insertCodexOptionBeforePrompt(
-      args,
-      resuming,
-      "-c",
-      `approval_policy=${tomlString("on-request")}`,
-      "-c",
-      `approvals_reviewer=${tomlString(CODEX_AUTO_APPROVALS_REVIEWER)}`
-    );
-  }
+  // `codex exec` has no interactive callback channel in AccordAgents. Always
+  // override ambient config so every one-shot and remote run fails closed.
+  insertCodexOptionBeforePrompt(
+    args,
+    resuming,
+    "-c",
+    `approval_policy=${tomlString("never")}`
+  );
   if (options.role) {
     insertCodexOptionBeforePrompt(args, resuming, "-c", `developer_instructions=${tomlString(options.role.instructions)}`);
   }

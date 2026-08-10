@@ -10,7 +10,8 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 
-  --app-header-height: 52px;
+  --app-header-height: 87px;
+  --app-header-title-offset-y: -7px;
   --app-rail-width: 90px;
   --activity-list-width: 320px;
   --app-sidebar-width: 320px;
@@ -118,6 +119,7 @@
   --app-shadow: color-mix(in srgb, var(--shadow-color) 10%, transparent);
   --highlight-color: rgb(255 255 255);
   --app-on-dark: #ffffff;
+  --plugin-brand-color: var(--app-accent);
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
