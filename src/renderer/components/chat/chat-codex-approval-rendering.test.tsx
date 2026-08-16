@@ -8,11 +8,13 @@ import {
   chatApprovalKeyboardAction,
   chatApprovalPlacement,
   chatApprovalShowsGenericSkip,
+  chatCodexApprovalShowsCancel,
   chatCodexApprovalShowsCompactResult,
   chatCodexApprovalRequest
 } from "./chat-codex-approval-presentation";
 import { ChatCodexApprovalOperation } from "./chat-codex-approval-operation";
 import { ChatCodexApprovalResult } from "./chat-codex-approval-result";
+import { chatToolPermissionAllowsChatScope, chatToolPermissionRequest } from "./chat-app-tool-data";
 
 const NOW = "2026-08-01T05:00:00.000Z";
 
@@ -44,13 +46,61 @@ test("concurrent Codex cards anchor by participant and run while the shared slot
   assert.deepEqual(placement.unanchored.map((item) => item.id), ["approval-wrong", "ordinary"]);
 });
 
-test("Codex presentation exposes only provider decisions and never adds a generic Skip or Cancel", () => {
+test("Standard Codex presentation exposes only provider decisions and never adds generic controls", () => {
   const approval = codexApproval("approval", "participant", "run");
   const request = chatCodexApprovalRequest(approval);
   assert.ok(request);
   assert.deepEqual(request.options.map((option) => option.label), ["Allow once", "Deny"]);
   assert.equal(chatApprovalShowsGenericSkip(request), false);
   assert.match(request.options[0].detail ?? "", /policy/i);
+});
+
+test("Guardian denial offers a card-only Cancel action", () => {
+  const approval = codexApproval("guardian", "participant", "run");
+  approval.request = {
+    ...(approval.request as ChatCodexApprovalRequest),
+    method: "item/autoApprovalReview/denied",
+    options: [
+      { id: "approveRetry", label: "Approve one retry", outcome: "approve" },
+      { id: "keepDenied", label: "Keep denied", outcome: "deny" }
+    ]
+  };
+  assert.equal(chatCodexApprovalShowsCancel(chatCodexApprovalRequest(approval)), true);
+});
+
+test("cancelled Guardian denial renders a compact result without the blocked command", () => {
+  const approval = codexApproval("guardian-cancelled", "participant", "run");
+  approval.status = "cancelled";
+  approval.summary = `Codex Auto Review denied: ${"very-long-command ".repeat(80)}`;
+  approval.request = {
+    ...(approval.request as ChatCodexApprovalRequest),
+    method: "item/autoApprovalReview/denied",
+    options: [
+      { id: "approveRetry", label: "Approve one retry", outcome: "approve" },
+      { id: "keepDenied", label: "Keep denied", outcome: "deny" }
+    ]
+  };
+  const renderer = create(<ChatCodexApprovalResult approval={approval} />);
+  const text = textContent(renderer.toJSON());
+  assert.match(text, /Cancelled/);
+  assert.match(text, /Closed without retrying/);
+  assert.doesNotMatch(text, /very-long-command/);
+  renderer.unmount();
+});
+
+test("Claude Auto permission prompts cannot offer chat-wide scope", () => {
+  const toolRequest = { kind: "toolPermission" as const, agentMode: "auto" as const, toolName: "Write" };
+  assert.equal(chatToolPermissionAllowsChatScope(toolRequest), false);
+  assert.equal(chatToolPermissionAllowsChatScope({ ...toolRequest, agentMode: "default" }), true);
+
+  const legacyApproval: ChatAppToolApproval = {
+    ...codexApproval("legacy-auto", "participant", "run"),
+    toolName: "app_tool_permission",
+    request: { kind: "toolPermission", toolName: "Write" }
+  };
+  const legacyToolRequest = chatToolPermissionRequest(legacyApproval, "auto");
+  assert.ok(legacyToolRequest);
+  assert.equal(chatToolPermissionAllowsChatScope(legacyToolRequest), false);
 });
 
 test("Codex approval keyboard selection stays within exact options and Enter submits", () => {
