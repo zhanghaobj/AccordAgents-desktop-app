@@ -119,7 +119,12 @@ import {
   limitChatBehaviorRulePromptText
 } from "../../shared/chatBehaviorRules";
 import { normalizeChatReasoningEffort, reasoningEffortOptionsForProvider } from "../../shared/reasoningEffort";
-import { CODEX_APPROVAL_TOOL_NAME, CODEX_GUARDIAN_DENIED_APPROVAL_METHOD, codexApprovalCancellationResult, prepareCodexApproval } from "./codexApprovals";
+import { CODEX_APPROVAL_TOOL_NAME, codexApprovalCancellationResult, prepareCodexApproval } from "./codexApprovals";
+import {
+  CHAT_CODEX_APPROVAL_CANCEL_DECISION_ID,
+  isCodexGuardianDeniedApprovalMethod,
+  isCodexGuardianTimedOutApprovalMethod
+} from "../../shared/codexApproval";
 import {
   CHAT_PROVIDER_NATIVE_ALLOWED_TOOL_MAX_LENGTH,
   CHAT_SHELL_RULE_PATTERN_MAX_LENGTH,
@@ -322,6 +327,10 @@ const GENERIC_PARTICIPANT_ROLE_ID = "generic-participant";
 // dispatch from a trigger message so skill validation never diverges from the
 // actual dispatch target.
 type ChatDispatchReplyContext = { parentMessageId?: string; threadId?: string; chatThreadRootId?: string };
+type InferredParticipantRequestSuppressionScope =
+  | "tool-source-segment"
+  | "final-source-tool-origin-run"
+  | "final-source-tool-origin-segment";
 const CHAT_LEGACY_ADMINISTRATOR_HANDLE = "admin";
 const CHAT_ROLE_LABEL_MAX_CHARS = 80;
 const CHAT_ROLE_INSTRUCTIONS_MAX_CHARS = 40_000;
@@ -391,11 +400,13 @@ interface ChatAppMcpGateway {
     snapshotMaxSequence?: number;
     continuation?: boolean;
     runId?: string;
+    turnSegmentId?: string;
     participantRequestDepth?: number;
     participantRequestBatchId?: string;
     chainRootId?: string;
     historyMarkdownPath?: string;
     historyJsonPath?: string;
+    agentMode?: ChatAgentMode;
     runPermissions?: ChatAgentPermissions;
   }): { url: string; token: string } | undefined;
   updateToken?(token: string, grant: ChatAppMcpTokenGrant): { url: string; token: string } | undefined;
@@ -417,11 +428,13 @@ interface ChatAppMcpActor {
   snapshotMaxSequence?: number;
   continuation?: boolean;
   runId?: string;
+  turnSegmentId?: string;
   participantRequestDepth?: number;
   participantRequestBatchId?: string;
   chainRootId?: string;
   historyMarkdownPath?: string;
   historyJsonPath?: string;
+  agentMode?: ChatAgentMode;
   runPermissions?: ChatAgentPermissions;
 }
 
@@ -514,6 +527,15 @@ interface ToolPermissionDecision {
   scope?: ChatAppToolApprovalScope;
   reason?: string;
   source: "user" | "policy" | "timeout" | "abort";
+}
+
+type ToolPermissionRequestRoute = "created" | "policy" | "pending-replay" | "terminal-replay";
+
+interface ToolPermissionRequestOutcome {
+  prepared: PreparedToolPermission;
+  route: ToolPermissionRequestRoute;
+  approval?: ChatAppToolApproval;
+  decision?: ToolPermissionDecision;
 }
 
 interface CodexApprovalResolver {
@@ -633,7 +655,7 @@ export class ChatService {
   private readonly participantRequestAutoResumes = new Set<string>();
   private readonly permissionApprovalAutoResumes = new Set<string>();
   private readonly codexApprovalContinuations = new Set<string>();
-  private readonly toolPermissionResolvers = new Map<string, (decision: ToolPermissionDecision) => void>();
+  private readonly toolPermissionResolvers = new Map<string, Set<(decision: ToolPermissionDecision) => void>>();
   private readonly codexApprovalResolvers = new Map<string, CodexApprovalResolver>();
   private readonly participantTurnQueues = new Map<string, Promise<void>>();
   private readonly chatRunControllers = new Map<string, Set<AbortController>>();
@@ -3082,63 +3104,122 @@ export class ChatService {
   }
 
   async requestToolPermissionFromTool(actor: ChatAppMcpActor, rawRequest: unknown): Promise<Record<string, unknown>> {
-    await this.waitForQueuedSave(actor.conversationId);
     const conversation = await this.requireChat(actor.conversationId);
-    const requester = this.chatParticipants(conversation).find((participant) => participant.id === actor.participantId);
-    if (!requester) {
-      return { behavior: "deny", message: "The requesting member is no longer in this chat." };
-    }
     if (!hasChatAppToolCapability(actor.capabilities, "permissions.request")) {
       return { behavior: "deny", message: "This chat member is not allowed to request tool permissions." };
     }
 
-    let prepared: PreparedToolPermission;
+    let outcome: ToolPermissionRequestOutcome;
     try {
-      prepared = this.prepareToolPermissionRequest(rawRequest);
+      outcome = await this.withChatMutation(conversation, async () => {
+        const requester = this.chatParticipants(conversation)
+          .find((participant) => participant.id === actor.participantId);
+        if (!requester) {
+          throw new Error("The requesting member is no longer in this chat.");
+        }
+        // The token captures the mode resolved for this exact run. Legacy tokens have
+        // no mode, so fall back to the participant's current setting rather than a
+        // persisted provider session that may still describe the previous turn.
+        const agentMode = actor.agentMode
+          ? normalizeChatAgentMode(actor.agentMode)
+          : normalizeChatAgentMode(requester.agentMode);
+        const prepared = this.prepareToolPermissionRequest(rawRequest, agentMode);
+        const existing = this.toolPermissionApprovalForOccurrence(
+          conversation,
+          requester.id,
+          actor.runId,
+          prepared.request.nativeOccurrenceId
+        );
+        if (existing) {
+          const decision = this.toolPermissionDecisionForApproval(existing);
+          return {
+            prepared,
+            route: decision ? "terminal-replay" : "pending-replay",
+            approval: existing,
+            decision
+          };
+        }
+
+        const policy = prepared.request.agentMode === "auto"
+          ? undefined
+          : this.matchingAppToolApprovalPolicy(
+              conversation,
+              requester,
+              APP_TOOL_PERMISSION_TOOL,
+              "permissions.request",
+              undefined,
+              prepared.request.toolName
+            );
+        if (policy) {
+          return {
+            prepared,
+            route: "policy",
+            decision: { approve: true, scope: "chat", source: "policy" }
+          };
+        }
+
+        const approval = this.newAppToolApproval(
+          conversation,
+          requester,
+          APP_TOOL_PERMISSION_TOOL,
+          "permissions.request",
+          prepared.request,
+          prepared.summary,
+          "pending"
+        );
+        if (actor.runId && actor.triggerMessageId) {
+          approval.resumeContext = {
+            runId: actor.runId,
+            triggerMessageId: actor.triggerMessageId,
+            participantRequestBatchId: actor.participantRequestBatchId
+          };
+        }
+        this.upsertAppToolApproval(conversation, approval);
+        conversation.messages.push(this.message(
+          "system",
+          `Tool approval needed for @${requester.handle}: ${prepared.summary}.`,
+          undefined,
+          { threadId: "system" }
+        ));
+        conversation.updatedAt = new Date().toISOString();
+        await this.saveConversation(conversation);
+        this.queueSnapshot(conversation);
+        return { prepared, route: "created", approval };
+      });
     } catch (error) {
       return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
     }
 
-    const policy = this.matchingAppToolApprovalPolicy(
-      conversation,
-      requester,
-      APP_TOOL_PERMISSION_TOOL,
-      "permissions.request",
-      undefined,
-      prepared.request.toolName
-    );
-    if (policy) {
+    void this.debugLogs.write("chat.claude.permission-prompt.invoked", {
+      conversationId: actor.conversationId,
+      participantId: actor.participantId,
+      runId: actor.runId,
+      agentMode: outcome.prepared.request.agentMode,
+      toolName: outcome.prepared.request.toolName,
+      nativeOccurrenceIdPresent: Boolean(outcome.prepared.request.nativeOccurrenceId),
+      route: outcome.route
+    });
+
+    if (outcome.decision?.approve) {
+      this.logToolPermissionResolution(actor, outcome, outcome.decision);
       return {
         behavior: "allow",
-        updatedInput: prepared.toolInput
+        updatedInput: outcome.prepared.toolInput
+      };
+    }
+    if (outcome.decision) {
+      this.logToolPermissionResolution(actor, outcome, outcome.decision);
+      return {
+        behavior: "deny",
+        message: outcome.decision.reason ?? "User denied this tool request."
       };
     }
 
-    const approval = this.newAppToolApproval(
-      conversation,
-      requester,
-      APP_TOOL_PERMISSION_TOOL,
-      "permissions.request",
-      prepared.request,
-      prepared.summary,
-      "pending"
-    );
-    if (actor.runId && actor.triggerMessageId) {
-      approval.resumeContext = {
-        runId: actor.runId,
-        triggerMessageId: actor.triggerMessageId,
-        participantRequestBatchId: actor.participantRequestBatchId
-      };
+    const approval = outcome.approval;
+    if (!approval) {
+      return { behavior: "deny", message: "Tool permission request could not be created." };
     }
-    this.upsertAppToolApproval(conversation, approval);
-    conversation.messages.push(this.message("system", `Tool approval needed for @${requester.handle}: ${prepared.summary}.`, undefined, {
-      threadId: "system"
-    }));
-    conversation.updatedAt = new Date().toISOString();
-    await this.saveConversation(conversation);
-    this.queueSnapshot(conversation);
-
-    const decision = await this.waitForToolPermissionDecision(approval.id, actor.runId);
+    const decision = await this.waitForToolPermissionDecision(actor.conversationId, approval.id, actor.runId);
     if (!decision.approve) {
       if (decision.source !== "user") {
         await this.denyPendingToolPermissionApproval(
@@ -3147,14 +3228,16 @@ export class ChatService {
           decision.reason ?? "Tool permission request did not receive approval."
         );
       }
+      this.logToolPermissionResolution(actor, outcome, decision);
       return {
         behavior: "deny",
         message: decision.reason ?? "User denied this tool request."
       };
     }
+    this.logToolPermissionResolution(actor, outcome, decision);
     return {
       behavior: "allow",
-      updatedInput: prepared.toolInput
+      updatedInput: outcome.prepared.toolInput
     };
   }
 
@@ -4036,6 +4119,11 @@ export class ChatService {
       }
     }
     let created: { id: string; sequence: number; threadId?: string } | undefined;
+    let participantRequestsToRun: Array<{
+      requestMessageId: string;
+      depth: number;
+      source: ChatParticipantRequestBatch["source"];
+    }> = [];
     try {
       await this.withChatMutation(conversation, async () => {
         const requester = this.chatParticipants(conversation).find((participant) => participant.id === actor.participantId);
@@ -4095,6 +4183,10 @@ export class ChatService {
             appMessageSource: APP_CHAT_SEND_MESSAGE_TOOL,
             accordResolution: request.accordResolution,
             runId: actor.runId,
+            turnSegmentId: actor.turnSegmentId,
+            participantRequestDepth: actor.participantRequestDepth ?? 0,
+            participantRequestBatchId: actor.participantRequestBatchId,
+            participantRequestChainRootId: actor.chainRootId,
             ...(preparedImages.attachments.length > 0 ? { imageAttachments: preparedImages.attachments } : {})
           }
         };
@@ -4106,6 +4198,26 @@ export class ChatService {
         // bump persists for the rest of the turn.
         if (typeof actor.snapshotMaxSequence === "number" && sequence > actor.snapshotMaxSequence) {
           actor.snapshotMaxSequence = sequence;
+        }
+        try {
+          participantRequestsToRun = await this.createImplicitParticipantRequestApproval(
+            conversation,
+            requester,
+            [message]
+          );
+        } catch (error) {
+          participantRequestsToRun = [];
+          this.addConversationWarning(
+            conversation,
+            `Participant mentions in @${requester.handle}'s message were not triggered because inferred-request processing failed.`
+          );
+          void this.debugLogs.write("chat.participant-request.inferred-tool-error", {
+            conversationId: conversation.id,
+            messageId: message.id,
+            requesterParticipantId: requester.id,
+            requesterHandle: requester.handle,
+            message: error instanceof Error ? error.message : String(error)
+          });
         }
         conversation.updatedAt = new Date().toISOString();
         this.queueSnapshot(conversation);
@@ -4127,6 +4239,7 @@ export class ChatService {
         );
       }
     }
+    this.startDeferredParticipantRequestRunners(conversation.id, participantRequestsToRun);
     return {
       ok: true,
       messageId: created.id,
@@ -4380,6 +4493,101 @@ export class ChatService {
     };
   }
 
+  private async respondToToolPermissionApproval(
+    request: RespondToChatAppToolApprovalRequest
+  ): Promise<Conversation | undefined> {
+    const conversation = await this.storage.getConversation(request.conversationId);
+    if (!conversation || conversation.kind !== "chat") {
+      return conversation;
+    }
+    let decidedApproval: ChatAppToolApproval | undefined;
+    let decision: ToolPermissionDecision | undefined;
+    await this.withChatMutation(conversation, async () => {
+      const approval = this.chatAppToolApprovals(conversation)
+        .find((item) => item.id === request.approvalId);
+      if (!approval || approval.toolName !== APP_TOOL_PERMISSION_TOOL || !this.isToolPermissionRequest(approval.request)) {
+        throw new Error("App tool approval request was not found.");
+      }
+      if (approval.status !== "pending") {
+        throw new Error("App tool approval request has already been answered.");
+      }
+
+      const now = new Date().toISOString();
+      if (!request.approve) {
+        decidedApproval = {
+          ...approval,
+          status: "denied",
+          updatedAt: now
+        };
+        decision = {
+          approve: false,
+          source: "user",
+          reason: "User denied this tool request."
+        };
+      } else {
+        const requester = this.chatParticipants(conversation)
+          .find((participant) => participant.id === approval.requesterParticipantId);
+        if (!requester) {
+          throw new Error("The requesting member is no longer in this chat.");
+        }
+        // Legacy pending records did not persist the run mode. Their safe fallback is
+        // the member's current mode, never the provider session's previous-turn mode.
+        const agentMode = approval.request.agentMode ?? normalizeChatAgentMode(requester.agentMode);
+        const scope = agentMode === "auto" ? "once" : request.scope === "chat" ? "chat" : "once";
+        decidedApproval = {
+          ...approval,
+          status: "approved",
+          approvalScope: scope,
+          updatedAt: now
+        };
+        decision = { approve: true, scope, source: "user" };
+        if (scope === "chat") {
+          this.upsertAppToolApprovalPolicy(conversation, {
+            id: randomUUID(),
+            participantId: approval.requesterParticipantId,
+            roleConfigId: approval.requesterRoleConfigId,
+            toolName: approval.toolName,
+            capability: approval.capability,
+            targetToolName: approval.request.toolName,
+            scope: "chat",
+            createdAt: now,
+            updatedAt: now
+          });
+        }
+        conversation.messages.push(this.message(
+          "system",
+          scope === "chat"
+            ? `Allowed @${approval.requesterHandle} to use ${approval.request.toolName} for this chat.`
+            : `Allowed @${approval.requesterHandle} to use ${approval.request.toolName} once.`,
+          undefined,
+          { threadId: "system" }
+        ));
+      }
+      this.upsertAppToolApproval(conversation, decidedApproval);
+      conversation.updatedAt = now;
+      await this.saveConversation(conversation);
+      this.queueSnapshot(conversation);
+    });
+
+    if (!decidedApproval || !decision) {
+      throw new Error("App tool approval request could not be resolved.");
+    }
+    if (!decision.approve) {
+      try {
+        await this.emitAppToolApprovalDecision({
+          conversationId: conversation.id,
+          approval: decidedApproval,
+          status: "denied"
+        });
+      } finally {
+        this.resolveToolPermissionApproval(request.approvalId, decision);
+      }
+    } else {
+      this.resolveToolPermissionApproval(request.approvalId, decision);
+    }
+    return conversation;
+  }
+
   async respondToAppToolApproval(
     request: RespondToChatAppToolApprovalRequest,
     progress?: ProgressCallback
@@ -4391,6 +4599,9 @@ export class ChatService {
     const approval = this.chatAppToolApprovals(conversation).find((item) => item.id === request.approvalId);
     if (!approval) {
       throw new Error("App tool approval request was not found.");
+    }
+    if (approval.toolName === APP_TOOL_PERMISSION_TOOL && this.isToolPermissionRequest(approval.request)) {
+      return this.respondToToolPermissionApproval(request);
     }
     if (approval.status !== "pending") {
       throw new Error("App tool approval request has already been answered.");
@@ -4425,13 +4636,6 @@ export class ChatService {
             requestMessageId,
             message: error instanceof Error ? error.message : String(error)
           });
-        });
-      }
-      if (approval.toolName === APP_TOOL_PERMISSION_TOOL && this.isToolPermissionRequest(approval.request)) {
-        this.resolveToolPermissionApproval(approval.id, {
-          approve: false,
-          source: "user",
-          reason: "User denied this tool request."
         });
       }
       return conversation;
@@ -4501,44 +4705,6 @@ export class ChatService {
       conversation.updatedAt = now;
       await this.saveConversation(conversation);
       this.startQueuedSelfCompaction(conversation.id, requester, approval.request, runId);
-      return conversation;
-    }
-
-    if (approval.toolName === APP_TOOL_PERMISSION_TOOL && this.isToolPermissionRequest(approval.request)) {
-      this.upsertAppToolApproval(conversation, {
-        ...approval,
-        status: "approved",
-        approvalScope: scope,
-        updatedAt: now
-      });
-      if (scope === "chat") {
-        this.upsertAppToolApprovalPolicy(conversation, {
-          id: randomUUID(),
-          participantId: approval.requesterParticipantId,
-          roleConfigId: approval.requesterRoleConfigId,
-          toolName: approval.toolName,
-          capability: approval.capability,
-          targetToolName: approval.request.toolName,
-          scope: "chat",
-          createdAt: now,
-          updatedAt: now
-        });
-      }
-      conversation.messages.push(this.message(
-        "system",
-        scope === "chat"
-          ? `Allowed @${approval.requesterHandle} to use ${approval.request.toolName} for this chat.`
-          : `Allowed @${approval.requesterHandle} to use ${approval.request.toolName} once.`,
-        undefined,
-        { threadId: "system" }
-      ));
-      conversation.updatedAt = now;
-      await this.saveConversation(conversation);
-      this.resolveToolPermissionApproval(approval.id, {
-        approve: true,
-        scope,
-        source: "user"
-      });
       return conversation;
     }
 
@@ -4768,7 +4934,7 @@ export class ChatService {
     }
     const prepared = prepareCodexApproval(request);
     const now = new Date().toISOString();
-    const guardianTimedOut = prepared.request.method === "item/autoApprovalReview/timedOut";
+    const guardianTimedOut = isCodexGuardianTimedOutApprovalMethod(prepared.request.method);
     const approval: ChatAppToolApproval = {
       id: randomUUID(),
       conversationId: conversation.id,
@@ -4926,8 +5092,17 @@ export class ChatService {
         throw new Error("Codex approval request has already been answered.");
       }
       const decisionId = request.codexDecisionId?.trim();
-      const option = approval.request.options.find((item) => item.id === decisionId);
-      const response = decisionId ? resolver.responseByOptionId.get(decisionId) : undefined;
+      const cancelGuardian = decisionId === CHAT_CODEX_APPROVAL_CANCEL_DECISION_ID &&
+        !request.approve &&
+        this.isEndedTurnGuardianApproval(approval);
+      const option: ChatCodexApprovalOption | undefined = cancelGuardian
+        ? { id: "cancel", label: "Cancel", outcome: "cancel" }
+        : approval.request.options.find((item) => item.id === decisionId);
+      const response = cancelGuardian
+        ? codexApprovalCancellationResult(approval.request.method)
+        : decisionId
+          ? resolver.responseByOptionId.get(decisionId)
+          : undefined;
       if (!option || response === undefined) {
         throw new Error("Select one of the decisions offered by this Codex approval request.");
       }
@@ -5021,7 +5196,8 @@ export class ChatService {
   }
 
   private isEndedTurnGuardianApproval(approval: ChatAppToolApproval): boolean {
-    return this.isCodexApprovalRequest(approval.request) && approval.request.method === CODEX_GUARDIAN_DENIED_APPROVAL_METHOD;
+    return this.isCodexApprovalRequest(approval.request) &&
+      isCodexGuardianDeniedApprovalMethod(approval.request.method);
   }
 
   private async autoResumeCodexGuardianDecision(
@@ -5246,7 +5422,7 @@ export class ChatService {
   }
 
   private codexApprovalSummary(request: ChatCodexApprovalRequest): string {
-    if (request.method === "item/autoApprovalReview/denied") {
+    if (isCodexGuardianDeniedApprovalMethod(request.method)) {
       return request.command
         ? `Codex Auto Review denied: ${request.command}`
         : request.networkTarget
@@ -6252,6 +6428,7 @@ export class ChatService {
       participantRequestDepth?: number;
       participantRequestBatchId?: string;
       chainRootId?: string;
+      turnSegmentId: string;
       queuedBehindHandle?: string;
       existingPendingMessage?: ChatMessage;
     }
@@ -6341,7 +6518,13 @@ export class ChatService {
         options.existingPendingMessage,
         cliParticipant,
         triggerMessage,
-        Boolean(options.continuation)
+        Boolean(options.continuation),
+        {
+          turnSegmentId: options.turnSegmentId,
+          participantRequestDepth: options.participantRequestDepth ?? 0,
+          participantRequestBatchId: options.participantRequestBatchId,
+          chainRootId: options.chainRootId
+        }
       );
     } else {
       pendingMessage = this.message(
@@ -6356,6 +6539,10 @@ export class ChatService {
           requesterParticipantId: options.continuation ? triggerMessage.participantId : undefined,
           approvedContinuation: options.continuation || undefined,
           runId,
+          turnSegmentId: options.turnSegmentId,
+          participantRequestDepth: options.participantRequestDepth ?? 0,
+          participantRequestBatchId: options.participantRequestBatchId,
+          participantRequestChainRootId: options.chainRootId,
           queuedBehind: options.queuedBehindHandle ? { handle: options.queuedBehindHandle } : undefined
         },
         "pending"
@@ -6377,10 +6564,10 @@ export class ChatService {
     );
     const unregisterRunProgressCallback = this.registerRunProgressCallback(runId, progress);
     // `permissions.request` is force-added to every run's grant (independent of the
-    // role's configured capabilities). The default-mode tool-permission bridge depends
+    // role's configured capabilities). The Default/Auto tool-permission bridge depends
     // on this: `requestToolPermissionFromTool` and the appMcp `app_tool_permission`
     // handler both gate on `permissions.request`, so if this force-add is ever removed
-    // or scoped back to role config, default-mode escalation silently denies every
+    // or scoped back to role config, native escalation silently denies every
     // un-pre-approved tool call. Keep it always-on (or give the bridge its own
     // capability) if you change this.
     const appToolCapabilities = this.appToolCapabilitiesForRun(session, permissions);
@@ -6402,6 +6589,8 @@ export class ChatService {
       snapshotMaxSequence: Math.max(0, promptConversation.messages.length - 1),
       continuation: Boolean(options.continuation),
       runId,
+      turnSegmentId: options.turnSegmentId,
+      agentMode,
       runPermissions: effectiveChatAgentPermissionsForProvider(participant.kind, agentMode, permissions),
       participantRequestDepth: options.participantRequestDepth ?? 0,
       participantRequestBatchId: options.participantRequestBatchId,
@@ -6771,7 +6960,13 @@ export class ChatService {
     existingPendingMessage: ChatMessage,
     cliParticipant: ParticipantConfig,
     triggerMessage: ChatMessage,
-    continuation: boolean
+    continuation: boolean,
+    inferenceContext: {
+      turnSegmentId: string;
+      participantRequestDepth: number;
+      participantRequestBatchId?: string;
+      chainRootId?: string;
+    }
   ): Promise<ChatMessage> {
     let pendingMessage = existingPendingMessage;
     await this.withChatMutation(conversation, async () => {
@@ -6783,7 +6978,15 @@ export class ChatService {
       const metadata: ChatMessageMetadata = {
         ...pendingMessage.metadata,
         requesterParticipantId: continuation ? triggerMessage.participantId : pendingMessage.metadata?.requesterParticipantId,
-        approvedContinuation: continuation || pendingMessage.metadata?.approvedContinuation
+        approvedContinuation: continuation || pendingMessage.metadata?.approvedContinuation,
+        turnSegmentId: inferenceContext.turnSegmentId,
+        participantRequestDepth: inferenceContext.participantRequestDepth,
+        ...(inferenceContext.participantRequestBatchId !== undefined
+          ? { participantRequestBatchId: inferenceContext.participantRequestBatchId }
+          : {}),
+        ...(inferenceContext.chainRootId !== undefined
+          ? { participantRequestChainRootId: inferenceContext.chainRootId }
+          : {})
       };
       delete metadata.queuedBehind;
       pendingMessage.metadata = Object.keys(metadata).length > 0 ? metadata : undefined;
@@ -8493,6 +8696,15 @@ export class ChatService {
     );
     if (contextUsage) {
       merged.agentContextUsageByParticipant = contextUsage;
+    }
+    const warnings = sanitizeWarningList([
+      ...sanitizeWarningList(storedMetadata.warnings),
+      ...sanitizeWarningList(currentMetadata.warnings)
+    ]);
+    if (warnings.length > 0) {
+      merged.warnings = warnings;
+    } else {
+      delete merged.warnings;
     }
     const removedMessageIds = this.mergeRemovedChatMessageIds(
       storedMetadata.removedChatMessageIds,
@@ -10699,15 +10911,82 @@ export class ChatService {
       if (inferred.length === 0) {
         continue;
       }
-      const targetHandles = inferred.map((item) => item.targetHandle);
+      const suppression = this.inferredParticipantRequestSuppression(
+        conversation,
+        participant,
+        sourceMessage
+      );
+      const suppressed = inferred.filter((item) => suppression.targetHandles.has(item.targetHandle.toLowerCase()));
+      let candidates = inferred.filter((item) => !suppression.targetHandles.has(item.targetHandle.toLowerCase()));
+      if (suppressed.length > 0) {
+        const targetsByScope = new Map<InferredParticipantRequestSuppressionScope, string[]>();
+        for (const item of suppressed) {
+          const scope = suppression.scopeByTarget.get(item.targetHandle.toLowerCase());
+          if (!scope) {
+            continue;
+          }
+          targetsByScope.set(scope, [...(targetsByScope.get(scope) ?? []), item.targetHandle]);
+        }
+        for (const [decidingScope, targets] of targetsByScope) {
+          void this.debugLogs.write("chat.participant-request.inferred-skipped-existing", {
+            conversationId: conversation.id,
+            messageId: sourceMessage.id,
+            requesterParticipantId: participant.id,
+            requesterHandle: participant.handle,
+            targets,
+            decidingScope
+          });
+        }
+      }
+      if (candidates.length === 0) {
+        continue;
+      }
+
+      const targetHandles = candidates.map((item) => item.targetHandle);
       if (this.hasActiveParticipantRequestForTargets(conversation, participant, sourceMessage.id, targetHandles)) {
         void this.debugLogs.write("chat.participant-request.inferred-skipped-existing", {
           conversationId: conversation.id,
           messageId: sourceMessage.id,
           requesterParticipantId: participant.id,
           requesterHandle: participant.handle,
-          targets: targetHandles
+          targets: targetHandles,
+          decidingScope: "active-overlap"
         });
+        continue;
+      }
+
+      const segmentTargets = this.inferredParticipantRequestTargetsForSegment(
+        conversation,
+        participant,
+        sourceMessage.metadata?.turnSegmentId
+      );
+      let remainingNewTargets = Math.max(0, CHAT_PARTICIPANT_REQUEST_MAX_ITEMS - segmentTargets.size);
+      const cappedTargets: string[] = [];
+      candidates = candidates.filter((item) => {
+        const handle = item.targetHandle.toLowerCase();
+        if (segmentTargets.has(handle)) {
+          return true;
+        }
+        if (remainingNewTargets <= 0) {
+          cappedTargets.push(item.targetHandle);
+          return false;
+        }
+        segmentTargets.add(handle);
+        remainingNewTargets -= 1;
+        return true;
+      });
+      if (cappedTargets.length > 0) {
+        void this.debugLogs.write("chat.participant-request.inferred-turn-cap", {
+          conversationId: conversation.id,
+          messageId: sourceMessage.id,
+          requesterParticipantId: participant.id,
+          requesterHandle: participant.handle,
+          turnSegmentId: sourceMessage.metadata?.turnSegmentId,
+          cap: CHAT_PARTICIPANT_REQUEST_MAX_ITEMS,
+          targets: cappedTargets
+        });
+      }
+      if (candidates.length === 0) {
         continue;
       }
 
@@ -10719,7 +10998,7 @@ export class ChatService {
           conversation,
           participant,
           {
-            requests: inferred.map((item) => ({
+            requests: candidates.map((item) => ({
               target: item.targetHandle,
               prompt: this.inferredParticipantRequestPrompt(participant.handle, item.snippet),
               reason: `Inferred from @${participant.handle}'s chat reply.`
@@ -10739,11 +11018,16 @@ export class ChatService {
             triggerChatThreadRootId: sourceMessage.metadata?.chatThreadRootId,
             snapshotMaxSequence: Math.max(0, conversation.messages.length - 1),
             continuation: false,
-            participantRequestDepth: 0
+            participantRequestDepth: sourceMessage.metadata?.participantRequestDepth ?? 0,
+            chainRootId: sourceMessage.metadata?.participantRequestChainRootId
           },
           "inferred"
         );
       } catch (error) {
+        this.addConversationWarning(
+          conversation,
+          this.inferredParticipantRequestWarning(participant.handle, candidates.map((item) => item.targetHandle), error)
+        );
         void this.debugLogs.write("chat.participant-request.inferred-create-error", {
           conversationId: conversation.id,
           messageId: sourceMessage.id,
@@ -10797,6 +11081,153 @@ export class ChatService {
       });
     }
     return participantRequestsToRun;
+  }
+
+  private inferredParticipantRequestSuppression(
+    conversation: Conversation,
+    requester: ChatParticipant,
+    sourceMessage: ChatMessage
+  ): {
+    targetHandles: Set<string>;
+    scopeByTarget: Map<string, InferredParticipantRequestSuppressionScope>;
+  } {
+    const sourceIsToolPosted = sourceMessage.metadata?.appMessageSource === APP_CHAT_SEND_MESSAGE_TOOL;
+    const turnSegmentId = sourceMessage.metadata?.turnSegmentId;
+    const runId = sourceMessage.metadata?.runId;
+    const participantRequestBatchId = sourceMessage.metadata?.participantRequestBatchId;
+    if ((sourceIsToolPosted && !turnSegmentId) || (!sourceIsToolPosted && !runId && !participantRequestBatchId)) {
+      return { targetHandles: new Set(), scopeByTarget: new Map() };
+    }
+
+    const messageById = new Map(conversation.messages.map((message) => [message.id, message]));
+    const resumedBatch = !sourceIsToolPosted && participantRequestBatchId
+      ? this.participantRequestBatches(conversation).find((batch) =>
+          batch.id === participantRequestBatchId &&
+          batch.source === "inferred" &&
+          batch.requesterParticipantId === requester.id &&
+          Boolean(batch.triggerMessageId)
+        )
+      : undefined;
+    const resumedBatchSource = resumedBatch?.triggerMessageId
+      ? messageById.get(resumedBatch.triggerMessageId)
+      : undefined;
+    const originatingToolSegmentId = resumedBatchSource?.metadata?.appMessageSource === APP_CHAT_SEND_MESSAGE_TOOL
+      ? resumedBatchSource.metadata.turnSegmentId
+      : undefined;
+    const targetHandles = originatingToolSegmentId
+      ? this.inferredParticipantRequestTargetsForSegment(
+          conversation,
+          requester,
+          originatingToolSegmentId,
+          { toolPostedOnly: true, messageById }
+        )
+      : new Set<string>();
+    const scopeByTarget = new Map<string, InferredParticipantRequestSuppressionScope>();
+    for (const targetHandle of targetHandles) {
+      scopeByTarget.set(targetHandle, "final-source-tool-origin-segment");
+    }
+    for (const batch of this.participantRequestBatches(conversation)) {
+      if (
+        batch.source !== "inferred" ||
+        batch.requesterParticipantId !== requester.id ||
+        !batch.triggerMessageId
+      ) {
+        continue;
+      }
+      const priorSource = messageById.get(batch.triggerMessageId);
+      if (priorSource?.metadata?.appMessageSource !== APP_CHAT_SEND_MESSAGE_TOOL) {
+        continue;
+      }
+      const matchesRun = !sourceIsToolPosted && Boolean(runId) && priorSource.metadata?.runId === runId;
+      const matchesScope = sourceIsToolPosted
+        ? priorSource.metadata?.turnSegmentId === turnSegmentId
+        : matchesRun;
+      if (!matchesScope) {
+        continue;
+      }
+      const decidingScope: InferredParticipantRequestSuppressionScope = sourceIsToolPosted
+        ? "tool-source-segment"
+        : "final-source-tool-origin-run";
+      for (const item of batch.items) {
+        const handle = item.targetHandle.toLowerCase();
+        targetHandles.add(handle);
+        if (!scopeByTarget.has(handle)) {
+          scopeByTarget.set(handle, decidingScope);
+        }
+      }
+    }
+    return { targetHandles, scopeByTarget };
+  }
+
+  private inferredParticipantRequestTargetsForSegment(
+    conversation: Conversation,
+    requester: ChatParticipant,
+    turnSegmentId: string | undefined,
+    options: { toolPostedOnly?: boolean; messageById?: ReadonlyMap<string, ChatMessage> } = {}
+  ): Set<string> {
+    const targetHandles = new Set<string>();
+    if (!turnSegmentId) {
+      return targetHandles;
+    }
+    const messageById = options.messageById ?? new Map(conversation.messages.map((message) => [message.id, message]));
+    for (const batch of this.participantRequestBatches(conversation)) {
+      if (
+        batch.source !== "inferred" ||
+        batch.requesterParticipantId !== requester.id ||
+        !batch.triggerMessageId
+      ) {
+        continue;
+      }
+      const source = messageById.get(batch.triggerMessageId);
+      if (
+        source?.metadata?.turnSegmentId !== turnSegmentId ||
+        (options.toolPostedOnly && source.metadata?.appMessageSource !== APP_CHAT_SEND_MESSAGE_TOOL)
+      ) {
+        continue;
+      }
+      for (const item of batch.items) {
+        targetHandles.add(item.targetHandle.toLowerCase());
+      }
+    }
+    return targetHandles;
+  }
+
+  private inferredParticipantRequestWarning(
+    requesterHandle: string,
+    targetHandles: string[],
+    error: unknown
+  ): string {
+    const targetSummary = this.formatHandleList(targetHandles.map((handle) => `@${handle}`));
+    const subject = targetSummary
+      ? `Participant ${targetHandles.length === 1 ? "mention" : "mentions"} from @${requesterHandle} to ${targetSummary}`
+      : `Participant mentions from @${requesterHandle}`;
+    const verb = targetHandles.length === 1 ? "was" : "were";
+    const message = error instanceof Error ? error.message : String(error);
+    if (/max depth/i.test(message)) {
+      return `${subject} ${verb} not triggered because the participant-request depth limit was reached.`;
+    }
+    if (/chain limit/i.test(message)) {
+      return `${subject} ${verb} not triggered because the participant-request chain limit was reached.`;
+    }
+    if (/rate limit/i.test(message)) {
+      return `${subject} ${verb} not triggered because the participant-request rate limit was reached.`;
+    }
+    if (/disabled/i.test(message)) {
+      return `${subject} ${verb} not triggered because participant requests are disabled for @${requesterHandle}.`;
+    }
+    return `${subject} ${verb} not triggered because the inferred request could not be prepared.`;
+  }
+
+  private addConversationWarning(conversation: Conversation, warning: string): void {
+    const sanitized = sanitizeWarningText(warning);
+    if (!sanitized) {
+      return;
+    }
+    const warnings = sanitizeWarningList(conversation.metadata.warnings);
+    if (warnings.includes(sanitized)) {
+      return;
+    }
+    conversation.metadata = { ...conversation.metadata, warnings: [...warnings, sanitized] };
   }
 
   private hasActiveParticipantRequestForTargets(
@@ -11136,7 +11567,7 @@ export class ChatService {
     return typeof reason === "string" ? reason.trim().slice(0, 500) || undefined : undefined;
   }
 
-  private prepareToolPermissionRequest(raw: unknown): PreparedToolPermission {
+  private prepareToolPermissionRequest(raw: unknown, agentMode: ChatAgentMode): PreparedToolPermission {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       throw new Error("Tool permission request must be an object.");
     }
@@ -11148,8 +11579,14 @@ export class ChatService {
     }
     const toolInput = record.input ?? record.tool_input ?? record.toolInput ?? {};
     const reason = this.normalizePermissionChangeReason(record.reason ?? record.description);
+    const rawNativeOccurrenceId = record.tool_use_id ?? record.toolUseId;
+    const nativeOccurrenceId = typeof rawNativeOccurrenceId === "string"
+      ? rawNativeOccurrenceId.trim().slice(0, 500) || undefined
+      : undefined;
     const request: ChatToolPermissionRequest = {
       kind: "toolPermission",
+      agentMode,
+      nativeOccurrenceId,
       reason,
       toolName: toolName.slice(0, CHAT_PROVIDER_NATIVE_ALLOWED_TOOL_MAX_LENGTH),
       toolInput: this.toolPermissionInputPreview(toolInput)
@@ -11193,7 +11630,65 @@ export class ChatService {
     return `Use ${request.toolName}${reason}`;
   }
 
-  private waitForToolPermissionDecision(approvalId: string, runId: string | undefined): Promise<ToolPermissionDecision> {
+  private toolPermissionApprovalForOccurrence(
+    conversation: Conversation,
+    participantId: string,
+    runId: string | undefined,
+    nativeOccurrenceId: string | undefined
+  ): ChatAppToolApproval | undefined {
+    if (!runId || !nativeOccurrenceId) {
+      return undefined;
+    }
+    return this.chatAppToolApprovals(conversation).find((approval) =>
+      approval.requesterParticipantId === participantId &&
+      approval.toolName === APP_TOOL_PERMISSION_TOOL &&
+      approval.resumeContext?.runId === runId &&
+      this.isToolPermissionRequest(approval.request) &&
+      approval.request.nativeOccurrenceId === nativeOccurrenceId
+    );
+  }
+
+  private toolPermissionDecisionForApproval(approval: ChatAppToolApproval): ToolPermissionDecision | undefined {
+    if (approval.status === "approved" || approval.status === "auto-applied") {
+      return {
+        approve: true,
+        scope: approval.approvalScope,
+        source: approval.status === "auto-applied" ? "policy" : "user"
+      };
+    }
+    if (approval.status === "denied" || approval.status === "cancelled" || approval.status === "expired") {
+      return {
+        approve: false,
+        source: "user",
+        reason: approval.error ?? "User denied this tool request."
+      };
+    }
+    return undefined;
+  }
+
+  private logToolPermissionResolution(
+    actor: ChatAppMcpActor,
+    outcome: ToolPermissionRequestOutcome,
+    decision: ToolPermissionDecision
+  ): void {
+    void this.debugLogs.write("chat.claude.permission-prompt.resolved", {
+      conversationId: actor.conversationId,
+      participantId: actor.participantId,
+      runId: actor.runId,
+      agentMode: outcome.prepared.request.agentMode,
+      toolName: outcome.prepared.request.toolName,
+      nativeOccurrenceIdPresent: Boolean(outcome.prepared.request.nativeOccurrenceId),
+      route: outcome.route,
+      behavior: decision.approve ? "allow" : "deny",
+      source: decision.source
+    });
+  }
+
+  private waitForToolPermissionDecision(
+    conversationId: string,
+    approvalId: string,
+    runId: string | undefined
+  ): Promise<ToolPermissionDecision> {
     return new Promise<ToolPermissionDecision>((resolve) => {
       let settled = false;
       const controller = runId ? this.firstChatRunController(runId) : undefined;
@@ -11206,7 +11701,11 @@ export class ChatService {
         settled = true;
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
-        this.toolPermissionResolvers.delete(approvalId);
+        const resolvers = this.toolPermissionResolvers.get(approvalId);
+        resolvers?.delete(finish);
+        if (resolvers?.size === 0) {
+          this.toolPermissionResolvers.delete(approvalId);
+        }
         resolve(decision);
       };
       const onAbort = (): void => {
@@ -11223,17 +11722,37 @@ export class ChatService {
           reason: "Timed out waiting for User approval."
         });
       }, CHAT_TOOL_PERMISSION_WAIT_MS);
-      this.toolPermissionResolvers.set(approvalId, finish);
+      const resolvers = this.toolPermissionResolvers.get(approvalId) ?? new Set();
+      resolvers.add(finish);
+      this.toolPermissionResolvers.set(approvalId, resolvers);
       if (signal?.aborted) {
         onAbort();
       } else {
         signal?.addEventListener("abort", onAbort, { once: true });
       }
+      // A fast UI response can land after the pending approval is saved but before
+      // this waiter is registered. Re-read durable state after registration so that
+      // race resolves to the stored decision rather than timing out.
+      void this.storage.getConversation(conversationId).then((conversation) => {
+        if (!conversation || conversation.kind !== "chat") {
+          return;
+        }
+        const approval = this.chatAppToolApprovals(conversation).find((item) => item.id === approvalId);
+        if (!approval) {
+          return;
+        }
+        const decision = this.toolPermissionDecisionForApproval(approval);
+        if (decision) {
+          finish(decision);
+        }
+      }).catch(() => undefined);
     });
   }
 
   private resolveToolPermissionApproval(approvalId: string, decision: ToolPermissionDecision): void {
-    this.toolPermissionResolvers.get(approvalId)?.(decision);
+    for (const resolve of Array.from(this.toolPermissionResolvers.get(approvalId) ?? [])) {
+      resolve(decision);
+    }
   }
 
   private async denyPendingToolPermissionApproval(conversationId: string, approvalId: string, reason: string): Promise<void> {
@@ -11241,23 +11760,25 @@ export class ChatService {
     if (!conversation || conversation.kind !== "chat") {
       return;
     }
-    const approval = this.chatAppToolApprovals(conversation).find((item) => item.id === approvalId);
-    if (!approval || approval.status !== "pending" || approval.toolName !== APP_TOOL_PERMISSION_TOOL) {
-      return;
-    }
-    const now = new Date().toISOString();
-    this.upsertAppToolApproval(conversation, {
-      ...approval,
-      status: "denied",
-      error: reason,
-      updatedAt: now
+    await this.withChatMutation(conversation, async () => {
+      const approval = this.chatAppToolApprovals(conversation).find((item) => item.id === approvalId);
+      if (!approval || approval.status !== "pending" || approval.toolName !== APP_TOOL_PERMISSION_TOOL) {
+        return;
+      }
+      const now = new Date().toISOString();
+      this.upsertAppToolApproval(conversation, {
+        ...approval,
+        status: "denied",
+        error: reason,
+        updatedAt: now
+      });
+      conversation.messages.push(this.message("system", `Denied tool request from @${approval.requesterHandle}: ${reason}`, undefined, {
+        threadId: "system"
+      }));
+      conversation.updatedAt = now;
+      await this.saveConversation(conversation);
+      this.queueSnapshot(conversation);
     });
-    conversation.messages.push(this.message("system", `Denied tool request from @${approval.requesterHandle}: ${reason}`, undefined, {
-      threadId: "system"
-    }));
-    conversation.updatedAt = now;
-    await this.saveConversation(conversation);
-    this.queueSnapshot(conversation);
   }
 
   private preparePermissionChange(
@@ -12361,6 +12882,7 @@ export class ChatService {
       turnReservation?: ParticipantTurnReservation;
     }
   ): Promise<ChatMessage[]> {
+    const turnSegmentId = randomUUID();
     const reservation = options.turnReservation ?? this.reserveParticipantTurn(conversation.id, participant.id);
     let turnController: { signal: AbortSignal; cleanup: () => void } | undefined;
     try {
@@ -12369,7 +12891,10 @@ export class ChatService {
       if (turnController.signal.aborted) {
         throw new Error("Chat run cancelled.");
       }
-      return await this.runParticipantTurn(conversation, participant, triggerMessage, runId, turnController.signal, progress, options);
+      return await this.runParticipantTurn(conversation, participant, triggerMessage, runId, turnController.signal, progress, {
+        ...options,
+        turnSegmentId
+      });
     } finally {
       reservation.release();
       turnController?.cleanup();
@@ -13884,23 +14409,33 @@ export class ChatService {
       const end = Math.min(cleaned.length, match.index + participant.handle.length + 1200);
       const snippet = cleaned.slice(start, end).replace(/\s+/g, " ").trim();
       inferred.push({ targetHandle: participant.handle, snippet });
-      if (inferred.length >= CHAT_PARTICIPANT_REQUEST_MAX_ITEMS) {
-        break;
-      }
     }
     return inferred;
   }
 
   private stripInferenceIgnoredText(content: string): string {
+    let inLegacyProtocolBlock = false;
     return this.withoutFencedCode(content)
       .replace(/`[^`\n]+`/g, "")
       .split(/\r?\n/)
       .filter((line) => {
         const trimmed = line.trim();
+        if (/^(?:participant requests|return to requester after replies)\s*:/i.test(trimmed)) {
+          inLegacyProtocolBlock = true;
+          return false;
+        }
+        if (inLegacyProtocolBlock) {
+          if (!trimmed) {
+            inLegacyProtocolBlock = false;
+            return true;
+          }
+          if (/^(?:[-*]|\d+[.)])\s+/.test(trimmed)) {
+            return false;
+          }
+          inLegacyProtocolBlock = false;
+        }
         return (
           !trimmed.startsWith(">") &&
-          !/^participant requests\s*:/i.test(trimmed) &&
-          !/^return to requester after replies\s*:/i.test(trimmed) &&
           !/^(?:user|system)\s*:\s+/i.test(trimmed)
         );
       })
@@ -16182,8 +16717,8 @@ export class ChatService {
         method === "item/commandExecution/requestApproval" ||
         method === "item/fileChange/requestApproval" ||
         method === "item/permissions/requestApproval" ||
-        method === "item/autoApprovalReview/denied" ||
-        method === "item/autoApprovalReview/timedOut" ||
+        isCodexGuardianDeniedApprovalMethod(method) ||
+        isCodexGuardianTimedOutApprovalMethod(method) ||
         method === "applyPatchApproval" ||
         method === "execCommandApproval"
       ) &&
@@ -16196,7 +16731,7 @@ export class ChatService {
         candidate.action === "mcpToolCall"
       ) &&
       Array.isArray(candidate.options) &&
-      (method === "item/autoApprovalReview/timedOut" ? candidate.options.length === 0 : candidate.options.length > 0) &&
+      (isCodexGuardianTimedOutApprovalMethod(method) ? candidate.options.length === 0 : candidate.options.length > 0) &&
       candidate.options.every((option) =>
         typeof option?.id === "string" &&
         typeof option.label === "string" &&

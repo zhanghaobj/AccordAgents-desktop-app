@@ -866,6 +866,8 @@ export type ChatPermissionChangeRequest =
 
 export interface ChatToolPermissionRequest {
   kind: "toolPermission";
+  agentMode?: ChatAgentMode;
+  nativeOccurrenceId?: string;
   reason?: string;
   toolName: string;
   toolInput?: unknown;
@@ -1157,6 +1159,10 @@ export interface ChatMessageMetadata {
   approvedContinuation?: boolean;
   syncedThroughMessageId?: string;
   runId?: string;
+  turnSegmentId?: string;
+  participantRequestDepth?: number;
+  participantRequestBatchId?: string;
+  participantRequestChainRootId?: string;
   nativeCommand?: {
     name: "goal";
     objective: string;

@@ -18,7 +18,7 @@ import { chatParticipantDisplayName, chatParticipantReference } from "../convers
 import { MarkdownText } from "../content/markdown-text";
 import { avatarForChatParticipant } from "./chat-avatars";
 import { formatChatTime } from "./chat-format";
-import { APP_ROSTER_REQUEST_CHANGE_TOOL, chatApprovalKeyboardAction, chatApprovalShowsGenericSkip, chatCodexApprovalRequest, chatParticipantChangeRequest, chatParticipantRequestApprovalRequest, chatPermissionChangeRequest, chatRoleChangeRequest, chatRoleParticipantChangeRequest, chatSelfCompactionRequest, chatToolPermissionRequest, participantProviderLabel } from "./chat-conversation-data";
+import { APP_ROSTER_REQUEST_CHANGE_TOOL, CHAT_CODEX_APPROVAL_CANCEL_DECISION_ID, chatApprovalKeyboardAction, chatApprovalShowsGenericSkip, chatCodexApprovalRequest, chatCodexApprovalShowsCancel, chatParticipantChangeRequest, chatParticipantRequestApprovalRequest, chatPermissionChangeRequest, chatRoleChangeRequest, chatRoleParticipantChangeRequest, chatSelfCompactionRequest, chatToolPermissionRequest, participantProviderLabel } from "./chat-conversation-data";
 import { chatCodexApprovalShowsCompactResult } from "./chat-codex-approval-presentation";
 import { approvalOptions, approvalQuestion, approvalReason, ChatAppToolReviewFooter, ChatAppToolReviewResult, ChatAppToolReviewStatus, participantReviewChipLabel, reviewPrimaryLabel, roleReviewChipLabel, temporaryRolesForReview } from "./chat-app-tool-approval-review";
 import { ChatCodexApprovalResult } from "./chat-codex-approval-result";
@@ -43,16 +43,21 @@ export function ChatAppToolApprovalCard(props: {
     codexDecisionId?: string
   ) => Promise<void>;
 }): JSX.Element {
+  const requester = props.participants.find((participant) => participant.id === props.approval.requesterParticipantId);
   const permissionRequest = chatPermissionChangeRequest(props.approval);
-  const toolPermissionRequest = chatToolPermissionRequest(props.approval);
+  const toolPermissionRequest = chatToolPermissionRequest(props.approval, requester?.agentMode);
   const combinedRequest = chatRoleParticipantChangeRequest(props.approval);
   const roleRequest = chatRoleChangeRequest(props.approval);
   const participantChange = chatParticipantChangeRequest(props.approval);
   const participantRequest = chatParticipantRequestApprovalRequest(props.approval);
   const selfCompactionRequest = chatSelfCompactionRequest(props.approval);
   const codexRequest = chatCodexApprovalRequest(props.approval);
+  const showCodexCancel = chatCodexApprovalShowsCancel(codexRequest);
   const inferredParticipantRequest = participantRequest?.source === "inferred";
-  const preferOnceApproval = Boolean(permissionRequest && permissionRequest.kind !== "portable");
+  const preferOnceApproval = Boolean(
+    permissionRequest && permissionRequest.kind !== "portable" ||
+    toolPermissionRequest?.agentMode === "auto"
+  );
   const added = props.approval.toolName === APP_ROSTER_REQUEST_CHANGE_TOOL && "operations" in props.approval.request
     ? props.approval.request.operations.filter((operation) => operation.type === "add")
     : [];
@@ -99,13 +104,12 @@ export function ChatAppToolApprovalCard(props: {
     );
   const defaultIndex = codexRequest || rosterApproval || preferOnceApproval || inferredParticipantRequest ? 0 : Math.min(1, options.length - 1);
   const [selectedIndex, setSelectedIndex] = useState(defaultIndex);
-  const requester = props.participants.find((participant) => participant.id === props.approval.requesterParticipantId);
   const requesterLabel = requester ? chatParticipantDisplayName(requester) : chatParticipantReference(props.approval.requesterHandle);
   const requesterAvatar = requester
     ? avatarForChatParticipant(requester, requesterLabel)
     : avatarForParticipant(requesterLabel, props.approval.requesterParticipantId);
   const approvalPrompt = codexRequest
-    ? codexRequest.method === "item/autoApprovalReview/denied"
+    ? showCodexCancel
       ? `${chatParticipantReference(props.approval.requesterHandle)} wants to retry an action denied by Codex Auto Review`
       : `${chatParticipantReference(props.approval.requesterHandle)} needs approval before Codex can continue`
     : effectiveCombinedRequest
@@ -309,7 +313,9 @@ export function ChatAppToolApprovalCard(props: {
           )}
           {toolPermissionRequest && (
             <p className="chat-app-tool-scope-note">
-              Applies only to {requesterLabel}. Allow once approves this blocked call; chat grants apply to future {toolPermissionRequest.toolName} calls from this member in this chat.
+              {toolPermissionRequest.agentMode === "auto"
+                ? `Applies only to ${requesterLabel}. Claude Auto approvals are per occurrence and do not grant future calls.`
+                : `Applies only to ${requesterLabel}. Allow once approves this blocked call; chat grants apply to future ${toolPermissionRequest.toolName} calls from this member in this chat.`}
             </p>
           )}
           {participantRequest && (
@@ -368,14 +374,20 @@ export function ChatAppToolApprovalCard(props: {
                 ))}
               </div>
               <div className="chat-approval-footer">
-                {chatApprovalShowsGenericSkip(codexRequest) && (
+                {(showCodexCancel || chatApprovalShowsGenericSkip(codexRequest)) && (
                   <button
                     type="button"
                     className="chat-approval-skip"
                     disabled={props.submitting}
-                    onClick={() => void props.onRespond(props.approval.id, false)}
+                    onClick={() => void props.onRespond(
+                      props.approval.id,
+                      false,
+                      undefined,
+                      undefined,
+                      showCodexCancel ? CHAT_CODEX_APPROVAL_CANCEL_DECISION_ID : undefined
+                    )}
                   >
-                    Skip
+                    {showCodexCancel ? "Cancel" : "Skip"}
                   </button>
                 )}
                 <Button variant="default" size="sm" className="chat-approval-submit" disabled={props.submitting} onClick={submit}>
