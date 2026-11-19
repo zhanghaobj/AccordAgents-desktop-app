@@ -16,22 +16,14 @@
 }
 
 .app-select-trigger:focus-visible {
-  border-color: var(--app-accent);
-  box-shadow: var(--focus-ring);
+  border-color: var(--app-focus-border);
+  box-shadow: none;
 }
 
-.icon-button,
 .participant-pill {
   min-height: 34px;
   font-size: 13px;
   font-weight: 600;
-}
-
-.icon-button {
-  width: 34px;
-  height: 34px;
-  background: var(--app-surface-subtle);
-  color: var(--app-text);
 }
 
 .participant-pill {
@@ -44,7 +36,6 @@
   color: var(--app-muted);
 }
 
-.icon-button:hover,
 .participant-pill:hover {
   background: var(--app-surface-hover);
 }
@@ -765,8 +756,8 @@ img.chat-draft-plugin-token-icon {
 }
 
 .chat-choice-text-panel textarea:focus {
-  border-color: var(--app-accent);
-  box-shadow: 0 0 0 1px var(--app-accent);
+  border-color: var(--app-focus-border);
+  box-shadow: none;
 }
 
 .sidebar-history-item.is-selected {
@@ -881,7 +872,7 @@ img.chat-draft-plugin-token-icon {
 }
 
 /* ============================================================
-   Typography — design language (Space Grotesk display / JetBrains mono)
+   Typography — design language (display family on titles / mono on file tokens)
    ============================================================ */
 
 /* Display family on brand wordmark + primary titles */
@@ -914,29 +905,11 @@ img.chat-draft-plugin-token-icon {
   padding: 4px 10px 2px;
 }
 
-/* Frameless top-bar icon buttons (theme / settings / refresh) — design handoff §3. */
-.topbar-icon-button {
-  border: 0 !important;
-  background: transparent !important;
-  box-shadow: none !important;
-  color: var(--app-muted);
-}
-
-.topbar-icon-button:hover {
-  background: var(--app-surface-hover) !important;
-  color: var(--app-text-strong);
-}
-
-.topbar-icon-button.is-active {
-  background: var(--app-accent-soft) !important;
-  color: var(--app-accent) !important;
-}
-
 /* Solid dark choice-card submit button — design handoff (.aa-perm-submit). */
 .chat-choice-submit {
   gap: 6px;
   border-color: transparent !important;
-  background: var(--app-text-strong) !important;
+  background: var(--app-primary) !important;
   /* Explicit constant-light token (not var(--app-surface)) so the label can't pick up an
      ambient surface token and render gray on the dark button. */
   color: var(--app-on-dark) !important;
@@ -949,24 +922,39 @@ img.chat-draft-plugin-token-icon {
 }
 
 .chat-choice-submit:hover:not(:disabled) {
-  background: var(--app-text-strong) !important;
+  background: var(--app-primary) !important;
   opacity: 0.88;
 }
 
-.chat-choice-submit:disabled {
-  opacity: 0.45;
+/* The primary button's own focus mark: a thin light edge inside it. */
+.chat-choice-submit:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--app-on-dark) !important;
+}
+
+/* Disabled is the shared calm light button, not the dark one faded grey. */
+.chat-choice-submit:disabled,
+.dark .chat-choice-submit:disabled {
+  opacity: 1;
+  border-color: var(--app-border) !important;
+  background: var(--app-surface-subtle) !important;
+  color: var(--app-muted) !important;
+}
+
+.chat-choice-submit:disabled span,
+.chat-choice-submit:disabled kbd {
+  color: var(--app-muted) !important;
 }
 
 /* Keep the submit a dark button with white text in dark mode too, instead of
-   letting --app-text-strong / --app-surface flip it to a light button. */
+   letting --app-primary / --app-surface flip it to a light button. */
 .dark .chat-choice-submit {
-  background: var(--app-bg) !important;
+  background: var(--app-primary-fg) !important;
   color: var(--app-on-dark) !important;
   border-color: var(--app-border-strong) !important;
 }
 
 .dark .chat-choice-submit:hover:not(:disabled) {
-  background: var(--app-bg) !important;
+  background: var(--app-primary-fg) !important;
 }
 
 .chat-choice-submit kbd {

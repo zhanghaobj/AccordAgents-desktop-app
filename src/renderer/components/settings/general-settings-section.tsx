@@ -1,22 +1,18 @@
-import { Fragment, useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { Check, CheckCircle2, ChevronDown, Code2, Copy, ExternalLink, FolderOpen, HelpCircle, Server } from "lucide-react";
+import { Fragment, useEffect, useState } from "react";
+import { ChevronDown } from "lucide-react";
 
 import type {
   AgentHealth,
   ChatProviderKind,
   CliProviderHost,
   CliProviderHostUpdate,
-  CloudRunsSettings,
-  CloudRunsSettingsUpdate,
-  CloudRunWorkerDoctorReport,
-  CloudRunWorkerMode,
-  CloudRunWorkerSetupProgress,
   ChatPromptContextMode,
   ChatPromptContextScopeSettings,
   ChatPromptContextSettings,
+  MobileControlSettings,
   ProviderKind,
   ProviderSettings,
+  RepoFileExternalOpenAction,
   RepoFileOpenAction
 } from "../../../shared/types";
 import {
@@ -30,21 +26,26 @@ import {
   CHAT_AUTO_WATCH_WAKE_LIMIT_MIN
 } from "../../../shared/chatAutoWatch";
 import { CLI_AGENT_RUN_TIMEOUT_MAX_MS, CLI_AGENT_RUN_TIMEOUT_MIN_MS, cliAgentRunTimeoutHours } from "../../../shared/cliAgentRunSettings";
+import { BetaUpdatesRow } from "./beta-updates-row";
+import { SpeechToTextRow } from "./speech-to-text-row";
+import { ClaudeChromeRow } from "./claude-chrome-row";
 import {
   CHAT_PROMPT_CONTEXT_LIMIT_MAX,
   normalizeChatPromptContextSettings
 } from "../../../shared/chatPromptContext";
-import { writeClipboardText, type ClipboardWriteResult } from "../../../shared/clipboard";
-import { AwsWorkerPanel as SharedAwsWorkerPanel } from "./aws-worker-panel";
+import { DevicePairingSection } from "./device-pairing-section";
+import { HubServerSection } from "./hub-server-section";
+import { MachinesSection } from "./machines-section";
 import { cliProviderMetadata, deriveAgentReadiness } from "../../../shared/cliReadiness";
 import { isChatProviderKind } from "../../../shared/chatProviders";
 import { AppSelect } from "../primitives";
+import { EXTERNAL_OPEN_OPTIONS, FILE_OPEN_OPTIONS, FileOpenDropdown } from "./file-open-dropdown";
 import { ProviderHostEditorDialog, ProviderHostRows, type ProviderHostEditorState } from "./provider-hosts-section";
 
 const PARTICIPANT_REQUEST_DEPTH_HELP = "Limits transitive member-to-member request nesting, not repeated rounds by the same requester.";
 const PARTICIPANT_REQUEST_PROMPT_MAX_HELP = "Maximum characters accepted for each member request prompt. Longer prompts are rejected, not truncated.";
 const AUTO_WATCH_WAKE_LIMIT_HELP = "Pauses auto-watch after this many automatic watcher runs happen without a user message.";
-type ClipboardFeedback = "idle" | ClipboardWriteResult;
+const SHOW_MACHINES_SETTINGS = false;
 
 const CLI_ICON_URLS: Partial<Record<ProviderKind, string>> = {
   "codex-cli": new URL("../../assets/codex-cli.svg", import.meta.url).href,
@@ -64,23 +65,26 @@ export function GeneralSettingsSection(props: {
   agents: AgentHealth[];
   assistantProviderKind?: ChatProviderKind;
   repoFileOpenAction?: RepoFileOpenAction;
+  repoFileExternalOpenAction?: RepoFileExternalOpenAction;
   betaUpdates: boolean;
+  crashReports: boolean;
   cliAgentRunTimeoutMs: number;
   chatParticipantRequestMaxDepth: number;
   chatParticipantRequestPromptMaxChars: number;
   chatAutoWatchWakeLimit: number;
   chatPromptContext: ChatPromptContextSettings;
-  cloudRuns: CloudRunsSettings;
+  mobileControl?: MobileControlSettings;
   updateProvider: (provider: ProviderSettings, patch: { enabled?: boolean }) => Promise<void>;
   setAssistantProviderKind: (kind: ChatProviderKind) => Promise<void>;
   setRepoFileOpenPreference: (action: RepoFileOpenAction | null) => Promise<void>;
+  setRepoFileExternalOpenPreference: (action: RepoFileExternalOpenAction | null) => Promise<void>;
   setBetaUpdates: (enabled: boolean) => Promise<void>;
+  setCrashReports: (enabled: boolean) => Promise<void>;
   setCliAgentRunTimeoutMs: (timeoutMs: number) => Promise<void>;
   setChatParticipantRequestMaxDepth: (maxDepth: number) => Promise<void>;
   setChatParticipantRequestPromptMaxChars: (maxChars: number) => Promise<void>;
   setChatAutoWatchWakeLimit: (limit: number) => Promise<void>;
   setChatPromptContext: (settings: ChatPromptContextSettings) => Promise<void>;
-  saveCloudRunsSettings: (update: CloudRunsSettingsUpdate) => Promise<void>;
 }): JSX.Element {
   const [hostEditor, setHostEditor] = useState<ProviderHostEditorState | undefined>();
   const readyCount = props.providers.filter(
@@ -141,6 +145,7 @@ export function GeneralSettingsSection(props: {
             onAdd={() => setHostEditor({ type: "create" })}
             onEdit={(host) => setHostEditor({ type: "edit", host })}
           />
+          <ClaudeChromeRow />
         </div>
       </section>
 
@@ -169,7 +174,8 @@ export function GeneralSettingsSection(props: {
               placeholder="Choose provider"
               ariaLabel="Assistant provider"
               testId="assistant-provider-select"
-              className="assistant-provider-select"
+              size="sm"
+              className="assistant-provider-select min-h-7 data-[size=sm]:rounded-[10px] border-[var(--app-hairline)] bg-[var(--app-surface)] text-[14px] dark:bg-[var(--app-surface)]"
               onValueChange={(value) => {
                 if (isChatProviderKind(value)) {
                   void props.setAssistantProviderKind(value);
@@ -185,20 +191,40 @@ export function GeneralSettingsSection(props: {
                 What happens when you click an inside-workspace file reference in chat.
               </div>
             </div>
-            <FileOpenDropdown action={props.repoFileOpenAction} onChange={props.setRepoFileOpenPreference} />
+            <FileOpenDropdown options={FILE_OPEN_OPTIONS} action={props.repoFileOpenAction ?? null} onChange={props.setRepoFileOpenPreference} />
           </div>
           <div className="gen-card-divider" />
           <div className="gen-row">
             <div className="gen-row-text">
-              <div className="gen-row-title">Beta updates</div>
-              <div className="gen-row-desc">Receive beta releases. Applies on next restart.</div>
+              <div className="gen-row-title">Open files outside the side panel</div>
+              <div className="gen-row-desc">
+                The side panel’s Open button, and files the panel does not show (spreadsheets, archives, installers).
+              </div>
+            </div>
+            <FileOpenDropdown
+              options={EXTERNAL_OPEN_OPTIONS}
+              action={props.repoFileExternalOpenAction ?? null}
+              onChange={async (action) => {
+                await props.setRepoFileExternalOpenPreference(action === "open" || action === "intellij-idea" ? action : null);
+              }}
+            />
+          </div>
+          <SpeechToTextRow />
+          <BetaUpdatesRow enabled={props.betaUpdates} onChange={props.setBetaUpdates} />
+          <div className="gen-card-divider" />
+          <div className="gen-row">
+            <div className="gen-row-text">
+              <div className="gen-row-title">Crash and usage reports</div>
+              <div className="gen-row-desc">
+                Send error reports and anonymous usage counts: active installs, your operating system and language, which supported CLIs are set up, which first steps you have reached (like your first chat) and which model providers you connect. Never your messages, code, file names or keys; file paths, links and secrets are removed from error reports. Turning on applies on next restart.
+              </div>
             </div>
             <label className="toggle">
               <input
                 type="checkbox"
-                data-testid="beta-updates-toggle"
-                checked={props.betaUpdates}
-                onChange={(event) => void props.setBetaUpdates(event.target.checked)}
+                data-testid="crash-reports-toggle"
+                checked={props.crashReports}
+                onChange={(event) => void props.setCrashReports(event.target.checked)}
               />
               <span />
             </label>
@@ -263,465 +289,15 @@ export function GeneralSettingsSection(props: {
         </div>
       </section>
 
-      <section className="gen-section">
-        <h2 className="gen-section-title gen-section-title-solo">Cloud Runs (beta)</h2>
-        <CloudRunsControl settings={props.cloudRuns} onSave={props.saveCloudRunsSettings} />
-      </section>
+      <HubServerSection />
+
+      <DevicePairingSection mobileControl={props.mobileControl} />
+
+      {SHOW_MACHINES_SETTINGS && <MachinesSection />}
     </>
   );
 }
 
-function CloudRunsControl(props: {
-  settings: CloudRunsSettings;
-  onSave: (update: CloudRunsSettingsUpdate) => Promise<void>;
-}): JSX.Element {
-  const [draft, setDraft] = useState<CloudRunsSettings>(props.settings);
-  const [status, setStatus] = useState<string>("");
-  const [busy, setBusy] = useState(false);
-  const [report, setReport] = useState<CloudRunWorkerDoctorReport | null>(null);
-  const [setupProgress, setSetupProgress] = useState<CloudRunWorkerSetupProgress | null>(null);
-  const [authCopyFeedback, setAuthCopyFeedback] = useState<ClipboardFeedback>("idle");
-
-  useEffect(() => {
-    setDraft(props.settings);
-  }, [props.settings]);
-
-  useEffect(() => window.consensus.onCloudRunSetupProgress(setSetupProgress), []);
-
-  useEffect(() => {
-    setAuthCopyFeedback("idle");
-  }, [setupProgress?.authCode]);
-
-  const patch = (update: CloudRunsSettingsUpdate): void => {
-    setDraft((current) => ({
-      ...current,
-      ...update,
-      worker: {
-        ...current.worker,
-        ...(update.worker ?? {})
-      }
-    }));
-  };
-
-  const save = async (): Promise<void> => {
-    setBusy(true);
-    setStatus("");
-    try {
-      await props.onSave(draft);
-      setStatus("Saved.");
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const savePatch = async (update: CloudRunsSettingsUpdate, successMessage?: string): Promise<void> => {
-    patch(update);
-    setBusy(true);
-    setStatus("");
-    try {
-      await props.onSave(update);
-      setStatus(successMessage ?? "Saved.");
-    } catch (error) {
-      setDraft(props.settings);
-      setStatus(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const diagnose = async (): Promise<void> => {
-    setBusy(true);
-    setStatus("Checking worker...");
-    setReport(null);
-    try {
-      const result = await window.consensus.diagnoseCloudRunWorker(draft.mode === "aws" ? undefined : draft.worker);
-      setReport(result);
-      setStatus(result.message);
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const setup = async (): Promise<void> => {
-    setBusy(true);
-    setStatus("Setting up worker...");
-    setSetupProgress(null);
-    try {
-      const result = await window.consensus.setupCloudRunWorker(draft.mode === "aws" ? undefined : draft.worker);
-      setReport(result);
-      setStatus(result.message);
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-      setSetupProgress(null);
-    }
-  };
-
-  const setMode = (mode: CloudRunWorkerMode): void => {
-    void savePatch({ mode });
-  };
-
-  const copyAuthCode = async (): Promise<void> => {
-    const authCode = setupProgress?.authCode;
-    if (!authCode) {
-      return;
-    }
-    const result = await writeClipboardText(authCode, (value) => navigator.clipboard.writeText(value));
-    setAuthCopyFeedback(result);
-    window.setTimeout(() => setAuthCopyFeedback("idle"), 1400);
-  };
-
-  const authCopyLabel = authCopyFeedback === "copied"
-    ? "Copied"
-    : authCopyFeedback === "failed"
-      ? "Copy failed"
-      : "Copy";
-  const authCopyAriaLabel = authCopyFeedback === "copied"
-    ? "Copied device authentication code"
-    : authCopyFeedback === "failed"
-      ? "Copy device authentication code failed"
-      : "Copy device authentication code";
-
-  return (
-    <div className="gen-card">
-      <div className="gen-row">
-        <div className="gen-row-text">
-          <div className="gen-row-title">Remote Codex worker</div>
-          <div className="gen-row-desc">Run Codex members marked remote on a worker instead of this machine.</div>
-        </div>
-        <label className="toggle">
-          <input
-            type="checkbox"
-            data-testid="remote-codex-worker-toggle"
-            checked={draft.enabled}
-            disabled={busy}
-            aria-expanded={draft.enabled}
-            onChange={(event) => {
-              const enabled = event.target.checked;
-              void savePatch({ enabled });
-            }}
-          />
-          <span />
-        </label>
-      </div>
-      {draft.enabled ? (
-        <fieldset
-          className="gen-cloud-runs-settings"
-          data-testid="remote-codex-worker-settings"
-        >
-        <div className="gen-card-divider" />
-        <div className="gen-row">
-        <div className="gen-row-text">
-          <div className="gen-row-title">Worker source</div>
-          <div className="gen-row-desc">Let the app create and manage an EC2 worker, or point it at a box you own.</div>
-        </div>
-        <div className="gen-segmented" role="tablist" aria-label="Worker source">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={draft.mode === "aws"}
-            className={`gen-segment ${draft.mode === "aws" ? "is-active" : ""}`}
-            onClick={() => setMode("aws")}
-          >
-            App-managed (AWS)
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={draft.mode !== "aws"}
-            className={`gen-segment ${draft.mode !== "aws" ? "is-active" : ""}`}
-            onClick={() => setMode("ssh")}
-          >
-            My own box (SSH)
-          </button>
-        </div>
-      </div>
-      <div className="gen-card-divider" />
-      {draft.mode === "aws" ? (
-        <SharedAwsWorkerPanel
-          settings={draft}
-          onInstanceTypeChange={(value) => patch({ awsInstanceType: value })}
-          onDiskSizeChange={(value) => patch({ awsRootVolumeSizeGb: value })}
-          onDeleted={() => props.onSave({ mode: "ssh" })}
-        />
-      ) : null}
-      <div className={draft.mode === "aws" ? "gen-collapsed" : ""} hidden={draft.mode === "aws"}>
-        <div className="gen-row gen-row-stack">
-          <div className="gen-row-text">
-            <div className="gen-row-title">SSH target</div>
-            <div className="gen-row-desc">Host is required; other fields inherit ssh defaults when empty.</div>
-          </div>
-          <div className="gen-grid-form">
-            <input className="gen-input" placeholder="Host" value={draft.worker.host ?? ""} onChange={(event) => patch({ worker: { host: event.target.value } })} />
-            <input className="gen-input" placeholder="User" value={draft.worker.user ?? ""} onChange={(event) => patch({ worker: { user: event.target.value } })} />
-            <input
-              className="gen-input"
-              placeholder="Port"
-              inputMode="numeric"
-              value={draft.worker.port ?? ""}
-              onChange={(event) => patch({ worker: { port: event.target.value ? Number(event.target.value) : undefined } })}
-            />
-            <input className="gen-input" placeholder="Identity file" value={draft.worker.identityFile ?? ""} onChange={(event) => patch({ worker: { identityFile: event.target.value } })} />
-            <input className="gen-input" placeholder="Worker root" value={draft.worker.workerRoot ?? ""} onChange={(event) => patch({ worker: { workerRoot: event.target.value } })} />
-            <input className="gen-input" placeholder="Remote repo/cwd" value={draft.worker.remoteCwd ?? ""} onChange={(event) => patch({ worker: { remoteCwd: event.target.value } })} />
-            <input className="gen-input" placeholder="Codex path" value={draft.worker.codexPath ?? ""} onChange={(event) => patch({ worker: { codexPath: event.target.value } })} />
-          </div>
-        </div>
-        <div className="gen-card-divider" />
-        <div className="gen-row gen-row-stack">
-          <div className="gen-row-text">
-            <div className="gen-row-title">Runtime</div>
-            <div className="gen-row-desc">Detached worker timeout and desktop reconnect polling.</div>
-          </div>
-          <div className="gen-grid-form gen-grid-form-compact">
-            <input
-              className="gen-input"
-              aria-label="Maximum runtime minutes"
-              inputMode="numeric"
-              value={Math.round(draft.maxRuntimeMs / 60_000)}
-              onChange={(event) => patch({ maxRuntimeMs: Math.max(1, Number(event.target.value) || 1) * 60_000 })}
-            />
-            <input
-              className="gen-input"
-              aria-label="Poll interval milliseconds"
-              inputMode="numeric"
-              value={draft.pollIntervalMs}
-              onChange={(event) => patch({ pollIntervalMs: Math.max(500, Number(event.target.value) || 500) })}
-            />
-          </div>
-        </div>
-      </div>
-      {draft.mode !== "aws" ? <><div className="gen-card-divider" />
-      <div className="gen-row">
-        <div className="gen-row-text">
-          <div className="gen-row-title">{(busy && setupProgress?.message) || status || "Ready"}</div>
-          {busy && setupProgress?.authUrl && (
-            <div className="gen-row-desc">
-              <button
-                type="button"
-                className="gen-doctor-auth-link"
-                onClick={() => void window.consensus.openExternal(setupProgress.authUrl as string)}
-              >
-                Open the sign-in page
-              </button>
-              {setupProgress.authCode ? (
-                <>
-                  {" and enter code "}
-                  <code className="gen-doctor-auth-code" data-testid="cloud-run-device-auth-code">
-                    {setupProgress.authCode}
-                  </code>
-                  <button
-                    type="button"
-                    className="gen-doctor-auth-copy"
-                    data-testid="cloud-run-device-auth-copy"
-                    aria-label={authCopyAriaLabel}
-                    onClick={() => void copyAuthCode()}
-                  >
-                    {authCopyFeedback === "copied"
-                      ? <CheckCircle2 size={13} aria-hidden />
-                      : <Copy size={13} aria-hidden />}
-                    <span aria-live="polite">{authCopyLabel}</span>
-                  </button>
-                </>
-              ) : null}
-            </div>
-          )}
-        </div>
-        <div className="gen-actions">
-          <button type="button" className="gen-pill" disabled={busy} onClick={() => void diagnose()}>
-            <span className="gen-pill-lead"><Server size={16} /></span>
-            <span className="gen-pill-label">Check</span>
-          </button>
-          <button type="button" className="gen-pill" disabled={busy} onClick={() => void setup()}>
-            <span className="gen-pill-label">Set up</span>
-          </button>
-          <button type="button" className="gen-pill" disabled={busy} onClick={() => void save()}>
-            <span className="gen-pill-label">Save</span>
-          </button>
-        </div>
-      </div>
-      </> : null}
-      {report && (
-        <>
-          <div className="gen-card-divider" />
-          <ul className="gen-doctor-list" aria-label="Worker checks">
-            {report.checks.map((check) => (
-              <li key={check.id} className={`gen-doctor-item is-${check.status}`}>
-                <span className="gen-doctor-mark" aria-hidden="true">
-                  {check.status === "pass" ? "✓" : check.status === "warn" ? "!" : "✕"}
-                </span>
-                <span className="gen-doctor-label">{check.label}</span>
-                {check.detail && <span className="gen-doctor-detail">{check.detail}</span>}
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
-        </fieldset>
-      ) : null}
-    </div>
-  );
-}
-
-const FILE_OPEN_OPTIONS: Array<{
-  key: "open" | "reveal" | "intellij-idea" | "ask";
-  value: RepoFileOpenAction | null;
-  pillLabel: string;
-  menuLabel: string;
-  icon: typeof ExternalLink;
-}> = [
-  { key: "open", value: "open", pillLabel: "Open with default app", menuLabel: "Open with default app", icon: ExternalLink },
-  { key: "reveal", value: "reveal", pillLabel: "Reveal in file manager", menuLabel: "Reveal in file manager", icon: FolderOpen },
-  { key: "intellij-idea", value: "intellij-idea", pillLabel: "Open in IntelliJ IDEA", menuLabel: "Open in IntelliJ IDEA", icon: Code2 },
-  { key: "ask", value: null, pillLabel: "Ask every time", menuLabel: "Reset to ask", icon: HelpCircle }
-];
-
-function FileOpenDropdown(props: {
-  action?: RepoFileOpenAction;
-  onChange: (action: RepoFileOpenAction | null) => Promise<void>;
-}): JSX.Element {
-  const [open, setOpen] = useState(false);
-  const [menuPos, setMenuPos] = useState<{ top: number; right: number } | null>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-  const currentKey = props.action === "open"
-    ? "open"
-    : props.action === "reveal"
-      ? "reveal"
-      : props.action === "intellij-idea"
-        ? "intellij-idea"
-        : "ask";
-  const current = FILE_OPEN_OPTIONS.find((option) => option.key === currentKey)
-    ?? FILE_OPEN_OPTIONS.find((option) => option.key === "ask")
-    ?? FILE_OPEN_OPTIONS[0];
-
-  const closeMenu = (returnFocus: boolean): void => {
-    setOpen(false);
-    if (returnFocus) {
-      triggerRef.current?.focus();
-    }
-  };
-
-  const openMenu = (): void => {
-    // Anchor to the trigger's viewport rect and render in a portal so the
-    // settings pane's overflow:auto can't clip the menu near the pane edge.
-    const rect = triggerRef.current?.getBoundingClientRect();
-    if (rect) {
-      setMenuPos({ top: rect.bottom + 6, right: window.innerWidth - rect.right });
-    }
-    setOpen(true);
-  };
-
-  const menuItems = (): HTMLButtonElement[] =>
-    menuRef.current ? Array.from(menuRef.current.querySelectorAll<HTMLButtonElement>("[role=menuitemradio]")) : [];
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    const onPointerDown = (event: MouseEvent): void => {
-      const target = event.target as Node;
-      if (triggerRef.current?.contains(target) || menuRef.current?.contains(target)) {
-        return;
-      }
-      closeMenu(false);
-    };
-    const dismiss = (): void => closeMenu(false);
-    const onKeyDown = (event: KeyboardEvent): void => {
-      const items = menuItems();
-      if (event.key === "Escape") {
-        event.preventDefault();
-        closeMenu(true);
-      } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-        event.preventDefault();
-        if (!items.length) {
-          return;
-        }
-        const index = items.indexOf(document.activeElement as HTMLButtonElement);
-        const delta = event.key === "ArrowDown" ? 1 : -1;
-        items[(index + delta + items.length) % items.length]?.focus();
-      } else if (event.key === "Home") {
-        event.preventDefault();
-        items[0]?.focus();
-      } else if (event.key === "End") {
-        event.preventDefault();
-        items[items.length - 1]?.focus();
-      }
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    // A fixed menu would drift on scroll/resize; dismiss instead of repositioning.
-    window.addEventListener("scroll", dismiss, true);
-    window.addEventListener("resize", dismiss);
-    const focusFrame = requestAnimationFrame(() => {
-      const items = menuItems();
-      const selected = items.find((item) => item.getAttribute("aria-checked") === "true");
-      (selected ?? items[0])?.focus();
-    });
-    return () => {
-      document.removeEventListener("mousedown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("scroll", dismiss, true);
-      window.removeEventListener("resize", dismiss);
-      cancelAnimationFrame(focusFrame);
-    };
-  }, [open]);
-
-  const select = (value: RepoFileOpenAction | null): void => {
-    closeMenu(true);
-    void props.onChange(value);
-  };
-
-  const CurrentIcon = current.icon;
-  return (
-    <div className="gen-dropdown">
-      <button
-        ref={triggerRef}
-        type="button"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        className={`gen-pill ${open ? "is-open" : ""}`}
-        onClick={() => (open ? closeMenu(true) : openMenu())}
-      >
-        <span className="gen-pill-lead"><CurrentIcon size={16} /></span>
-        <span className="gen-pill-label">{current.pillLabel}</span>
-        <ChevronDown size={16} className="gen-pill-chev" />
-      </button>
-      {open && menuPos && createPortal(
-        <div
-          ref={menuRef}
-          className="gen-menu"
-          role="menu"
-          style={{ position: "fixed", top: menuPos.top, right: menuPos.right }}
-        >
-          {FILE_OPEN_OPTIONS.map((option) => {
-            const Icon = option.icon;
-            const selected = option.key === current.key;
-            return (
-              <button
-                type="button"
-                key={option.key}
-                role="menuitemradio"
-                aria-checked={selected}
-                className={`gen-menu-item ${selected ? "is-selected" : ""}`}
-                onClick={() => select(option.value)}
-              >
-                <span className="gen-menu-item-icon"><Icon size={16} /></span>
-                <span className="gen-menu-item-label">{option.menuLabel}</span>
-                {selected && <Check size={15} className="gen-menu-item-check" />}
-              </button>
-            );
-          })}
-        </div>,
-        document.body
-      )}
-    </div>
-  );
-}
 
 function CliAgentRunTimeoutControl(props: {
   timeoutMs: number;

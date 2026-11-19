@@ -1,0 +1,367 @@
+import { useEffect, useState } from "react";
+import { Copy, Loader2, Plus, Trash2 } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import type { CreateMachineResult, MachineLinkStatus, MachineListResult, MachineRecord } from "../../../shared/machineLink";
+import type { MachineInstallRecord, MachineInstallSnapshot, MachineRuntimePayloadInfo } from "../../../shared/machineInstall";
+import type { MachineTrustedDevicesResult } from "../../../shared/machineLink";
+import { writeClipboardText } from "../../../shared/clipboard";
+import { MachineRow } from "./machine-row";
+
+/**
+ * Machines transport: computers that run the app without a window and host
+ * participants. Adding one mints an enrollment file; installing that file on
+ * the computer connects it through the User's own server.
+ */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const megabytes = bytes / (1024 * 1024);
+  return megabytes >= 1 ? `${megabytes.toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
+}
+
+export function MachinesSection(): JSX.Element {
+  const [machines, setMachines] = useState<MachineRecord[]>([]);
+  const [status, setStatus] = useState<MachineLinkStatus[]>([]);
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | undefined>();
+  const [enrollment, setEnrollment] = useState<CreateMachineResult | undefined>();
+  const [copied, setCopied] = useState(false);
+  const [installs, setInstalls] = useState<MachineInstallRecord[]>([]);
+  const [setupFor, setSetupFor] = useState<string | undefined>();
+  const [payload, setPayload] = useState<MachineRuntimePayloadInfo | undefined>();
+  const [trust, setTrust] = useState<MachineTrustedDevicesResult | undefined>();
+  /** The setup or update running on each machine right now, as it streams. */
+  const [liveOps, setLiveOps] = useState<Record<string, MachineInstallSnapshot>>({});
+  const [appVersion, setAppVersion] = useState<string | undefined>();
+  const [trustDraft, setTrustDraft] = useState({ name: "", deviceId: "", publicKeyDerBase64: "" });
+  const [trustError, setTrustError] = useState<string | undefined>();
+  const [identityCopied, setIdentityCopied] = useState(false);
+
+  const refreshInstalls = (): void => {
+    void window.consensus.listMachineInstalls().then(setInstalls).catch(() => undefined);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const apply = (result: MachineListResult): void => {
+      if (cancelled) {
+        return;
+      }
+      setMachines(result.machines);
+      setStatus(result.status);
+    };
+    void window.consensus.listMachines().then(apply).catch((listError) => {
+      if (!cancelled) {
+        setError(listError instanceof Error ? listError.message : String(listError));
+      }
+    });
+    void window.consensus.listMachineInstalls().then((records) => {
+      if (!cancelled) setInstalls(records);
+    }).catch(() => undefined);
+    // The runtime this app would put on a machine. Shown before a machine is
+    // added, so an incomplete copy of the app is visible before a setup that
+    // would fail halfway.
+    void window.consensus.machineRuntimePayload().then((info) => {
+      if (!cancelled) setPayload(info);
+    }).catch(() => undefined);
+    void window.consensus.listTrustedDevices().then((result) => {
+      if (!cancelled) setTrust(result);
+    }).catch(() => undefined);
+    void window.consensus.getAppVersion().then((version) => {
+      if (!cancelled) setAppVersion(version);
+    }).catch(() => undefined);
+    const off = window.consensus.onMachinesUpdated(apply);
+    const offInstall = window.consensus.onMachineInstallProgress((snapshot) => {
+      setLiveOps((current) => ({ ...current, [snapshot.machineId]: snapshot }));
+      void window.consensus.listMachineInstalls().then((records) => {
+        if (!cancelled) setInstalls(records);
+      }).catch(() => undefined);
+    });
+    return () => {
+      cancelled = true;
+      off();
+      offInstall();
+    };
+  }, []);
+
+  async function addMachine(): Promise<void> {
+    const trimmed = name.trim();
+    if (!trimmed || busy) {
+      return;
+    }
+    setBusy(true);
+    setError(undefined);
+    setCopied(false);
+    try {
+      const result = await window.consensus.createMachine({ name: trimmed });
+      setEnrollment(result);
+      setName("");
+    } catch (createError) {
+      setError(createError instanceof Error ? createError.message : String(createError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function showEnrollment(machine: MachineRecord): Promise<void> {
+    setError(undefined);
+    setCopied(false);
+    try {
+      setEnrollment(await window.consensus.machineEnrollment({ id: machine.id }));
+    } catch (readError) {
+      setError(readError instanceof Error ? readError.message : String(readError));
+    }
+  }
+
+  async function removeMachine(machine: MachineRecord): Promise<void> {
+    if (busy) {
+      return;
+    }
+    setBusy(true);
+    setError(undefined);
+    try {
+      const result = await window.consensus.removeMachine({ id: machine.id });
+      setMachines(result.machines);
+      setStatus(result.status);
+      if (enrollment?.machine.id === machine.id) {
+        setEnrollment(undefined);
+      }
+    } catch (removeError) {
+      setError(removeError instanceof Error ? removeError.message : String(removeError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyEnrollment(): Promise<void> {
+    if (!enrollment) {
+      return;
+    }
+    const result = await writeClipboardText(enrollment.enrollmentJson, (value) => navigator.clipboard.writeText(value));
+    setCopied(result === "copied");
+    if (result !== "copied") {
+      setError("Copy failed.");
+    }
+  }
+
+  async function addTrustedDevice(): Promise<void> {
+    setTrustError(undefined);
+    try {
+      setTrust(await window.consensus.trustDevice({
+        deviceId: trustDraft.deviceId.trim(),
+        publicKeyDerBase64: trustDraft.publicKeyDerBase64.trim(),
+        role: "desktop",
+        name: trustDraft.name.trim() || "Another device"
+      }));
+      setTrustDraft({ name: "", deviceId: "", publicKeyDerBase64: "" });
+    } catch (addError) {
+      setTrustError(addError instanceof Error ? addError.message : String(addError));
+    }
+  }
+
+  async function copyIdentity(): Promise<void> {
+    if (!trust) return;
+    const result = await writeClipboardText(JSON.stringify({
+      deviceId: trust.thisDevice.deviceId,
+      publicKeyDerBase64: trust.thisDevice.publicKeyDerBase64
+    }, null, 2), (value) => navigator.clipboard.writeText(value));
+    setIdentityCopied(result === "copied");
+    window.setTimeout(() => setIdentityCopied(false), 1_500);
+  }
+
+  const statusById = new Map(status.map((item) => [item.machineId, item]));
+  const installById = new Map(installs.map((item) => [item.machineId, item]));
+
+  return (
+    <section className="gen-section" data-testid="machines-section">
+      <h2 className="gen-section-title gen-section-title-solo">Machines</h2>
+      <div className="gen-card">
+        <div className="gen-row">
+          <div className="gen-row-text">
+            <div className="gen-row-title">Computers that host members</div>
+            <div className="gen-row-desc">
+              Choose Cloud run in a member’s settings to use your running AWS instance. The app connects and prepares it for you.
+              Add other computers here to run members on them.
+            </div>
+          </div>
+          <div className="gen-row-control machines-add">
+            <Label htmlFor="machine-name" className="sr-only">Machine name</Label>
+            <Input
+              id="machine-name"
+              value={name}
+              placeholder="Machine name"
+              data-testid="machine-name-input"
+              onChange={(event) => setName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void addMachine();
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="gen-pill"
+              data-testid="machine-add"
+              disabled={busy || !name.trim()}
+              onClick={() => void addMachine()}
+            >
+              <span className="gen-pill-lead">{busy ? <Loader2 className="spin" size={16} aria-hidden /> : <Plus size={16} aria-hidden />}</span>
+              <span className="gen-pill-label">Add machine</span>
+            </button>
+          </div>
+        </div>
+        {payload ? (
+          <div
+            className={payload.ok ? "machines-payload" : "device-pairing-error"}
+            data-testid="machines-payload"
+            data-ok={payload.ok ? "true" : "false"}
+            data-source={payload.source}
+          >
+            {payload.ok
+              ? `Runtime to install: ${payload.version} · ${payload.files} files · ${formatBytes(payload.bytes)}`
+              : payload.message}
+          </div>
+        ) : null}
+        {machines.length > 0 ? (
+          <>
+            <div className="gen-card-divider" />
+            <ul className="machines-list" data-testid="machines-list">
+              {machines.map((machine) => (
+                <MachineRow
+                  key={machine.id}
+                  machine={machine}
+                  live={statusById.get(machine.id)}
+                  install={installById.get(machine.id)}
+                  liveOp={liveOps[machine.id]}
+                  desktopVersion={appVersion}
+                  setupOpen={setupFor === machine.id}
+                  busy={busy}
+                  onToggleSetup={() => setSetupFor((current) => (current === machine.id ? undefined : machine.id))}
+                  onSetupDone={refreshInstalls}
+                  onShowEnrollment={() => void showEnrollment(machine)}
+                  onRemove={() => void removeMachine(machine)}
+                />
+              ))}
+            </ul>
+          </>
+        ) : null}
+        {enrollment ? (
+          <>
+            <div className="gen-card-divider" />
+            <div className="gen-row machines-enrollment" data-testid="machine-enrollment">
+              <div className="gen-row-text">
+                <div className="gen-row-title">Enrollment for {enrollment.machine.name}</div>
+                <div className="gen-row-desc">
+                  Save this as <code>enrollment.json</code> on the machine and start the runtime with
+                  {" "}<code>accordagents-machine --enrollment enrollment.json</code>. The file carries the machine's pairing key: treat it like a password.
+                </div>
+                <textarea
+                  className="machines-enrollment-json"
+                  readOnly
+                  value={enrollment.enrollmentJson}
+                  rows={6}
+                  data-testid="machine-enrollment-json"
+                />
+              </div>
+              <div className="gen-row-control">
+                <button type="button" className="gen-pill" onClick={() => void copyEnrollment()} data-testid="machine-copy-enrollment">
+                  <span className="gen-pill-lead"><Copy size={14} aria-hidden /></span>
+                  <span className="gen-pill-label">{copied ? "Copied" : "Copy"}</span>
+                </button>
+              </div>
+            </div>
+          </>
+        ) : null}
+        {error ? <div className="device-pairing-error" data-testid="machines-error">{error}</div> : null}
+      </div>
+      <div className="gen-card" data-testid="machines-trust">
+        <div className="gen-row">
+          <div className="gen-row-text">
+            <div className="gen-row-title">Devices that may use your machines</div>
+            <div className="gen-row-desc">
+              A machine answers these devices, so your work continues on it when this computer is closed. Each device
+              shows its own identity below; paste another device&apos;s identity here to let it in, and remove it to
+              take that away.
+            </div>
+          </div>
+          <div className="gen-row-control">
+            <button type="button" className="gen-pill" onClick={() => void copyIdentity()} data-testid="machines-copy-identity">
+              <span className="gen-pill-lead"><Copy size={14} aria-hidden /></span>
+              <span className="gen-pill-label">{identityCopied ? "Copied" : "Copy this device"}</span>
+            </button>
+          </div>
+        </div>
+        {trust ? (
+          <div className="gen-row">
+            <div className="gen-row-text">
+              <div className="gen-row-title">This device</div>
+              <div className="gen-row-desc"><code>{trust.thisDevice.deviceId}</code></div>
+            </div>
+          </div>
+        ) : null}
+        {(trust?.devices ?? []).map((device) => (
+          <div className="gen-row" key={device.deviceId}>
+            <div className="gen-row-text">
+              <div className="gen-row-title">{device.name}</div>
+              <div className="gen-row-desc"><code>{device.deviceId}</code> · added {new Date(device.addedAt).toLocaleDateString()}</div>
+            </div>
+            <div className="gen-row-control">
+              <button
+                type="button"
+                className="gen-pill"
+                data-testid={`machines-untrust-${device.deviceId}`}
+                onClick={() => void window.consensus.untrustDevice(device.deviceId).then(setTrust).catch((removeError) => {
+                  setTrustError(removeError instanceof Error ? removeError.message : String(removeError));
+                })}
+              >
+                <span className="gen-pill-lead"><Trash2 size={14} aria-hidden /></span>
+                <span className="gen-pill-label">Remove</span>
+              </button>
+            </div>
+          </div>
+        ))}
+        <div className="gen-row">
+          <div className="gen-row-control machines-add">
+            <Label htmlFor="trust-device-name" className="sr-only">Device name</Label>
+            <Input
+              id="trust-device-name"
+              value={trustDraft.name}
+              placeholder="Device name"
+              data-testid="machines-trust-name"
+              onChange={(event) => setTrustDraft({ ...trustDraft, name: event.target.value })}
+            />
+            <Label htmlFor="trust-device-id" className="sr-only">Device id</Label>
+            <Input
+              id="trust-device-id"
+              value={trustDraft.deviceId}
+              placeholder="device-…"
+              data-testid="machines-trust-id"
+              onChange={(event) => setTrustDraft({ ...trustDraft, deviceId: event.target.value })}
+            />
+            <Label htmlFor="trust-device-key" className="sr-only">Public key</Label>
+            <Input
+              id="trust-device-key"
+              value={trustDraft.publicKeyDerBase64}
+              placeholder="Public key"
+              data-testid="machines-trust-key"
+              onChange={(event) => setTrustDraft({ ...trustDraft, publicKeyDerBase64: event.target.value })}
+            />
+            <button
+              type="button"
+              className="gen-pill"
+              data-testid="machines-trust-add"
+              disabled={!trustDraft.deviceId.trim() || !trustDraft.publicKeyDerBase64.trim()}
+              onClick={() => void addTrustedDevice()}
+            >
+              <span className="gen-pill-lead"><Plus size={16} aria-hidden /></span>
+              <span className="gen-pill-label">Allow device</span>
+            </button>
+          </div>
+        </div>
+        {trustError ? <div className="device-pairing-error" data-testid="machines-trust-error">{trustError}</div> : null}
+      </div>
+    </section>
+  );
+}

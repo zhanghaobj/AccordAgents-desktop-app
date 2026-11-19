@@ -1,8 +1,41 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
+import type { ScriptsUpdatedEvent } from "../shared/scripts";
+import type { CreateTerminalRequest, TerminalHostStateEvent } from "../shared/terminal";
+import type { AvatarStudioTurnRequest, SaveCustomAvatarRequest } from "../shared/avatarStudio";
+import type { HubInstallRequest, HubSetupCommandRequest, HubSetupState } from "../shared/hubSetup";
+import type { DisableSpeechToTextRequest, SpeechToTextState, TranscribeSpeechRequest } from "../shared/types";
+import type { SpeechHoldKey } from "../shared/speechToText";
 import type {
+  CreateMachineRequest,
+  CreateMachineResult,
+  MachineEnrollmentRequest,
+  MachineListResult,
+  MachineTrustedDevicesResult,
+  SaveTrustedDeviceRequest,
+  RemoveMachineRequest,
+  MachineInactivityQuestion,
+  AnswerMachineInactivityRequest
+} from "../shared/machineLink";
+import type {
+  MachineInstallRecord,
+  MachineInstallRequest,
+  MachineInstallResult,
+  MachineInstallSnapshot,
+  MachineMirrorBootstrapRequest,
+  MachineMirrorBootstrapResult,
+  MachineRuntimePayloadInfo,
+  MachineRuntimeProbe,
+  MachineSshTarget,
+  MachineUpgradeRequest
+} from "../shared/machineInstall";
+import type {
+  AwsDiskChosenWork,
+  AwsInstanceProjectProgress,
   AppBridge,
   AddChatParticipantRequest,
   AgentDetectionRequest,
+  CliSignInKind,
+  CliSignInState,
   CliProviderHostUpdate,
   ArtifactsUpdatedEvent,
   ChatBehaviorRuleConfigUpdate,
@@ -33,14 +66,20 @@ import type {
   ConnectAwsWorkerRequest,
   AwsWorkerOperationSnapshot,
   AwsWorkerStartRequest,
+  SetAwsAutoStopRequest,
+  AwsDiskCleanCategory,
   DeleteAgentEnvironmentVariableRequest,
   CompactChatParticipantRequest,
+  RestartChatParticipantRequest,
   ChatParticipantConfigUpdate,
   ChatRoleConfigUpdate,
   ComposeImplementationPlanRequest,
   ContinueReviewRequest,
   ConversationMessagePageRequest,
   Conversation,
+  ConversationUpdate,
+  ChatPromptSuggestionsUpdate,
+  ChatBackgroundTasksEvent,
   CreateChatConversationRequest,
   DeleteChatConversationRequest,
   DismissConversationWarningsRequest,
@@ -69,6 +108,7 @@ import type {
   SendChatMessageRequest,
   StartChatAccordRequest,
   ToggleChatReactionRequest,
+  DismissTurnFinishedNoteRequest,
   UpdateChatParticipantRuntimeRequest,
   RemoveChatParticipantRequest,
   UserSkillDiagnosticsRequest,
@@ -76,14 +116,57 @@ import type {
   UserSkillSearchRequest
 } from "../shared/types";
 
+// Must match the argument main.ts passes to the window.
+const CRASH_REPORTS_ACTIVE_ARG = "--accordagents-crash-reports=on";
+
 const bridge: AppBridge = {
   getAppVersion: () => ipcRenderer.invoke("app:get-version"),
   openExternal: (url: string) => ipcRenderer.invoke("app:open-external", url),
   openTerminal: () => ipcRenderer.invoke("app:open-terminal"),
+  listTerminals: () => ipcRenderer.invoke("terminal:list"),
+  createTerminal: (request?: CreateTerminalRequest) => ipcRenderer.invoke("terminal:create", request),
+  killTerminal: (terminalId: string) => ipcRenderer.invoke("terminal:kill", terminalId),
+  connectTerminals: () => ipcRenderer.invoke("terminal:connect"),
+  restartTerminals: () => ipcRenderer.invoke("terminal:restart"),
+  terminalWorkspaceRoot: (repoPath?: string) => ipcRenderer.invoke("terminal:workspace-root", repoPath),
+  terminalPathForFile: (file: unknown) => {
+    try {
+      return webUtils.getPathForFile(file as Parameters<typeof webUtils.getPathForFile>[0]);
+    } catch {
+      return "";
+    }
+  },
+  onTerminalHostState: (callback: (event: TerminalHostStateEvent) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, update: TerminalHostStateEvent) => callback(update);
+    ipcRenderer.on("terminal:host-state", listener);
+    return () => ipcRenderer.removeListener("terminal:host-state", listener);
+  },
   inspectLocalFile: (request: InspectLocalFileRequest) => ipcRenderer.invoke("app:inspect-local-file", request),
   openLocalFile: (request: OpenLocalFileRequest) => ipcRenderer.invoke("app:open-local-file", request),
   setRepoFileOpenPreference: (action: RepoFileOpenAction | null) => ipcRenderer.invoke("settings:set-repo-file-open-preference", action),
+  setRepoFileExternalOpenPreference: (action) => ipcRenderer.invoke("settings:set-repo-file-external-open-preference", action),
+  readFilePreview: (request) => ipcRenderer.invoke("files:read", request),
+  writeFilePreview: (request) => ipcRenderer.invoke("files:write", request),
+  watchFilePreview: (request) => ipcRenderer.invoke("files:watch", request),
+  unwatchFilePreview: (realPath) => ipcRenderer.invoke("files:unwatch", realPath),
+  releaseFilePreview: (realPath) => ipcRenderer.invoke("files:release", realPath),
+  onFilePreviewChanged: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: Parameters<typeof callback>[0]) => callback(payload);
+    ipcRenderer.on("files:changed", listener);
+    return () => ipcRenderer.removeListener("files:changed", listener);
+  },
+  saveUnsavedFileEdit: (edit) => ipcRenderer.invoke("files:unsaved-save", edit),
+  clearUnsavedFileEdit: (realPath) => ipcRenderer.invoke("files:unsaved-clear", realPath),
+  listUnsavedFileEdits: () => ipcRenderer.invoke("files:unsaved-list"),
+  onFlushFileEdits: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, requestId: string) => callback(requestId);
+    ipcRenderer.on("files:flush", listener);
+    return () => ipcRenderer.removeListener("files:flush", listener);
+  },
+  fileEditsFlushed: (requestId) => ipcRenderer.send("files:flush-done", requestId),
   setBetaUpdates: (enabled: boolean) => ipcRenderer.invoke("settings:set-beta-updates", enabled),
+  setCrashReports: (enabled: boolean) => ipcRenderer.invoke("settings:set-crash-reports", enabled),
+  crashReportsActive: process.argv.includes(CRASH_REPORTS_ACTIVE_ARG),
   setCliAgentRunTimeoutMs: (timeoutMs: number) => ipcRenderer.invoke("settings:set-cli-agent-run-timeout", timeoutMs),
   setChatParticipantRequestMaxDepth: (maxDepth: number) =>
     ipcRenderer.invoke("settings:set-chat-participant-request-max-depth", maxDepth),
@@ -96,13 +179,17 @@ const bridge: AppBridge = {
   saveCloudRunsSettings: (update: CloudRunsSettingsUpdate) => ipcRenderer.invoke("settings:save-cloud-runs", update),
   testCloudRunWorker: (request?: CloudRunWorkerSettings) => ipcRenderer.invoke("cloud-runs:test-worker", request),
   diagnoseCloudRunWorker: (request?: CloudRunWorkerSettings) => ipcRenderer.invoke("cloud-runs:diagnose-worker", request),
-  setupCloudRunWorker: (request?: CloudRunWorkerSettings) => ipcRenderer.invoke("cloud-runs:setup-worker", request),
+  setupCloudRunWorker: (request?: CloudRunWorkerSettings, options?: { signIn?: "codex-cli" | "claude-code" | "none" }) => ipcRenderer.invoke("cloud-runs:setup-worker", request, options),
+  getCloudRunSetupProgress: () => ipcRenderer.invoke("cloud-runs:get-setup-progress"),
+  submitCloudRunAuthCode: request => ipcRenderer.invoke("cloud-runs:submit-auth-code", request),
+  cancelCloudRunAuth: requestId => ipcRenderer.invoke("cloud-runs:cancel-auth", requestId),
+  isCloudRunAuthActive: requestId => ipcRenderer.invoke("cloud-runs:is-auth-active", requestId),
   onCloudRunSetupProgress: (callback: (progress: CloudRunWorkerSetupProgress) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, progress: CloudRunWorkerSetupProgress) => callback(progress);
     ipcRenderer.on("cloud-runs:setup-progress", listener);
     return () => ipcRenderer.removeListener("cloud-runs:setup-progress", listener);
   },
-  getAwsWorkerBootstrapCommand: (region: string) => ipcRenderer.invoke("cloud-runs:aws-bootstrap-command", region),
+  getAwsWorkerBootstrapCommand: (region: string, recoveryOperationId?: string) => ipcRenderer.invoke("cloud-runs:aws-bootstrap-command", region, recoveryOperationId),
   connectAwsWorker: (request: ConnectAwsWorkerRequest) => ipcRenderer.invoke("cloud-runs:aws-connect", request),
   startAwsWorker: (request: AwsWorkerStartRequest) => ipcRenderer.invoke("cloud-runs:aws-start", request),
   onAwsWorkerProgress: (callback: (progress: AwsWorkerOperationSnapshot) => void) => {
@@ -111,6 +198,20 @@ const bridge: AppBridge = {
     return () => ipcRenderer.removeListener("cloud-runs:aws-progress", listener);
   },
   getAwsWorkerStatus: () => ipcRenderer.invoke("cloud-runs:aws-status"),
+  setAwsAutoStop: (request: SetAwsAutoStopRequest) => ipcRenderer.invoke("cloud-runs:aws-auto-stop", request),
+  reconnectAwsMachine: (machineId?: string) => ipcRenderer.invoke("cloud-runs:aws-reconnect-machine", machineId),
+  getAwsInstanceDisk: (options?: { refresh?: boolean }) => ipcRenderer.invoke("cloud-runs:aws-disk", options),
+  cleanAwsInstanceDisk: (category: AwsDiskCleanCategory) => ipcRenderer.invoke("cloud-runs:aws-disk-clean", category),
+  listAwsInstanceFiles: (path?: string) => ipcRenderer.invoke("cloud-runs:aws-disk-list", path),
+  deleteAwsInstanceFiles: (paths: string[], options?: { withWork?: AwsDiskChosenWork }) => ipcRenderer.invoke("cloud-runs:aws-disk-delete", paths, options),
+  listAwsInstanceProjects: () => ipcRenderer.invoke("cloud-runs:aws-projects"),
+  addAwsInstanceProject: (localPath: string) => ipcRenderer.invoke("cloud-runs:aws-project-add", localPath),
+  cancelAwsInstanceProjectAdd: (localPath: string) => ipcRenderer.invoke("cloud-runs:aws-project-add-cancel", localPath),
+  onAwsInstanceProjectProgress: (callback) => {
+    const listener = (_event: unknown, progress: AwsInstanceProjectProgress): void => callback(progress);
+    ipcRenderer.on("cloud-runs:aws-project-progress", listener);
+    return () => ipcRenderer.off("cloud-runs:aws-project-progress", listener);
+  },
   stopAwsWorker: () => ipcRenderer.invoke("cloud-runs:aws-stop"),
   deleteAwsWorker: () => ipcRenderer.invoke("cloud-runs:aws-delete"),
   getAgentEnvironment: () => ipcRenderer.invoke("settings:get-agent-environment"),
@@ -126,6 +227,11 @@ const bridge: AppBridge = {
   saveChatRoleConfig: (update: ChatRoleConfigUpdate) => ipcRenderer.invoke("settings:save-chat-role", update),
   archiveChatRoleConfig: (id: string) => ipcRenderer.invoke("settings:archive-chat-role", id),
   saveChatBehaviorRuleConfig: (update: ChatBehaviorRuleConfigUpdate) => ipcRenderer.invoke("settings:save-chat-behavior-rule", update),
+  runAvatarStudioTurn: (request: AvatarStudioTurnRequest) => ipcRenderer.invoke("avatar-studio:run-turn", request),
+  cancelAvatarStudioTurn: (studioId: string) => ipcRenderer.invoke("avatar-studio:cancel", studioId),
+  closeAvatarStudio: (studioId: string) => ipcRenderer.invoke("avatar-studio:close", studioId),
+  saveCustomAvatar: (request: SaveCustomAvatarRequest) => ipcRenderer.invoke("settings:save-custom-avatar", request),
+  readCustomAvatar: (id: string) => ipcRenderer.invoke("settings:read-custom-avatar", id),
   deleteChatBehaviorRuleConfig: (id: string) => ipcRenderer.invoke("settings:delete-chat-behavior-rule", id),
   saveChatSavedPromptConfig: (update: ChatSavedPromptConfigUpdate) => ipcRenderer.invoke("settings:save-chat-saved-prompt", update),
   deleteChatSavedPromptConfig: (id: string) => ipcRenderer.invoke("settings:delete-chat-saved-prompt", id),
@@ -134,6 +240,15 @@ const bridge: AppBridge = {
   updateLastRepoPath: (repoPath: string) => ipcRenderer.invoke("settings:update-last-repo-path", repoPath),
   listProviderModels: (kind) => ipcRenderer.invoke("settings:list-provider-models", kind),
   detectAgents: (request?: AgentDetectionRequest) => ipcRenderer.invoke("agents:detect", request),
+  startCliSignIn: (kind: CliSignInKind) => ipcRenderer.invoke("cli-sign-in:start", kind),
+  listCliSignIns: () => ipcRenderer.invoke("cli-sign-in:list"),
+  submitCliSignInCode: (request: { requestId: string; code: string }) => ipcRenderer.invoke("cli-sign-in:submit-code", request),
+  cancelCliSignIn: (requestId: string) => ipcRenderer.invoke("cli-sign-in:cancel", requestId),
+  onCliSignInUpdated: (callback: (state: CliSignInState) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: CliSignInState) => callback(state);
+    ipcRenderer.on("cli-sign-in:updated", listener);
+    return () => ipcRenderer.removeListener("cli-sign-in:updated", listener);
+  },
   selectRepoDirectory: () => ipcRenderer.invoke("dialog:select-repo"),
   inspectRepo: (repoPath: string) => ipcRenderer.invoke("git:inspect-repo", repoPath),
   getDiff: (request: GitDiffRequest) => ipcRenderer.invoke("git:get-diff", request),
@@ -149,6 +264,8 @@ const bridge: AppBridge = {
   getConversation: (id: string) => ipcRenderer.invoke("conversations:get", id),
   openConversation: (id: string, limit?: number) => ipcRenderer.invoke("conversations:open", id, limit),
   listConversationMessages: (request: ConversationMessagePageRequest) => ipcRenderer.invoke("conversations:list-messages", request),
+  findRunningParticipantMessage: (conversationId: string, participantId: string) =>
+    ipcRenderer.invoke("conversations:find-running-participant-message", conversationId, participantId),
   saveDecisionSelections: (conversationId: string, selections: Record<string, string>) =>
     ipcRenderer.invoke("conversations:save-decision-selections", conversationId, selections),
   saveDecisionResolutions: (conversationId: string, resolutions: Record<string, boolean>) =>
@@ -163,13 +280,40 @@ const bridge: AppBridge = {
   updateChatParticipantRuntime: (request: UpdateChatParticipantRuntimeRequest) => ipcRenderer.invoke("chat:update-participant-runtime", request),
   removeChatParticipant: (request: RemoveChatParticipantRequest) => ipcRenderer.invoke("chat:remove-participant", request),
   compactChatParticipant: (request: CompactChatParticipantRequest) => ipcRenderer.invoke("chat:compact-participant", request),
+  getClaudeChromeSetting: () => ipcRenderer.invoke("claude-chrome:get"),
+  setClaudeChromeEnabledByDefault: (enabled: boolean) => ipcRenderer.invoke("claude-chrome:set", enabled),
+  restartChatParticipant: (request: RestartChatParticipantRequest) => ipcRenderer.invoke("chat:restart-participant", request),
   startChatAccord: (request: StartChatAccordRequest) => ipcRenderer.invoke("chat:start-accord", request),
   sendChatMessage: (request: SendChatMessageRequest) => ipcRenderer.invoke("chat:send", request),
   readChatAttachment: (request: ReadChatAttachmentRequest) => ipcRenderer.invoke("chat:read-attachment", request),
   toggleChatReaction: (request: ToggleChatReactionRequest) => ipcRenderer.invoke("chat:toggle-reaction", request),
+  dismissTurnFinishedNote: (request: DismissTurnFinishedNoteRequest) => ipcRenderer.invoke("chat:dismiss-turn-finished-note", request),
   respondToChatMentions: (request: RespondToChatMentionsRequest) => ipcRenderer.invoke("chat:respond-to-mentions", request),
   respondToChatChoice: (request: RespondToChatChoiceRequest) => ipcRenderer.invoke("chat:respond-to-choice", request),
   respondToChatAppToolApproval: (request: RespondToChatAppToolApprovalRequest) => ipcRenderer.invoke("chat:respond-to-app-tool-approval", request),
+  createPhoneInvite: (request?: import("../shared/types").CreatePhoneInviteRequest) => ipcRenderer.invoke("mobile:create-phone-invite", request ?? {}),
+  revokePhoneInvite: (request: { inviteId: string }) => ipcRenderer.invoke("mobile:revoke-phone-invite", request),
+  getHubSetupState: () => ipcRenderer.invoke("hub:setup-state"),
+  getHubSetupCommand: (request: HubSetupCommandRequest) => ipcRenderer.invoke("hub:setup-command", request),
+  installHub: (request: HubInstallRequest) => ipcRenderer.invoke("hub:install", request),
+  onHubSetupProgress: (callback: (state: HubSetupState) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: HubSetupState) => callback(state);
+    ipcRenderer.on("hub:setup-progress", listener);
+    return () => ipcRenderer.removeListener("hub:setup-progress", listener);
+  },
+  getSpeechToTextState: () => ipcRenderer.invoke("speech:state"),
+  enableSpeechToText: () => ipcRenderer.invoke("speech:enable"),
+  cancelSpeechToTextDownload: () => ipcRenderer.invoke("speech:cancel-download"),
+  disableSpeechToText: (request: DisableSpeechToTextRequest) => ipcRenderer.invoke("speech:disable", request),
+  setSpeechToTextHoldKey: (holdKey: SpeechHoldKey) => ipcRenderer.invoke("speech:set-hold-key", holdKey),
+  prepareSpeechToText: () => ipcRenderer.invoke("speech:prepare"),
+  transcribeSpeech: (request: TranscribeSpeechRequest) => ipcRenderer.invoke("speech:transcribe", request),
+  requestMicrophoneAccess: () => ipcRenderer.invoke("speech:request-microphone"),
+  onSpeechToTextState: (callback: (state: SpeechToTextState) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: SpeechToTextState) => callback(state);
+    ipcRenderer.on("speech:state", listener);
+    return () => ipcRenderer.removeListener("speech:state", listener);
+  },
   startReview: (request: ReviewRequest) => ipcRenderer.invoke("conversations:start-review", request),
   continueReview: (request: ContinueReviewRequest) => ipcRenderer.invoke("conversations:continue-review", request),
   askPlanDecisionClarification: (request: PlanDecisionClarificationRequest) => ipcRenderer.invoke("conversations:ask-plan-decision-clarification", request),
@@ -198,6 +342,66 @@ const bridge: AppBridge = {
   withdrawArtifactDraft: (request: WithdrawArtifactDraftRequest) => ipcRenderer.invoke("artifacts:drafts:withdraw", request),
   updateArtifactDraftRoster: (request: UpdateArtifactDraftRosterRequest) => ipcRenderer.invoke("artifacts:drafts:set-roster", request),
   publishArtifact: (request: PublishArtifactRequest) => ipcRenderer.invoke("artifacts:publish", request),
+  listMachines: (): Promise<MachineListResult> => ipcRenderer.invoke("machines:list"),
+  prepareCloudRun: (request) => ipcRenderer.invoke("machines:prepare-cloud-run", request),
+  getCloudRunPreparation: (request) => ipcRenderer.invoke("machines:get-cloud-run-preparation", request),
+  onCloudRunPreparationProgress: (callback) => {
+    const listener = (_event: unknown, snapshot: import("../shared/cloudRunPreparation").CloudRunPreparationState): void => callback(snapshot);
+    ipcRenderer.on("machines:cloud-run-progress", listener);
+    return () => ipcRenderer.off("machines:cloud-run-progress", listener);
+  },
+  createMachine: (request: CreateMachineRequest): Promise<CreateMachineResult> => ipcRenderer.invoke("machines:create", request),
+  removeMachine: (request: RemoveMachineRequest): Promise<MachineListResult> => ipcRenderer.invoke("machines:remove", request),
+  machineEnrollment: (request: MachineEnrollmentRequest): Promise<CreateMachineResult> => ipcRenderer.invoke("machines:enrollment", request),
+  probeMachineInstall: (request: { machineId: string; target: MachineSshTarget }): Promise<MachineRuntimeProbe> =>
+    ipcRenderer.invoke("machines:install-probe", request),
+  installMachine: (request: MachineInstallRequest): Promise<MachineInstallResult> => ipcRenderer.invoke("machines:install", request),
+  upgradeMachine: (request: MachineUpgradeRequest): Promise<MachineInstallResult> => ipcRenderer.invoke("machines:upgrade", request),
+  bootstrapMachineProjectMirror: (request: MachineMirrorBootstrapRequest): Promise<MachineMirrorBootstrapResult> =>
+    ipcRenderer.invoke("machines:bootstrap-mirror", request),
+  listMachineInstalls: (): Promise<MachineInstallRecord[]> => ipcRenderer.invoke("machines:install-list"),
+  listTrustedDevices: (): Promise<MachineTrustedDevicesResult> => ipcRenderer.invoke("machines:trusted-devices"),
+  trustDevice: (request: SaveTrustedDeviceRequest): Promise<MachineTrustedDevicesResult> =>
+    ipcRenderer.invoke("machines:trust-device", request),
+  untrustDevice: (deviceId: string): Promise<MachineTrustedDevicesResult> =>
+    ipcRenderer.invoke("machines:untrust-device", deviceId),
+  machineRuntimePayload: (): Promise<MachineRuntimePayloadInfo> => ipcRenderer.invoke("machines:install-payload"),
+  onMachineInstallProgress: (callback: (snapshot: MachineInstallSnapshot) => void) => {
+    const listener = (_event: unknown, snapshot: MachineInstallSnapshot): void => callback(snapshot);
+    ipcRenderer.on("machines:install-progress", listener);
+    return () => ipcRenderer.off("machines:install-progress", listener);
+  },
+  onMachinesUpdated: (callback: (result: MachineListResult) => void) => {
+    const listener = (_event: unknown, result: MachineListResult): void => callback(result);
+    ipcRenderer.on("machines:updated", listener);
+    return () => ipcRenderer.off("machines:updated", listener);
+  },
+  listScripts: () => ipcRenderer.invoke("scripts:list"),
+  getScriptRevision: (request) => ipcRenderer.invoke("scripts:get-revision", request),
+  getScriptRuns: (request) => ipcRenderer.invoke("scripts:runs", request),
+  setScriptSecret: (request) => ipcRenderer.invoke("scripts:set-secret", request),
+  deleteScriptSecret: (request) => ipcRenderer.invoke("scripts:delete-secret", request),
+  setScriptEnabled: (request) => ipcRenderer.invoke("scripts:set-enabled", request),
+  runScriptNow: (request) => ipcRenderer.invoke("scripts:run-now", request),
+  deleteScript: (request) => ipcRenderer.invoke("scripts:delete", request),
+  releaseHeldScriptMessages: (request) => ipcRenderer.invoke("scripts:release-held", request),
+  discardHeldScriptMessages: (request) => ipcRenderer.invoke("scripts:discard-held", request),
+  onScriptsUpdated: (callback) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: ScriptsUpdatedEvent) => callback(payload);
+    ipcRenderer.on("scripts:updated", listener);
+    return () => ipcRenderer.removeListener("scripts:updated", listener);
+  },
+  listMemoryNotes: (request) => ipcRenderer.invoke("memory:list", request),
+  readMemoryNote: (request) => ipcRenderer.invoke("memory:read", request),
+  deleteMemoryNote: (request) => ipcRenderer.invoke("memory:delete", request),
+  listMachineInactivityQuestions: (): Promise<MachineInactivityQuestion[]> => ipcRenderer.invoke("machines:inactivity-questions"),
+  answerMachineInactivity: (request: AnswerMachineInactivityRequest): Promise<MachineInactivityQuestion[]> =>
+    ipcRenderer.invoke("machines:inactivity-answer", request),
+  onMachineInactivityQuestions: (callback: (questions: MachineInactivityQuestion[]) => void) => {
+    const listener = (_event: unknown, questions: MachineInactivityQuestion[]): void => callback(questions);
+    ipcRenderer.on("machines:inactivity-questions", listener);
+    return () => ipcRenderer.off("machines:inactivity-questions", listener);
+  },
   onArtifactsUpdated: (callback: (event: ArtifactsUpdatedEvent) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: ArtifactsUpdatedEvent) => callback(payload);
     ipcRenderer.on("artifacts:updated", listener);
@@ -208,11 +412,40 @@ const bridge: AppBridge = {
     ipcRenderer.on("conversations:review-progress", listener);
     return () => ipcRenderer.removeListener("conversations:review-progress", listener);
   },
-  onConversationUpdated: (callback: (conversation: Conversation) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, conversation: Conversation) => callback(conversation);
+  onConversationDeleted: (callback: (conversationId: string) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, conversationId: string) => callback(conversationId);
+    ipcRenderer.on("conversations:deleted", listener);
+    return () => ipcRenderer.removeListener("conversations:deleted", listener);
+  },
+  onConversationUpdated: (callback: (conversation: ConversationUpdate) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, conversation: ConversationUpdate) => callback(conversation);
     ipcRenderer.on("conversations:updated", listener);
     return () => ipcRenderer.removeListener("conversations:updated", listener);
+  },
+  getChatPromptSuggestions: (conversationId: string) => ipcRenderer.invoke("chat:get-prompt-suggestions", conversationId),
+  onChatPromptSuggestions: (callback: (update: ChatPromptSuggestionsUpdate) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, update: ChatPromptSuggestionsUpdate) => callback(update);
+    ipcRenderer.on("chat:prompt-suggestions", listener);
+    return () => ipcRenderer.removeListener("chat:prompt-suggestions", listener);
+  },
+  getChatBackgroundTasks: (conversationId: string) => ipcRenderer.invoke("chat:get-background-tasks", conversationId),
+  onChatBackgroundTasks: (callback: (event: ChatBackgroundTasksEvent) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, update: ChatBackgroundTasksEvent) => callback(update);
+    ipcRenderer.on("chat:background-tasks", listener);
+    return () => ipcRenderer.removeListener("chat:background-tasks", listener);
   }
 };
 
 contextBridge.exposeInMainWorld("consensus", bridge);
+
+// The terminal port: a MessagePort cannot cross contextBridge, so the
+// preload hands it to the page the way Electron documents for isolated
+// worlds. Must match TERMINAL_PORT_WINDOW_MESSAGE in shared/terminal.ts (a
+// sandboxed preload cannot load that file at run time).
+// The preload compiles without the DOM library, so the page is typed here.
+const page = globalThis as unknown as {
+  postMessage(message: unknown, targetOrigin: string, transfer?: unknown[]): void;
+};
+ipcRenderer.on("terminal:port", (event) => {
+  page.postMessage({ type: "accordagents:terminal-port" }, "*", event.ports);
+});

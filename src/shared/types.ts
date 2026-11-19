@@ -1,4 +1,49 @@
+import type { CreateTerminalRequest, TerminalHostStateEvent, TerminalListResult, TerminalSummary } from "./terminal";
+import type { ChatScriptChangeRequest } from "./scripts";
 import type { ChatParticipantRosterStatus } from "./chatParticipantStatus";
+import type { DeviceEventBlobReference } from "./deviceEventBlobs";
+import type {
+  CreateMachineRequest,
+  CreateMachineResult,
+  MachineEnrollmentRequest,
+  MachineListResult,
+  MachineTrustedDevicesResult,
+  SaveTrustedDeviceRequest,
+  RemoveMachineRequest,
+  MachineInactivityQuestion,
+  AnswerMachineInactivityRequest
+} from "./machineLink";
+import type {
+  MachineInstallRecord,
+  MachineInstallRequest,
+  MachineInstallResult,
+  MachineInstallSnapshot,
+  MachineMirrorBootstrapRequest,
+  MachineMirrorBootstrapResult,
+  MachineRuntimePayloadInfo,
+  MachineRuntimeProbe,
+  MachineSshTarget,
+  MachineUpgradeRequest
+} from "./machineInstall";
+
+export type {
+  MachineInstallRecord,
+  MachineInstallRequest,
+  MachineInstallResult,
+  MachineInstallSnapshot,
+  MachineMirrorBootstrapRequest,
+  MachineMirrorBootstrapResult,
+  MachineRuntimeProbe,
+  MachineSshTarget,
+  MachineUpgradeRequest
+} from "./machineInstall";
+import type { MobileControlSettings } from "./mobilePairing";
+
+export type {
+  CreateMobilePairingRequest,
+  CreateMobilePairingResult,
+  MobileControlSettings
+} from "./mobilePairing";
 
 export type ProviderKind = "openai" | "anthropic" | "gemini" | "codex-cli" | "claude-code" | "gemini-cli";
 
@@ -32,6 +77,7 @@ export interface CloudRunWorkerSettings {
   workerRoot?: string;
   remoteCwd?: string;
   codexPath?: string;
+  claudePath?: string;
 }
 
 export type CloudRunWorkerMode = "ssh" | "aws";
@@ -52,6 +98,10 @@ export interface AwsWorkerHandleInfo {
   vCpu?: number;
   memoryMiB?: number;
   adopted?: boolean;
+  // The public address the instance had when it was last seen running. An AWS
+  // box gets a new one on every stop/start, so stored run/session handles go
+  // stale; this is the one place that tracks where the machine is NOW.
+  lastKnownHost?: string;
   createdAt: string;
 }
 
@@ -156,6 +206,13 @@ export interface AwsWorkerStatus {
   state?: AwsWorkerLifecycleState;
   publicIp?: string;
   message?: string;
+  /** Failure of the requested mutation, independent of the observed EC2 state. */
+  actionError?: string;
+  /** Lines the AWS page tells the User about what the app did by itself,
+   *  each only while it holds: the instance AWS no longer has was removed
+   *  with its machine; an old cloud machine could not be removed from this
+   *  computer yet; or the app could not confirm an old one is gone. */
+  notices?: string[];
   persistentStorage?: {
     rootVolumeBackedByEbs: boolean;
     rootDeviceName?: string;
@@ -164,6 +221,163 @@ export interface AwsWorkerStatus {
   actualSpec?: AwsWorkerActualSpec;
   specMismatch?: AwsWorkerSpecMismatch;
   operation?: AwsWorkerOperationSnapshot;
+  /** The automatic-stop switch and, while it is on, anything that keeps the
+   *  instance from stopping by itself. Absent when it could not be read. */
+  autoStop?: AwsWorkerAutoStop;
+  /** The program on the running instance is still not back although the
+   *  app tried to bring it back itself, in plain words; shown in the Cloud
+   *  program section's Connection row. */
+  machineProblem?: string;
+}
+
+/** Automatic stop as Settings → AWS shows it: one switch, and, when the
+ *  switch is on but the instance will not stop by itself, why. */
+export interface AwsWorkerAutoStop {
+  /** The switch: a stop key is saved and the User left automatic stop on. */
+  enabled: boolean;
+  /** Turning the switch on first needs the setup command: there is no stop key. */
+  needsSetup: boolean;
+  /** Shown in the Automatic stop row. Agents working is not a problem. */
+  problem?: AwsWorkerAutoStopProblem;
+  /** Switched-on scheduled scripts on the instance: they keep it running so
+   *  each run finds it awake. */
+  keptOnByScripts?: number;
+}
+
+export interface AwsWorkerAutoStopProblem {
+  /** What is wrong, in plain words. */
+  message: string;
+  /** What fixes it: the setup command again, or setting up the program on
+   *  the cloud machine again. Without one, the message says what to do. */
+  action?: "set-up-again" | "reconnect";
+  actionLabel?: string;
+  /** The machine the fix acts on. */
+  machineId?: string;
+}
+
+/** What fills the AWS instance's disk, measured on the instance. */
+export type AwsDiskCategoryId =
+  | "system" | "other-programs" | "cloud-runs" | "agent-tools" | "program-logs"
+  | "project-copies" | "program-data" | "caches" | "program-versions" | "system-logs" | "swap";
+
+export interface AwsDiskCategory {
+  id: AwsDiskCategoryId;
+  bytes: number;
+  /** What "Clean up" frees; absent where nothing can be cleaned. */
+  cleanableBytes?: number;
+  /** Program versions kept, or other programs on the instance. */
+  count?: number;
+  /** Program versions the running program uses. */
+  inUse?: number;
+  /** Other programs that are running. */
+  running?: number;
+  /** Log files kept. */
+  files?: number;
+  /** Project copies by folder name. */
+  projects?: string[];
+}
+
+export interface AwsDiskReport extends AwsDiskSpace {
+  categories: AwsDiskCategory[];
+  measuredAt: number;
+}
+
+export type AwsDiskCleanCategory = "program-logs" | "caches" | "program-versions" | "system-logs";
+
+/** A member's work in a git project, lost when the folder holding it goes. */
+export type AwsDiskWorkReason = "worktree" | "changes" | "unpushed";
+
+/** Chosen project copies, each with the kinds of work the User saw on it. */
+export type AwsDiskChosenWork = Record<string, AwsDiskWorkReason[]>;
+
+/** Why a file on the instance cannot be removed from Settings. A work
+ *  reason locks anything but a whole project copy, and a project copy
+ *  whose work changed after the User chose it. */
+export type AwsDiskLockReason =
+  | "system" | "sign-ins" | "agent-tools" | "program" | "running-version" | "qa-browser"
+  | "other-program" | "in-use" | "repository" | "worktree-elsewhere" | "unreadable" | AwsDiskWorkReason;
+
+/** What a folder on the instance is to the User, when its name alone does
+ *  not say; decided on the instance, which knows its layout. */
+export type AwsDiskEntryRole =
+  | "program" | "other-program" | "idle-program" | "program-data" | "cloud-runs" | "project-copies"
+  | "versions" | "agent-tools" | "sign-ins" | "logs" | "cache" | "mailbox-runners";
+
+export interface AwsDiskEntry {
+  name: string;
+  path: string;
+  bytes: number;
+  dir: boolean;
+  /** Why it cannot be removed from Settings. */
+  lock: AwsDiskLockReason | null;
+  /** A whole project copy only: every kind of work a member would lose
+   *  with it, in a fixed order; set only when nothing locks it. */
+  work?: AwsDiskWorkReason[];
+  role?: AwsDiskEntryRole;
+}
+
+export interface AwsDiskListing {
+  path: string;
+  home: string;
+  /** This desktop's program folder on the instance. */
+  own: string;
+  entries: AwsDiskEntry[];
+  /** Entries left out after the largest ones. */
+  truncated: number;
+  /** The disk as the listing was read. */
+  space?: AwsDiskSpace;
+}
+
+/** One project copy on the AWS instance, as Settings → AWS → Projects shows it. */
+export interface AwsInstanceProject {
+  /** The copy's folder on the instance. */
+  path: string;
+  name: string;
+  /** The project on this computer the copy was made from, when known. */
+  localPath?: string;
+  bytes: number;
+  /** Why it cannot be deleted now. */
+  lock: AwsDiskLockReason | null;
+  /** Members' work that goes with it when it is deleted. */
+  work?: AwsDiskWorkReason[];
+}
+
+export interface AwsInstanceProjects {
+  copies: AwsInstanceProject[];
+  /** This computer's projects without a copy on the instance, newest first. */
+  available: Array<{ path: string; label: string }>;
+  /** Why no project can be added yet, when one cannot. */
+  addUnavailable?: string;
+  freeBytes?: number;
+}
+
+/** A project being copied to the instance from Settings → AWS → Projects. */
+export interface AwsInstanceProjectProgress {
+  localPath: string;
+  message: string;
+}
+
+export interface AwsDiskSpace {
+  totalBytes: number;
+  usedBytes: number;
+  availableBytes: number;
+}
+
+export interface AwsDiskChangeResult {
+  freedBytes: number;
+  removed?: number;
+  /** What went, as the instance names it (its home folder resolved). */
+  removedPaths?: string[];
+  failed: Array<{ path: string; reason: AwsDiskLockReason | "error"; message?: string }>;
+  /** The disk right after the change; categories are measured again later. */
+  space: AwsDiskSpace;
+}
+
+/** The automatic-stop switch. Turning it on with a pasted setup result also
+ *  saves the result's stop key; without one, a saved key must exist. */
+export interface SetAwsAutoStopRequest {
+  enabled: boolean;
+  blob?: string;
 }
 
 export interface ConnectAwsWorkerRequest {
@@ -182,8 +396,24 @@ export type AwsWorkerStartPhase =
 
 export type AwsWorkerSpecResolution = "keep" | "grow-disk" | "recreate";
 
+/** The parts of setting the AWS instance up, in the order they run. */
+export type AwsSetupStepId = "instance" | "tools" | "sign-in-codex" | "sign-in-claude" | "program";
+
+/** One part of the setup as the User sees it: what it is doing now, or how
+ *  it ended. Kept with the operation, so a reopened page shows the same. */
+export interface AwsSetupStep {
+  id: AwsSetupStepId;
+  state: "pending" | "current" | "done" | "skipped" | "failed";
+  detail?: string;
+  /** When the step began, so a long one visibly keeps moving. */
+  startedAt?: string;
+}
+
 export interface AwsWorkerStartRequest {
   operationId: string;
+  /** "check" is read-only: it probes AWS access and classifies a refusal
+   *  into recovery steps; it never creates, starts or sets anything up. */
+  intent?: "setup" | "resize" | "check";
   clientToken?: string;
   blob?: string;
   instanceType?: string;
@@ -191,10 +421,12 @@ export interface AwsWorkerStartRequest {
   resolution?: AwsWorkerSpecResolution;
   expectedInstanceId?: string;
   expectedDesiredSpec?: AwsWorkerSpec;
+  expectedActualSpec?: AwsWorkerSpec;
 }
 
 export interface AwsWorkerOperationSnapshot {
   operationId: string;
+  intent?: "setup" | "resize" | "check";
   clientToken?: string;
   phase: AwsWorkerStartPhase;
   message: string;
@@ -204,8 +436,15 @@ export interface AwsWorkerOperationSnapshot {
   error?: string;
   authUrl?: string;
   authCode?: string;
+  authProvider?: "codex-cli" | "claude-code";
+  authRequestId?: string;
+  /** Present for a start or setup: every step with its state. */
+  setupSteps?: AwsSetupStep[];
   status?: AwsWorkerStatus;
   specMismatch?: AwsWorkerSpecMismatch;
+  missingAwsActions?: string[];
+  awsPrincipalArn?: string;
+  awsPrincipalUserName?: string;
 }
 
 export interface AwsWorkerVolumeExpansion {
@@ -237,9 +476,14 @@ export type CloudRunWorkerCheckId =
   | "build-essential"
   | "codex"
   | "codex-auth"
+  | "claude"
+  | "claude-auth"
   | "git-identity"
   | "persistent-storage"
-  | "userns";
+  | "userns"
+  | "browser"
+  | "headless-display"
+  | "sqlite3";
 
 export type CloudRunWorkerCheckStatus = "pass" | "warn" | "fail";
 
@@ -261,14 +505,19 @@ export interface CloudRunWorkerDoctorReport {
 export interface CloudRunWorkerSetupProgress {
   stage: string;
   message: string;
-  // Present while the codex device-auth fix waits for the user to approve the
+  // Present while a provider device-auth fix waits for the user to approve the
   // sign-in in their browser.
   authUrl?: string;
   authCode?: string;
+  authProvider?: "codex-cli" | "claude-code";
+  authRequestId?: string;
+  /** How a provider sign-in ended, on its last frame. */
+  signInOutcome?: "completed" | "skipped" | "expired" | "failed";
 }
 
 export interface RemoteRunSyncInfo {
   localPath: string;
+  // Stable per-project mirror repo on the worker.
   remotePath?: string;
 }
 
@@ -288,6 +537,7 @@ export interface RemoteRunHandle {
   error?: string;
   sync?: RemoteRunSyncInfo;
   promptContextPointerAdvance?: ChatPromptContextPointerAdvance;
+  executionLease?: ChatExecutionLeaseMetadata;
 }
 
 export interface RemoteParticipantSessionHandle {
@@ -323,26 +573,40 @@ export interface ChatPromptContextSettings {
   timeline: ChatPromptContextScopeSettings;
 }
 
+import type {
+  AvatarStudioTurnRequest,
+  AvatarStudioTurnResult,
+  CustomAvatarSummary,
+  ReadCustomAvatarResult,
+  SaveCustomAvatarRequest
+} from "./avatarStudio";
+
 export interface AppSettings {
   roundLimitDefault: number;
   betaUpdates: boolean;
+  /** Error, crash and usage reports to the app's Sentry project; on unless
+   *  the User turned them off. */
+  crashReports: boolean;
   cliAgentRunTimeoutMs: number;
   chatParticipantRequestMaxDepth: number;
   chatParticipantRequestPromptMaxChars: number;
   chatAutoWatchWakeLimit: number;
   chatPromptContext: ChatPromptContextSettings;
   cloudRuns: CloudRunsSettings;
+  mobileControl: MobileControlSettings;
   providers: ProviderSettings[];
   cliProviderHosts: CliProviderHost[];
   chatRoleConfigs: ChatRoleConfig[];
   chatBehaviorRules: ChatBehaviorRuleConfig[];
   chatSavedPrompts: ChatSavedPromptConfig[];
   chatParticipantConfigs: ChatParticipantConfig[];
+  chatCustomAvatars: CustomAvatarSummary[];
   chatParticipantSeedState?: ChatParticipantSeedState;
   assistantProviderKind?: ChatProviderKind;
   lastSuccessfulChatProviderKind?: ChatProviderKind;
   lastRepoPath?: string;
   repoFileOpenAction?: RepoFileOpenAction;
+  repoFileExternalOpenAction?: RepoFileExternalOpenAction;
 }
 
 export interface ChatRoleConfig {
@@ -613,7 +877,7 @@ export interface PluginListResult {
 
 export type ChatRoleRuntime = "claude-agent" | "codex-developer-instructions" | "prompt-fallback";
 
-export type ChatAppToolCapability = "participants.manage" | "participants.request" | "compaction.request" | "permissions.request";
+export type ChatAppToolCapability = "participants.manage" | "participants.request" | "compaction.request" | "permissions.request" | "scripts.request";
 
 export type ChatReactionActorKind = "user" | "participant";
 
@@ -698,6 +962,15 @@ export interface ChatParticipant {
   agentMode?: ChatAgentMode;
   permissions?: ChatAgentPermissions;
   remoteExecution?: CloudRunRemoteExecutionMode;
+  /** Machine that hosts this participant's sessions (machines transport).
+   *  Absent = this desktop unless a Cloud choice is awaiting preparation. */
+  homeMachineId?: string;
+  /** Cloud choice is saved before the machine is ready. */
+  cloudRun?: import("./cloudRunPreparation").CloudRunSelection;
+  /** The member's session, put on the User's server by the device it moved
+   *  away from, for the device it runs on now to take before its next turn.
+   *  Written only by the computer, like the other home fields. */
+  sessionHandoff?: import("./memberSessionMove").ChatSessionHandoff;
   skipToolchainPreflight?: boolean;
   autoWatch?: boolean;
 }
@@ -705,6 +978,7 @@ export interface ChatParticipant {
 export interface ChatParticipantSession {
   participantId: string;
   sessionId: string;
+  executionSessionId?: string;
   roleConfigId: string;
   roleConfigVersion: number;
   roleAppToolCapabilities?: ChatAppToolCapability[];
@@ -724,6 +998,12 @@ export interface ChatParticipantSession {
   remoteSession?: RemoteParticipantSessionHandle;
   invalidatedRemoteSessionId?: string;
   invalidatedRemoteSessionAt?: string;
+  /** The handoff (its body's hash) this session was taken from, so it is
+   *  taken once on this device; see ChatParticipant.sessionHandoff. */
+  importedHandoff?: string;
+  /** Device-local: it moved here with this session, and its next turn tells
+   *  it so (memberMovedNote); cleared once a turn of it succeeded. */
+  movedHere?: { from: string; to: string; at: string };
   updatedAt: string;
 }
 
@@ -757,6 +1037,20 @@ export interface ChatPendingChoice {
   note?: string;
   selectedAt?: string;
   cancelledAt?: string;
+  /** When the member asked it (the end of the reply that carries it). */
+  askedAt?: string;
+  /** Closed by the app, not by the User: an hour after it was asked, once
+   *  the User had gone on with its member. Its status is `cancelled`, so it
+   *  is closed everywhere a cancelled choice is; it is shown as expired. */
+  expiredAt?: string;
+  /** The durable answer which saved this selection, before native admission. */
+  decisionEventId?: string;
+  responseMessageId?: string;
+  responseRunId?: string;
+  /** The last few answers this choice was given and refused, oldest first,
+   *  each by the operation it was sent under. Shown to the devices that sent
+   *  them only while the choice still waits. */
+  refusals?: Array<{ operationId: string; reason: string; at: string }>;
 }
 
 export type ChatRosterChangeOperationType = "add";
@@ -863,6 +1157,24 @@ export interface ChatParticipantChangeRequest {
   operations: ChatParticipantChangeOperation[];
 }
 
+// A member asks to take another member out of the chat. The app resolves the
+// target when the request is made; the stored handle is for display only.
+export interface ChatParticipantRemoveOperation {
+  type: "remove_participant_from_chat";
+  participantId: string;
+  handle: string;
+}
+
+// Decided by the asking member's Manage members setting, like an addition:
+// allow records it as auto-applied, ask puts it on a card for the User. Once
+// decided it is applied when the chat has no live work (see
+// ChatAppToolApproval.memberRemovalQueuedAt).
+export interface ChatParticipantRemovalRequest {
+  kind: "participant_removal";
+  reason?: string;
+  operations: ChatParticipantRemoveOperation[];
+}
+
 export interface ChatRoleParticipantChangeRequest {
   kind: "role_participant_change";
   reason?: string;
@@ -911,6 +1223,24 @@ export interface ChatToolPermissionRequest {
   reason?: string;
   toolName: string;
   toolInput?: unknown;
+}
+
+/** A member asks the User to sign in to (or reconnect) an MCP server its task
+ *  needs (src/shared/connectorSignIn.ts). The sign-in address comes from the
+ *  member's CLI, never from the member. Answering it approves "Done" (the app
+ *  reconnects the server) or declines "Not now". */
+export interface ChatConnectorSignInRequest {
+  kind: "connectorSignIn";
+  /** The server's name as the CLI lists it, e.g. "claude.ai Sentry". */
+  connector: string;
+  /** sign-in: the CLI needs the User to authenticate; reconnect: the server
+   *  failed to connect, and the User fixes it, then reconnects. */
+  action: "sign-in" | "reconnect";
+  authUrl?: string;
+  /** The server's own sign-in, whose browser return the member's CLI takes on
+   *  the computer it runs on: it can finish only in a browser there. */
+  callbackOnMemberComputer?: boolean;
+  reason?: string;
 }
 
 export interface ChatParticipantRequestInput {
@@ -1008,6 +1338,9 @@ export interface ChatRosterCurrentParticipant {
   permissions?: ChatAgentPermissions;
   manageRolesParticipants?: ChatManageRolesParticipantsResolution;
   remoteExecution?: CloudRunRemoteExecutionMode;
+  homeMachineId?: string;
+  /** Cloud choice is saved before the machine is ready. */
+  cloudRun?: import("./cloudRunPreparation").CloudRunSelection;
   skipToolchainPreflight?: boolean;
   autoWatch?: boolean;
 }
@@ -1065,12 +1398,15 @@ export interface ChatPermissionRequestToolResult {
 }
 
 export type ChatAppToolApprovalRequest =
+  | ChatScriptChangeRequest
   | ChatRosterChangeRequest
   | ChatRoleChangeRequest
   | ChatParticipantChangeRequest
+  | ChatParticipantRemovalRequest
   | ChatRoleParticipantChangeRequest
   | ChatPermissionChangeRequest
   | ChatToolPermissionRequest
+  | ChatConnectorSignInRequest
   | ChatParticipantRequestApprovalRequest
   | ChatSelfCompactionRequest
   | ChatCodexApprovalRequest;
@@ -1164,6 +1500,32 @@ export interface ChatAppToolApproval {
   };
   consumedAt?: string;
   error?: string;
+  /** A member removal decided (approved by the User, or auto-applied under
+   *  the member's Manage members setting) and waiting for the chat's running
+   *  turns to finish; cleared when the removal is applied or could not be.
+   *  The asking member's own device applies it (Д2). */
+  memberRemovalQueuedAt?: string;
+  /** An approved (or auto-applied) addition requested by a member on a
+   *  machine, waiting for the desktop, which owns the member list, to apply it. */
+  memberAdditionQueuedAt?: string;
+  /** Desktop only: when the desktop applied (or could not apply) a machine
+   *  member's roster change, so an older copy of the card from the machine
+   *  does not bring the waiting state back. */
+  rosterChangeSettledAt?: string;
+  /** The desktop's view of a card a member on this machine raised on the
+   *  User's server: the desktop shows it, and answers it there. */
+  homeMachineId?: string;
+  /** Answered on the User's server (from any device), not applied by the
+   *  member's machine yet. */
+  machineDecisionPending?: { decisionId: string; machineName: string; approve: boolean; at: string };
+  machineDecisionReceiptId?: string;
+  /** Desktop only: the User's answer to a machine member's roster change, as
+   *  the User's server holds it (`server:<card>@<answered at>`); the desktop
+   *  applies the change only for that answer. */
+  machineAppliedDecisionId?: string;
+  /** Answers its device could not apply (the last few), by the operation
+   *  each was sent under: the card is asked again and says why. */
+  cardRefusals?: ChatCardRefusal[];
 }
 
 export interface ChatAppToolApprovalPolicy {
@@ -1179,13 +1541,101 @@ export interface ChatAppToolApprovalPolicy {
   updatedAt: string;
 }
 
+/** A chat member's live background work (Claude Code `run_in_background`),
+ *  by task name; an empty list means none is running any more. */
+export interface ChatBackgroundTasksEvent {
+  conversationId: string;
+  participantId: string;
+  labels: string[];
+}
+
+/** The desktop's outcome of a roster change a member asked for, on the chat
+ *  message that says it: a machine settles its own copy of the card from it
+ *  (it never applies a roster change itself). */
+export interface ChatRosterChangeOutcome {
+  approvalId: string;
+  outcome: "applied" | "refused";
+  appliedParticipantIds?: string[];
+  error?: string;
+}
+
+/** An answer a member's device could not apply, by the operation it was
+ *  sent under on the User's server. */
+export interface ChatCardRefusal {
+  operationId: string;
+  reason: string;
+  at: string;
+}
+
+/** A card answered on the User's server for a member that runs elsewhere,
+ *  while its device has not applied the answer yet. */
+export interface ChatServerCardMark {
+  cardId: string;
+  state: "answered";
+  answer: Record<string, unknown>;
+  answeredAt: string;
+  /** Where the member runs ("the machine" when unnamed). */
+  machineName: string;
+}
+
+/** The reply a turn-finished note points at, and the member who wrote it. */
+export interface ChatTurnFinishedNoteMetadata {
+  messageId: string;
+  participantId: string;
+  participantLabel: string;
+}
+
 export interface ChatMessageMetadata {
+  /** A machine member could not start because the machine's copy of the
+   *  project is gone: the computer that made the copy forgets it, so the
+   *  next message copies it again. */
+  missingProjectCopy?: { machineId: string; sourcePath: string };
+  /** The message's place in the User's server's order (agreement Д1): set
+   *  by the server when it accepted the message, the same on every device. */
+  serverSeq?: number;
+  /** The device that wrote the message on the server, the only one that may
+   *  change it (agreement Д2). */
+  serverWriter?: string;
+  /** This device's view of the turns the message asked for, by member (who
+   *  took each, whether it was asked to stop). Never sent to the server. */
+  serverTurns?: Record<string, { runId: string; state: "requested" | "claimed" | "stopped" | "finished"; executorDeviceId?: string; stopRequested?: boolean; outcome?: "done" | "error" | "stopped" | "interrupted" }>;
+  /** A bubble shown here for a member that runs on another device, until that
+   *  device writes the real one. Never sent to the server. */
+  serverPlaceholder?: boolean;
+  /** The User's server refused this message, with its reason (agreement Д3:
+   *  shown instead of "sent"). Never sent to the server. */
+  serverRejected?: string;
+  /** This device's view of a card the message's member waits on that runs
+   *  on another device: answered (from any device), and not applied there
+   *  yet. Shown as answered and waiting; never sent to the server. */
+  serverCard?: ChatServerCardMark;
+  /** Answers to this message's mention approvals its device could not apply
+   *  (the last few), shown with the card asked again. */
+  mentionCardRefusals?: ChatCardRefusal[];
+  rosterChange?: ChatRosterChangeOutcome;
+  /** Machines transport, Rule 2: a Stop was requested but the member's
+   *  machine has not confirmed it yet (shown honestly instead of "stopped");
+   *  kept apart from the content so delivered text is never overwritten. */
+  stopPending?: { machineName: string; at: string };
+  machinePending?: { machineName: string; at: string; reason?: string };
+  /** Machines transport: this member's turn never left the desktop (stopped
+   *  while preparing, or refused before it was sent), so the desktop, not the
+   *  member's home machine, settles the bubble. */
+  machineTurnNotSent?: boolean;
+  cloudRunPreparation?: import("./cloudRunPreparation").CloudRunPreparationProgress;
+  /** Machines transport: the result already folded into this bubble
+   *  (identified by the machine's finishedAt), so a redelivery of the same
+   *  result is applied once while a real result still replaces a provisional
+   *  desktop-side outcome such as a timeout. */
+  machineOutcome?: { runId: string; status: string; finishedAt?: string; receiptId?: string };
   threadId?: string;
   parentMessageId?: string;
   chatThreadRootId?: string;
   reactions?: ChatMessageReactions;
   staleRunRecovery?: ChatStaleRunRecovery;
-  terminalReason?: "user-stopped";
+  /** "stop-unconfirmed": machines transport, Rule 2 — a Stop the member's
+   *  machine never confirmed; shown as such, never as "stopped by user". */
+  terminalReason?: "user-stopped" | "stop-unconfirmed";
   mentions?: string[];
   skillMentions?: ChatSkillMention[];
   repoFileMentions?: RepoFileMention[];
@@ -1200,6 +1650,7 @@ export interface ChatMessageMetadata {
   approvedContinuation?: boolean;
   syncedThroughMessageId?: string;
   runId?: string;
+  mobileEventId?: string;
   turnSegmentId?: string;
   participantRequestDepth?: number;
   participantRequestBatchId?: string;
@@ -1214,13 +1665,36 @@ export interface ChatMessageMetadata {
     outcome: "completed" | "failed" | "no-active-session";
     instructionsProvided: boolean;
   };
+  /** A machine's hidden answer to a `session.export` turn: where it put the
+   *  member's session on the User's server for its move. */
+  memberSessionExport?: import("./memberSessionMove").MemberSessionExportReport;
+  /** A machine's hidden word that it took the session its member was handed. */
+  memberSessionTaken?: import("./memberSessionMove").MemberSessionTakenReport;
+  /** The computer's hidden word that a move it asked a machine for was not
+   *  made: the machine lets the member's held turns go. */
+  memberMoveCancelled?: { participantId: string; runId: string };
   workedMs?: number;
   queuedBehind?: { handle: string };
   appMessageSource?: string;
+  /** Set on messages a scheduled script posted. */
+  scriptId?: string;
+  scriptName?: string;
   artifactEventId?: string;
+  /** An artifact note: the Accord launch message its document belongs to, so
+   *  that Accord's card shows the step instead of a card of its own. */
+  accordLaunchMessageId?: string;
+  /** Who leads that Accord and who is in it, as its launch names them, so the
+   *  Accord's card can be drawn when the launch itself is not loaded. */
+  accordLaunch?: { facilitator: string; members: string[] };
+  /** On a turn-finished note (appMessageSource TURN_FINISHED_NOTE_SOURCE): the
+   *  member's reply it points at, which had other messages below it when the
+   *  turn ended. */
+  turnFinishedNote?: ChatTurnFinishedNoteMetadata;
   activityEvents?: ChatAgentActivityEvent[];
   processingTranscript?: ChatProcessingTranscript;
   remoteRunStatus?: ChatRemoteRunStatus;
+  executionLease?: ChatExecutionLeaseMetadata;
+  executionLeaseSuperseded?: boolean;
   accordResolution?: ChatAccordResolutionMetadata;
   autoWatchTrigger?: {
     participantId: string;
@@ -1229,10 +1703,25 @@ export interface ChatMessageMetadata {
   };
 }
 
+export interface ChatExecutionLeaseMetadata {
+  conversationId: string;
+  participantId: string;
+  participantSessionId: string;
+  leaseId: string;
+  holderId: string;
+  generation: number;
+  status: "active" | "released" | "reclaimed" | "conflict";
+  acquiredAt: string;
+  heartbeatAt: string;
+  expiresAt: string;
+  releasedAt?: string;
+}
+
 export type ChatRemoteRunPhase =
   | "preparing-worker"
   | "syncing-files"
   | "launching-session"
+  | "waiting-for-runner"
   | "waiting-for-response"
   | "processing-request"
   | "waiting-for-approval"
@@ -1350,6 +1839,11 @@ export interface ChatParticipantConfig {
   agentMode?: ChatAgentMode;
   permissions?: ChatAgentPermissions;
   remoteExecution?: CloudRunRemoteExecutionMode;
+  /** Machine that hosts this participant's sessions (machines transport).
+   *  Absent = this desktop unless a Cloud choice is awaiting preparation. */
+  homeMachineId?: string;
+  /** Cloud choice is saved before the machine is ready. */
+  cloudRun?: import("./cloudRunPreparation").CloudRunSelection;
   skipToolchainPreflight?: boolean;
   autoWatchEnabled?: boolean;
   updatedAt: string;
@@ -1368,6 +1862,9 @@ export interface ChatParticipantConfigUpdate {
   agentMode?: ChatAgentMode;
   permissions?: ChatAgentPermissions;
   remoteExecution?: CloudRunRemoteExecutionMode;
+  homeMachineId?: string;
+  /** Cloud choice is saved before the machine is ready. */
+  cloudRun?: import("./cloudRunPreparation").CloudRunSelection;
   skipToolchainPreflight?: boolean;
   autoWatchEnabled?: boolean;
 }
@@ -1385,11 +1882,15 @@ export interface ChatParticipantInput {
   agentMode?: ChatAgentMode;
   permissions?: ChatAgentPermissions;
   remoteExecution?: CloudRunRemoteExecutionMode;
+  homeMachineId?: string;
+  /** Cloud choice is saved before the machine is ready. */
+  cloudRun?: import("./cloudRunPreparation").CloudRunSelection;
   skipToolchainPreflight?: boolean;
   autoWatch?: boolean;
 }
 
 export interface CreateChatConversationRequest {
+  runId?: string;
   title?: string;
   repoPath?: string;
   skipDefaultParticipants?: boolean;
@@ -1409,6 +1910,9 @@ export interface UpdateChatParticipantRuntimeRequest {
   agentMode?: ChatAgentMode;
   permissions?: ChatAgentPermissions;
   remoteExecution?: CloudRunRemoteExecutionMode;
+  homeMachineId?: string;
+  /** Cloud choice is saved before the machine is ready. */
+  cloudRun?: import("./cloudRunPreparation").CloudRunSelection;
   skipToolchainPreflight?: boolean;
   autoWatch?: boolean;
 }
@@ -1430,6 +1934,26 @@ export interface CompactChatParticipantRequest {
   chatThreadRootId?: string;
 }
 
+/** Restart a member's CLI process (the members list): its next turn starts a
+ *  new process that resumes the same session with the settings of then. */
+export interface RestartChatParticipantRequest {
+  conversationId: string;
+  participantId: string;
+  runId?: string;
+  /** The User agreed to stop the member's background tasks; without it a
+   *  member that has some is not restarted. */
+  stopBackgroundTasks?: boolean;
+}
+
+/** Claude in Chrome as this computer's Claude Code has it ("Enabled by
+ *  default" in its `/chrome` dialog). */
+export interface ClaudeChromeSetting {
+  enabledByDefault: boolean;
+  /** CLAUDE_CODE_ENABLE_CFC in the environment decides it instead, as in the
+   *  CLI itself. */
+  environmentDecides?: boolean;
+}
+
 export interface RenameChatConversationRequest {
   conversationId: string;
   title: string;
@@ -1438,6 +1962,7 @@ export interface RenameChatConversationRequest {
 export interface SetChatArchivedRequest {
   conversationId: string;
   archived: boolean;
+  onlyIfEmpty?: boolean;
 }
 
 export interface DeleteChatConversationRequest {
@@ -1464,6 +1989,7 @@ export interface DismissConversationWarningsRequest {
 export interface SendChatMessageRequest {
   conversationId: string;
   runId?: string;
+  mobileEventId?: string;
   content: string;
   skillMentions?: ChatSkillMention[];
   repoFileMentions?: RepoFileMention[];
@@ -1477,6 +2003,12 @@ export interface ToggleChatReactionRequest {
   conversationId: string;
   messageId: string;
   emoji: string;
+}
+
+/** Takes a turn-finished note away (its cross), on every device. */
+export interface DismissTurnFinishedNoteRequest {
+  conversationId: string;
+  messageId: string;
 }
 
 export type ChatImageMimeType = "image/png" | "image/jpeg" | "image/webp";
@@ -1496,6 +2028,11 @@ export interface ChatImageAttachment {
   height: number;
   storageKey: string;
   createdAt: string;
+  /** The picture's bytes on the User's server, put there by the device that
+   *  made it (the phone, the computer or a machine) before its message, so
+   *  every other device reads it from there. Absent on pictures made before
+   *  devices put their pictures on the server. */
+  hubBlob?: DeviceEventBlobReference;
 }
 
 export interface ReadChatAttachmentRequest {
@@ -1620,6 +2157,27 @@ export interface AgentHealth {
   generation?: number;
   platform?: AgentPlatform;
   appSkillSync?: AppSkillSyncHealth;
+}
+
+/** A CLI whose own sign-in the app can start on this computer. Antigravity
+ *  has no sign-in command; it is signed in from its own app. */
+export type CliSignInKind = Extract<ChatProviderKind, "claude-code" | "codex-cli">;
+export type CliSignInStatus = "starting" | "waiting" | "checking-code" | "succeeded" | "failed" | "cancelled";
+
+/** One sign-in the CLI runs on this computer. The CLI opens the browser and
+ *  keeps the credentials; the app only starts it and shows where it is. */
+export interface CliSignInState {
+  kind: CliSignInKind;
+  requestId: string;
+  status: CliSignInStatus;
+  /** Higher is newer; an update with a lower revision is stale. */
+  revision: number;
+  /** The page the CLI printed for when the browser did not open. */
+  pageUrl?: string;
+  /** That page ends with a code the CLI reads back (Claude's). */
+  pageGivesCode?: boolean;
+  /** Why it failed, in the CLI's words when it said. */
+  message?: string;
 }
 
 export type AgentDetectionState = "detected" | "not-detected" | "unknown";
@@ -1801,6 +2359,9 @@ export interface ReviewProgress {
   findingTitle?: string;
   completed?: number;
   total?: number;
+  /** A member's restart: the members list shows it (and a machine's wait)
+   *  on that member's row until it ends. */
+  memberRestart?: { participantId: string; waiting?: boolean };
   createdAt: string;
 }
 
@@ -1813,11 +2374,18 @@ export interface AgentRunProgress {
   messageId?: string;
   partialContent?: string;
   remoteRunStatus?: ChatRemoteRunStatus;
+  /** The mobile event id of the phone-sent message this run is answering.
+   *  The phone keys its in-progress row by this id while the run itself gets
+   *  a fresh id, so live frames must carry it or a watcher can never bind
+   *  them to the row it follows. */
+  mobileEventId?: string;
 }
 
 export interface ChatMessage {
   id: string;
-  role: "user" | "participant" | "system" | "summary";
+  /** "script": posted by a scheduled script the User approved; its name is
+   *  in participantLabel and metadata.scriptName. */
+  role: "user" | "participant" | "system" | "summary" | "script";
   participantId?: string;
   participantLabel?: string;
   content: string;
@@ -1876,6 +2444,11 @@ export interface ConversationSummary {
   updatedAt: string;
   repoPath?: string;
   running?: boolean;
+  /** A member's reply in the chat has not ended (`isPendingReply`), though
+   *  this device may hold no run in it: a machine member's turn asked from
+   *  the phone. The chat list shows it as work; unlike `running` it blocks
+   *  nothing (a reply whose machine is gone may never end). */
+  replyPending?: boolean;
   archived?: boolean;
   chatParticipants?: ConversationSummaryChatParticipant[];
 }
@@ -1982,7 +2555,23 @@ export interface ChatParticipantWatcherState {
   updatedAt: string;
 }
 
+/** A Claude Code member's guess at the User's next prompt, sent by its CLI
+ *  after a reply (`--prompt-suggestions`) and offered in the chat composer as
+ *  the dedicated CLI offers it in its input. Kept in memory per chat only. */
+export interface ChatPromptSuggestion {
+  participantId: string;
+  text: string;
+  createdAt: string;
+}
+
+export interface ChatPromptSuggestionsUpdate {
+  conversationId: string;
+  /** Newest first, at most one per member. */
+  suggestions: ChatPromptSuggestion[];
+}
+
 export type ConversationMetadata = Record<string, unknown> & {
+  machineRepository?: { sourcePath: string; paths: Record<string, string> };
   activationProviderKind?: ChatProviderKind;
   activeRunParticipantIdsByRunId?: Record<string, string>;
   lastMessageByParticipant?: ChatLastMessageByParticipant;
@@ -1999,9 +2588,19 @@ export interface Conversation extends ConversationSummary {
   metadata: ConversationMetadata;
 }
 
+/** Where to open a member's turn that is in progress: the message itself,
+ *  and the thread it is in when it is a thread reply. */
+export interface ChatRunningMessageTarget {
+  messageId: string;
+  threadRootId?: string;
+}
+
 export interface ConversationMessagePageRequest {
   conversationId: string;
   beforeSequence?: number;
+  /** The page strictly before this message; takes precedence over the other
+   *  cursors. Used by readers that know message ids but not sequences. */
+  beforeMessageId?: string;
   aroundMessageId?: string;
   limit?: number;
 }
@@ -2020,6 +2619,26 @@ export interface ConversationMessagePage extends ConversationMessagePageInfo {
 export interface ConversationOpenResult {
   conversation: Conversation;
   messagePage: ConversationMessagePageInfo;
+}
+
+/** How `conversations:updated` describes a large chat without resending every
+ *  message. `messages` then holds only the messages that changed since the
+ *  previous update plus the newest `tailCount` messages (the last `tailCount`
+ *  entries, in conversation order); `removedIds` names messages that no longer
+ *  exist. The receiver merges these into the messages it already holds. Absent
+ *  on legacy and first-time updates, which carry the full message list. */
+export interface ConversationMessageDelta {
+  totalMessages: number;
+  tailCount: number;
+  removedIds: string[];
+  /** Whether any member's reply in the whole chat has not ended yet
+   *  (`isPendingReply`): the carried messages may not include it
+   *  (`ConversationSummary.replyPending`). */
+  replyPending?: boolean;
+}
+
+export interface ConversationUpdate extends Conversation {
+  messageDelta?: ConversationMessageDelta;
 }
 
 export type ChatSearchRequester =
@@ -2129,6 +2748,11 @@ export interface ChatActivityParticipantSummary {
 export interface ChatActivityTarget {
   runId?: string;
   messageId?: string;
+  /**
+   * The message is only a navigation anchor picked as a fallback, not a message this row is
+   * actually about. Such a row must not claim that message against another row that is.
+   */
+  messageIsApproximate?: boolean;
   sourceMessageId?: string;
   threadRootId?: string;
   approvalId?: string;
@@ -2149,6 +2773,8 @@ export interface ChatActivityItem {
   preview: string;
   createdAt: string;
   updatedAt: string;
+  /** Finished updates from one member in one chat share a row; how many that row stands for. */
+  groupedCount?: number;
   participant?: ChatActivityParticipantSummary;
   target: ChatActivityTarget;
 }
@@ -2159,6 +2785,10 @@ export interface ListChatActivityRequest {
   recentWindowDays?: number;
   lastViewedAtByConversationId?: Record<string, string>;
   excludedItemIds?: string[];
+  /** Per chat and member "cleared through" timestamps, so cleared updates stay cleared and uncounted. */
+  clearedRecentThroughByGroup?: Record<string, string>;
+  /** Frozen cutoff inherited from the pre-per-group clear state. */
+  clearedRecentThroughBefore?: string;
 }
 
 export interface ListChatActivityResult {
@@ -2166,8 +2796,82 @@ export interface ListChatActivityResult {
   generatedAt: string;
 }
 
-export type RepoFileOpenAction = "open" | "reveal" | "intellij-idea";
-export type LocalFileOpenAction = RepoFileOpenAction;
+/** An action the operating system performs on a file. */
+export type LocalFileOpenAction = "open" | "reveal" | "intellij-idea";
+/** What a click on a file link does: one of the OS actions, or the side panel.
+ *  "panel" is never passed to openLocalFile. */
+export type RepoFileOpenAction = LocalFileOpenAction | "panel";
+/** What the panel's "Open in…" button does. */
+export type RepoFileExternalOpenAction = "open" | "intellij-idea";
+
+export type FilePreviewKind = "text" | "markdown" | "csv" | "image" | "pdf" | "html" | "unsupported";
+
+export interface ReadFilePreviewRequest {
+  conversationId: string;
+  path: string;
+}
+
+export interface FilePreview {
+  kind: FilePreviewKind;
+  /** The path as the link gave it. */
+  path: string;
+  absolutePath: string;
+  realPath: string;
+  insideWorkspace: boolean;
+  size: number;
+  mtimeMs: number;
+  /** SHA-256 of the whole file on disk (hex), the base of every save. */
+  hash: string;
+  /** Text kinds: the content (the first FILE_PREVIEW_TEXT_EDIT_LIMIT bytes when truncated). */
+  text?: string;
+  truncated: boolean;
+  /** The file is larger than the panel reads at all. */
+  tooLarge: boolean;
+  /** UTF-8 that decodes cleanly. Only text kinds. */
+  utf8: boolean;
+  /** The text started with a UTF-8 byte-order mark (stripped from `text`, written back on save). */
+  bom: boolean;
+  editable: boolean;
+  /** Why it is read-only, in words for the User. */
+  readOnlyReason?: string;
+  /** Image and HTML: a URL the panel loads through the app's own file protocol. */
+  url?: string;
+  /** PDF: the bytes. */
+  data?: Uint8Array;
+}
+
+export interface WriteFilePreviewRequest {
+  conversationId: string;
+  path: string;
+  content: string;
+  baseHash: string;
+  bom?: boolean;
+}
+
+export type WriteFilePreviewResult =
+  | { ok: true; hash: string; mtimeMs: number; size: number }
+  | { ok: false; conflict: true; reason: "changed" | "replaced" | "deleted" }
+  | { ok: false; conflict: false; error: string };
+
+export interface FilePreviewChangedEvent {
+  realPath: string;
+  /** "changed": the content on disk differs from what the panel was told last;
+   *  "deleted": the file or its folder is gone. */
+  change: "changed" | "deleted";
+  hash?: string;
+  mtimeMs?: number;
+}
+
+/** A copy of unsaved panel edits kept in userData until they are saved or discarded. */
+export interface UnsavedFileEdit {
+  conversationId: string;
+  path: string;
+  realPath: string;
+  baseHash: string;
+  text: string;
+  bom?: boolean;
+  updatedAt: string;
+}
 
 export interface InspectLocalFileRequest {
   conversationId: string;
@@ -2212,8 +2916,10 @@ export interface StartReviewResult {
 // --- Artifacts -------------------------------------------------------------
 // Named, versioned, signable work products scoped to one chat. Artifacts live
 // in their own SQLite tables (not in conversation payloads) so they survive
-// context compaction, agent session resets, and app restarts. Members are
-// addressed by normalized handle ("gera") or the reserved "user" for the human.
+// context compaction, agent session resets, and app restarts. The User's
+// server owns them and decides every change; each device keeps a copy it
+// reads. Members are addressed by normalized handle ("gera") or the reserved
+// "user" for the human.
 
 export const ARTIFACT_USER_MEMBER = "user";
 
@@ -2231,10 +2937,14 @@ export type ArtifactDraftAudiencePolicyByAuthor = Record<string, ArtifactDraftAu
 export interface ArtifactSignature {
   signer: string;
   signedAt: string;
+  versionEventId?: string;
+  contentHash?: string;
 }
 
 export interface ArtifactVersionMeta {
   version: number;
+  versionEventId: string;
+  contentHash: string;
   author: string;
   note?: string;
   createdAt: string;
@@ -2278,6 +2988,9 @@ export interface ArtifactSummary {
   createdAt: string;
   updatedAt: string;
   archivedAt?: string;
+  /** The chat message the document was started for, when the app recorded
+   *  one: that message's card in the chat shows the document's progress. */
+  originMessageId?: string;
   approval: ArtifactApproval;
 }
 
@@ -2336,7 +3049,10 @@ export type ArtifactErrorCode =
   | "access_denied"
   | "stale_version"
   | "name_taken"
-  | "invalid_request";
+  | "invalid_request"
+  // The User's server, which owns documents, did not confirm the change
+  // (unreachable, or no answer in time): nothing is shown as done.
+  | "server_unavailable";
 
 export interface ArtifactError {
   code: ArtifactErrorCode;
@@ -2397,6 +3113,9 @@ export interface CreateCollectingArtifactRequest {
   requiredDraftAuthors: string[];
   audiencePolicyByAuthor: ArtifactDraftAudiencePolicyByAuthor;
   operationId: string;
+  /** The chat message this collection was started for. Set by the app from
+   *  the creating member's turn, never taken from the member's arguments. */
+  originMessageId?: string;
 }
 
 export type CreateArtifactRequest = CreatePublishedArtifactRequest | CreateCollectingArtifactRequest;
@@ -2406,6 +3125,8 @@ export interface ReviseArtifactRequest {
   artifactId?: string;
   name?: string;
   baseVersion: number;
+  baseVersionEventId?: string;
+  baseContentHash?: string;
   content: string;
   note?: string;
 }
@@ -2422,6 +3143,8 @@ export interface SignArtifactRequest {
   artifactId?: string;
   name?: string;
   version?: number;
+  versionEventId?: string;
+  contentHash?: string;
 }
 
 export interface UpdateArtifactAccessRequest {
@@ -2508,7 +3231,27 @@ export interface AppBridge {
   inspectLocalFile(request: InspectLocalFileRequest): Promise<InspectLocalFileResult>;
   openLocalFile(request: OpenLocalFileRequest): Promise<OpenLocalFileResult>;
   setRepoFileOpenPreference(action: RepoFileOpenAction | null): Promise<AppSettings>;
+  /** null: ask every time for a file the side panel does not show. */
+  setRepoFileExternalOpenPreference(action: RepoFileExternalOpenAction | null): Promise<AppSettings>;
+  readFilePreview(request: ReadFilePreviewRequest): Promise<FilePreview>;
+  writeFilePreview(request: WriteFilePreviewRequest): Promise<WriteFilePreviewResult>;
+  watchFilePreview(request: ReadFilePreviewRequest): Promise<void>;
+  unwatchFilePreview(realPath: string): Promise<void>;
+  /** Releases the protocol tokens of a file the panel no longer shows. */
+  releaseFilePreview(realPath: string): Promise<void>;
+  onFilePreviewChanged(callback: (event: FilePreviewChangedEvent) => void): () => void;
+  saveUnsavedFileEdit(edit: UnsavedFileEdit): Promise<void>;
+  clearUnsavedFileEdit(realPath: string): Promise<void>;
+  listUnsavedFileEdits(): Promise<UnsavedFileEdit[]>;
+  /** The main process asks the window to save every open panel file before it closes or quits. */
+  onFlushFileEdits(callback: (requestId: string) => void): () => void;
+  fileEditsFlushed(requestId: string): void;
   setBetaUpdates(enabled: boolean): Promise<AppSettings>;
+  /** Off takes effect at once; on applies from the next launch. */
+  setCrashReports(enabled: boolean): Promise<AppSettings>;
+  /** Whether this window was opened with reports running, so the renderer
+   *  starts its half of the SDK only then. */
+  readonly crashReportsActive: boolean;
   setCliAgentRunTimeoutMs(timeoutMs: number): Promise<AppSettings>;
   setChatParticipantRequestMaxDepth(maxDepth: number): Promise<AppSettings>;
   setChatParticipantRequestPromptMaxChars(maxChars: number): Promise<AppSettings>;
@@ -2517,13 +3260,45 @@ export interface AppBridge {
   saveCloudRunsSettings(update: CloudRunsSettingsUpdate): Promise<AppSettings>;
   testCloudRunWorker(request?: CloudRunWorkerSettings): Promise<CloudRunWorkerTestResult>;
   diagnoseCloudRunWorker(request?: CloudRunWorkerSettings): Promise<CloudRunWorkerDoctorReport>;
-  setupCloudRunWorker(request?: CloudRunWorkerSettings): Promise<CloudRunWorkerDoctorReport>;
+  /** `signIn`: sign in only this provider; without it every enabled
+   *  provider must be signed in, as before. */
+  setupCloudRunWorker(request?: CloudRunWorkerSettings, options?: { signIn?: "codex-cli" | "claude-code" | "none" }): Promise<CloudRunWorkerDoctorReport>;
+  getCloudRunSetupProgress(): Promise<CloudRunWorkerSetupProgress | null>;
+  submitCloudRunAuthCode(request: { requestId: string; code: string }): Promise<void>;
+  cancelCloudRunAuth(requestId: string): Promise<void>;
+  isCloudRunAuthActive(requestId: string): Promise<boolean>;
   onCloudRunSetupProgress(callback: (progress: CloudRunWorkerSetupProgress) => void): () => void;
-  getAwsWorkerBootstrapCommand(region: string): Promise<string>;
+  getAwsWorkerBootstrapCommand(region: string, recoveryOperationId?: string): Promise<string>;
   connectAwsWorker(request: ConnectAwsWorkerRequest): Promise<AwsWorkerStatus>;
   startAwsWorker(request: AwsWorkerStartRequest): Promise<AwsWorkerStartResult>;
   onAwsWorkerProgress(callback: (progress: AwsWorkerOperationSnapshot) => void): () => void;
   getAwsWorkerStatus(): Promise<AwsWorkerStatus>;
+  /** The automatic-stop switch; returns the status it leads to. */
+  setAwsAutoStop(request: SetAwsAutoStopRequest): Promise<AwsWorkerStatus>;
+  /** Sets the program on the instance's cloud machine up again, the way
+   *  choosing Cloud run does, so it can stop the instance by itself. */
+  reconnectAwsMachine(machineId?: string): Promise<AwsWorkerStatus>;
+  /** The running instance's disk, measured on it (a slow, low-priority pass)
+   *  or the last measurement when it is recent; never starts the instance. */
+  getAwsInstanceDisk(options?: { refresh?: boolean }): Promise<AwsDiskReport>;
+  cleanAwsInstanceDisk(category: AwsDiskCleanCategory): Promise<AwsDiskChangeResult>;
+  /** A folder on the instance, largest first. "@runs" and "@mirrors" name the
+   *  cloud run files and the project copies; nothing means the home folder. */
+  listAwsInstanceFiles(path?: string): Promise<AwsDiskListing>;
+  /** Removes only what the instance itself confirms is safe at that moment.
+   *  `withWork` names the chosen project copies the User deletes with their
+   *  members' work, with the kinds of work she saw on each; a copy that
+   *  holds any other kind by then stays. */
+  deleteAwsInstanceFiles(paths: string[], options?: { withWork?: AwsDiskChosenWork }): Promise<AwsDiskChangeResult>;
+  /** Settings → AWS → Projects: the project copies on the instance and this
+   *  computer's projects that could be added. */
+  listAwsInstanceProjects(): Promise<AwsInstanceProjects>;
+  /** Copies one of this computer's projects to the instance; resolves when
+   *  the copy is there. A copy already there is kept as it is. */
+  addAwsInstanceProject(localPath: string): Promise<void>;
+  /** Stops a copy `addAwsInstanceProject` is making; nothing half-copied stays. */
+  cancelAwsInstanceProjectAdd(localPath: string): Promise<void>;
+  onAwsInstanceProjectProgress(callback: (progress: AwsInstanceProjectProgress) => void): () => void;
   stopAwsWorker(): Promise<AwsWorkerStatus>;
   deleteAwsWorker(): Promise<AwsWorkerStatus>;
   getAgentEnvironment(): Promise<AgentEnvironmentSnapshot>;
@@ -2541,11 +3316,34 @@ export interface AppBridge {
   saveChatSavedPromptConfig(update: ChatSavedPromptConfigUpdate): Promise<AppSettings>;
   deleteChatSavedPromptConfig(id: string): Promise<AppSettings>;
   saveChatParticipantConfig(update: ChatParticipantConfigUpdate): Promise<AppSettings>;
+  runAvatarStudioTurn(request: AvatarStudioTurnRequest): Promise<AvatarStudioTurnResult>;
+  cancelAvatarStudioTurn(studioId: string): Promise<void>;
+  closeAvatarStudio(studioId: string): Promise<void>;
+  saveCustomAvatar(request: SaveCustomAvatarRequest): Promise<AppSettings>;
+  readCustomAvatar(id: string): Promise<ReadCustomAvatarResult>;
   deleteChatParticipantConfig(id: string): Promise<AppSettings>;
   updateLastRepoPath(repoPath: string): Promise<AppSettings>;
   listProviderModels(kind: ProviderKind): Promise<ProviderModelCatalog>;
   detectAgents(request?: AgentDetectionRequest): Promise<AgentHealth[]>;
+  /** Runs the CLI's own sign-in on this computer (`claude auth login`,
+   *  `codex login`); a second start while one runs returns that one. */
+  startCliSignIn(kind: CliSignInKind): Promise<CliSignInState>;
+  listCliSignIns(): Promise<CliSignInState[]>;
+  submitCliSignInCode(request: { requestId: string; code: string }): Promise<void>;
+  cancelCliSignIn(requestId: string): Promise<void>;
+  onCliSignInUpdated(callback: (state: CliSignInState) => void): () => void;
   openTerminal(): Promise<void>;
+  /** The terminal panel. Output and input go over a MessagePort the window
+   *  gets after connectTerminals(); these only manage the terminals. */
+  listTerminals(): Promise<TerminalListResult>;
+  createTerminal(request?: CreateTerminalRequest): Promise<TerminalSummary>;
+  killTerminal(terminalId: string): Promise<void>;
+  connectTerminals(): Promise<boolean>;
+  restartTerminals(): Promise<TerminalListResult>;
+  terminalWorkspaceRoot(repoPath?: string): Promise<string | null>;
+  /** The path of a file dropped on a terminal ("" when it has none). */
+  terminalPathForFile(file: unknown): string;
+  onTerminalHostState(callback: (event: TerminalHostStateEvent) => void): () => void;
   selectRepoDirectory(): Promise<string | undefined>;
   inspectRepo(repoPath: string): Promise<GitRepoInfo>;
   getDiff(request: GitDiffRequest): Promise<GitDiffResult>;
@@ -2561,6 +3359,9 @@ export interface AppBridge {
   getConversation(id: string): Promise<Conversation | undefined>;
   openConversation(id: string, limit?: number): Promise<ConversationOpenResult | undefined>;
   listConversationMessages(request: ConversationMessagePageRequest): Promise<ConversationMessagePage>;
+  /** The member's message that is in progress right now, searched in the
+   *  whole chat (an open chat holds only its latest page). */
+  findRunningParticipantMessage(conversationId: string, participantId: string): Promise<ChatRunningMessageTarget | undefined>;
   saveDecisionSelections(conversationId: string, selections: Record<string, string>): Promise<Conversation | undefined>;
   saveDecisionResolutions(conversationId: string, resolutions: Record<string, boolean>): Promise<Conversation | undefined>;
   savePlanItemReview(request: PlanItemReviewRequest): Promise<Conversation | undefined>;
@@ -2574,12 +3375,46 @@ export interface AppBridge {
   updateChatParticipantRuntime(request: UpdateChatParticipantRuntimeRequest): Promise<Conversation | undefined>;
   removeChatParticipant(request: RemoveChatParticipantRequest): Promise<Conversation | undefined>;
   compactChatParticipant(request: CompactChatParticipantRequest): Promise<StartReviewResult>;
+  getClaudeChromeSetting(): Promise<ClaudeChromeSetting>;
+  setClaudeChromeEnabledByDefault(enabled: boolean): Promise<ClaudeChromeSetting>;
+  /** The chat itself arrives as a snapshot update; nothing is returned, so a
+   *  large chat is not sent twice. */
+  restartChatParticipant(request: RestartChatParticipantRequest): Promise<void>;
   sendChatMessage(request: SendChatMessageRequest): Promise<StartReviewResult>;
   readChatAttachment(request: ReadChatAttachmentRequest): Promise<ReadChatAttachmentResult>;
   toggleChatReaction(request: ToggleChatReactionRequest): Promise<Conversation | undefined>;
+  dismissTurnFinishedNote(request: DismissTurnFinishedNoteRequest): Promise<void>;
   respondToChatMentions(request: RespondToChatMentionsRequest): Promise<StartReviewResult>;
   respondToChatChoice(request: RespondToChatChoiceRequest): Promise<StartReviewResult>;
   respondToChatAppToolApproval(request: RespondToChatAppToolApprovalRequest): Promise<Conversation | undefined>;
+  /** A one-time code a phone pairs with the User's server by. */
+  createPhoneInvite(request?: CreatePhoneInviteRequest): Promise<CreatePhoneInviteResult>;
+  /** Revokes a phone code: unused, it stops working; used, its phone is removed. */
+  revokePhoneInvite(request: { inviteId: string }): Promise<RevokePhoneInviteResult>;
+  /** The User's own hub: what is set up, the command that creates its server,
+   *  and the installation from the line that command prints. */
+  getHubSetupState(): Promise<import("./hubSetup").HubSetupState>;
+  getHubSetupCommand(request: import("./hubSetup").HubSetupCommandRequest): Promise<import("./hubSetup").HubSetupCommandResult>;
+  installHub(request: import("./hubSetup").HubInstallRequest): Promise<import("./hubSetup").HubSetupState>;
+  onHubSetupProgress(callback: (state: import("./hubSetup").HubSetupState) => void): () => void;
+  /** Speech to text: dictation recognized on this computer by a downloaded
+   *  Whisper model. Off until the User turns it on in General settings. */
+  getSpeechToTextState(): Promise<SpeechToTextState>;
+  /** Turns it on and downloads the model, or resumes an interrupted download. */
+  enableSpeechToText(): Promise<SpeechToTextState>;
+  /** Stops a download in progress, removes what was downloaded, turns it off. */
+  cancelSpeechToTextDownload(): Promise<SpeechToTextState>;
+  disableSpeechToText(request: DisableSpeechToTextRequest): Promise<SpeechToTextState>;
+  /** The key held to dictate while the app is in front. */
+  setSpeechToTextHoldKey(holdKey: import("./speechToText").SpeechHoldKey): Promise<SpeechToTextState>;
+  /** Starts loading the speech model as she begins to dictate; returns at once. */
+  prepareSpeechToText(): Promise<void>;
+  /** Recognizes one recording, or one piece of a long one (16 kHz mono
+   *  16-bit WAV), optionally given the text before it and its language. */
+  transcribeSpeech(request: TranscribeSpeechRequest): Promise<TranscribeSpeechResult>;
+  /** Asks the system for the microphone; false when it is refused or off. */
+  requestMicrophoneAccess(): Promise<boolean>;
+  onSpeechToTextState(callback: (state: SpeechToTextState) => void): () => void;
   startReview(request: ReviewRequest): Promise<StartReviewResult>;
   continueReview(request: ContinueReviewRequest): Promise<StartReviewResult>;
   askPlanDecisionClarification(request: PlanDecisionClarificationRequest): Promise<StartReviewResult>;
@@ -2606,6 +3441,119 @@ export interface AppBridge {
   updateArtifactDraftRoster(request: UpdateArtifactDraftRosterRequest): Promise<ArtifactResult<CollectingArtifactReadResult>>;
   publishArtifact(request: PublishArtifactRequest): Promise<ArtifactResult<PublishedArtifactReadResult>>;
   onArtifactsUpdated(callback: (event: ArtifactsUpdatedEvent) => void): () => void;
+  // Scheduled scripts on this desktop.
+  listScripts(): Promise<import("./scripts").ScheduledScriptSummary[]>;
+  getScriptRevision(request: import("./scripts").GetScriptRevisionRequest): Promise<import("./scripts").ScriptRevisionContent>;
+  getScriptRuns(request: import("./scripts").ScriptIdRequest): Promise<import("./scripts").ScriptRunRow[]>;
+  setScriptSecret(request: import("./scripts").SetScriptSecretRequest): Promise<import("./scripts").ScheduledScriptSummary>;
+  deleteScriptSecret(request: import("./scripts").DeleteScriptSecretRequest): Promise<import("./scripts").ScheduledScriptSummary>;
+  setScriptEnabled(request: import("./scripts").SetScriptEnabledRequest): Promise<import("./scripts").ScheduledScriptSummary>;
+  runScriptNow(request: import("./scripts").ScriptIdRequest): Promise<void>;
+  deleteScript(request: import("./scripts").ScriptIdRequest): Promise<void>;
+  releaseHeldScriptMessages(request: import("./scripts").ScriptIdRequest): Promise<void>;
+  discardHeldScriptMessages(request: import("./scripts").ScriptIdRequest): Promise<void>;
+  onScriptsUpdated(callback: (event: import("./scripts").ScriptsUpdatedEvent) => void): () => void;
+  // Members' long-term memory on the User's server (Settings → Memory: look and delete only).
+  listMemoryNotes(request: import("./memory").MemorySettingsListRequest): Promise<import("./memory").MemorySettingsListResult>;
+  readMemoryNote(request: import("./memory").MemoryNoteIdRequest): Promise<import("./memory").MemoryResult<import("./memory").MemoryNote>>;
+  deleteMemoryNote(request: import("./memory").MemoryNoteIdRequest): Promise<import("./memory").MemoryResult<{ deleted: boolean }>>;
+  // Machines transport: machines that host participants.
+  listMachines(): Promise<MachineListResult>;
+  getCloudRunPreparation(request: Pick<import("./cloudRunPreparation").PrepareCloudRunRequest, "provider" | "instanceId">): Promise<import("./cloudRunPreparation").CloudRunPreparationState | undefined>;
+  prepareCloudRun(request: import("./cloudRunPreparation").PrepareCloudRunRequest): Promise<import("./cloudRunPreparation").PrepareCloudRunResult>;
+  onCloudRunPreparationProgress(callback: (snapshot: import("./cloudRunPreparation").CloudRunPreparationState) => void): () => void;
+  createMachine(request: CreateMachineRequest): Promise<CreateMachineResult>;
+  removeMachine(request: RemoveMachineRequest): Promise<MachineListResult>;
+  machineEnrollment(request: MachineEnrollmentRequest): Promise<CreateMachineResult>;
+  onMachinesUpdated(callback: (result: MachineListResult) => void): () => void;
+  /** Machines the User is asked about because they stopped being used. */
+  listMachineInactivityQuestions(): Promise<MachineInactivityQuestion[]>;
+  answerMachineInactivity(request: AnswerMachineInactivityRequest): Promise<MachineInactivityQuestion[]>;
+  onMachineInactivityQuestions(callback: (questions: MachineInactivityQuestion[]) => void): () => void;
+  // Machines transport: installing and upgrading the runtime on a machine.
+  // This is the only SSH path to a machine; messaging always goes through
+  // the User's server.
+  probeMachineInstall(request: { machineId: string; target: MachineSshTarget }): Promise<MachineRuntimeProbe>;
+  installMachine(request: MachineInstallRequest): Promise<MachineInstallResult>;
+  upgradeMachine(request: MachineUpgradeRequest): Promise<MachineInstallResult>;
+  bootstrapMachineProjectMirror(request: MachineMirrorBootstrapRequest): Promise<MachineMirrorBootstrapResult>;
+  listMachineInstalls(): Promise<MachineInstallRecord[]>;
+  listTrustedDevices(): Promise<MachineTrustedDevicesResult>;
+  trustDevice(request: SaveTrustedDeviceRequest): Promise<MachineTrustedDevicesResult>;
+  untrustDevice(deviceId: string): Promise<MachineTrustedDevicesResult>;
+  /** What runtime this desktop would install on a machine, or why it cannot. */
+  machineRuntimePayload(): Promise<MachineRuntimePayloadInfo>;
+  onMachineInstallProgress(callback: (snapshot: MachineInstallSnapshot) => void): () => void;
   onReviewProgress(callback: (progress: ReviewProgress) => void): () => void;
-  onConversationUpdated(callback: (conversation: Conversation) => void): () => void;
+  onConversationDeleted(callback: (conversationId: string) => void): () => void;
+  onConversationUpdated(callback: (conversation: ConversationUpdate) => void): () => void;
+  /** The next-prompt suggestions on offer in a chat (newest first). */
+  getChatPromptSuggestions(conversationId: string): Promise<ChatPromptSuggestion[]>;
+  onChatPromptSuggestions(callback: (update: ChatPromptSuggestionsUpdate) => void): () => void;
+  /** Live background work of the chat's members, by member id. */
+  getChatBackgroundTasks(conversationId: string): Promise<Record<string, string[]>>;
+  onChatBackgroundTasks(callback: (event: ChatBackgroundTasksEvent) => void): () => void;
+}
+
+/** A one-time code a phone pairs with the User's server by. */
+export interface CreatePhoneInviteRequest {
+  /** The phone app's address, when it is not the usual one. */
+  staticOriginUrl?: string;
+}
+
+export interface CreatePhoneInviteResult {
+  inviteId: string;
+  expiresAt: string;
+  /** The phone app's address with the server, the token and its id in the
+   *  fragment: what the QR code shows. */
+  pwaUrl: string;
+  qrPayload: string;
+}
+
+export interface RevokePhoneInviteResult {
+  revoked: boolean;
+  inviteId: string;
+  deviceId?: string;
+}
+
+/**
+ * Speech to text on this computer.
+ * - unavailable: this build or this computer cannot run it.
+ * - off: the User has not turned it on (the model may still be on disk).
+ * - downloading / verifying: the model is being fetched or checked.
+ * - interrupted: turned on, but the model is incomplete and nothing is
+ *   downloading (a failed download, or the app quit during one).
+ * - ready: the microphone can be used.
+ */
+export type SpeechToTextStatus = "unavailable" | "off" | "downloading" | "verifying" | "interrupted" | "ready";
+
+export interface SpeechToTextState {
+  status: SpeechToTextStatus;
+  /** The model is fully downloaded and checked, whether or not it is on. */
+  modelInstalled: boolean;
+  downloadedBytes: number;
+  totalBytes: number;
+  /** What went wrong, in a sentence for the User. */
+  error?: string;
+  /** The key held to dictate while the app is in front. */
+  holdKey: import("./speechToText").SpeechHoldKey;
+}
+
+export interface DisableSpeechToTextRequest {
+  deleteModel: boolean;
+}
+
+export interface TranscribeSpeechRequest {
+  /** A 16 kHz mono 16-bit PCM WAV file. */
+  audio: Uint8Array;
+  /** The end of the text recognized before this piece of a long recording. */
+  prompt?: string;
+  /** The language found in the recording's first piece, kept for the rest. */
+  language?: string;
+}
+
+export interface TranscribeSpeechResult {
+  text: string;
+  /** The language the engine heard, in its own naming ("russian"). */
+  language?: string;
 }

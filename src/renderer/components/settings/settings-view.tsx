@@ -14,12 +14,12 @@ import type {
   DeleteAgentEnvironmentVariableRequest,
   PluginCatalogItem,
   ProviderSettings,
+  RepoFileExternalOpenAction,
   RepoFileOpenAction,
   SaveAgentEnvironmentVariableRequest
 } from "../../../shared/types";
-import { Button } from "@/components/ui/button";
 import { IconButton } from "../primitives";
-import { SidebarPanelIcon } from "../shell/sidebar-panel-icon";
+import { SidebarToggleButton } from "../shell/sidebar-toggle-button";
 import { ParticipantsSettingsScreen } from "./participants-settings-screen";
 import { RolesSettingsSection } from "./roles-settings-section";
 import { GeneralSettingsSection } from "./general-settings-section";
@@ -28,8 +28,11 @@ import { SavedPromptsSettingsSection } from "./saved-prompts-settings-section";
 import { EnvironmentSettingsSection } from "./environment-settings-section";
 import { PluginsSettingsSection } from "./plugins/plugins-settings-section";
 import { X } from "lucide-react";
+import { AwsSettingsPage } from "./aws-settings-page";
+import { ScriptsSettingsSection } from "./scripts-settings-section";
+import { MemorySettingsSection } from "./memory-settings-section";
 
-export type SettingsSection = "general" | "environment" | "roles" | "behavior-rules" | "saved-prompts" | "participants" | "plugins";
+export type SettingsSection = "general" | "aws" | "environment" | "scripts" | "roles" | "behavior-rules" | "saved-prompts" | "participants" | "plugins" | "memory";
 
 export function SettingsView(props: {
   section: SettingsSection;
@@ -48,7 +51,9 @@ export function SettingsView(props: {
   saveCliProviderHost: (update: CliProviderHostUpdate) => Promise<void>;
   deleteCliProviderHost: (id: string) => Promise<void>;
   setRepoFileOpenPreference: (action: RepoFileOpenAction | null) => Promise<void>;
+  setRepoFileExternalOpenPreference: (action: RepoFileExternalOpenAction | null) => Promise<void>;
   setBetaUpdates: (enabled: boolean) => Promise<void>;
+  setCrashReports: (enabled: boolean) => Promise<void>;
   setCliAgentRunTimeoutMs: (timeoutMs: number) => Promise<void>;
   setChatParticipantRequestMaxDepth: (maxDepth: number) => Promise<void>;
   setChatParticipantRequestPromptMaxChars: (maxChars: number) => Promise<void>;
@@ -66,41 +71,30 @@ export function SettingsView(props: {
   const [pluginHeaderAction, setPluginHeaderAction] = useState<ReactNode>();
   const title = props.section === "general"
     ? "General"
+    : props.section === "aws"
+      ? "AWS"
     : props.section === "environment"
       ? "Environment"
+    : props.section === "scripts"
+      ? "Scheduled Tasks"
       : props.section === "roles"
         ? "Roles"
         : props.section === "behavior-rules"
           ? "Rules"
           : props.section === "saved-prompts"
             ? "Prompts"
-            : props.section === "plugins" ? "Plugins & Skills" : "Members";
+            : props.section === "plugins" ? "Plugins & Skills" : props.section === "memory" ? "Memory" : "Members";
   const sectionClass = props.section === "participants"
     ? "settings-view-participants"
-    : props.section === "roles"
+    : props.section === "roles" || props.section === "memory"
       ? "settings-view-roles"
       : "";
   return (
     <section className={`settings-view ${sectionClass}`}>
       <div className={`settings-view-inner ${props.section === "participants" ? "settings-view-inner-participants" : ""}`}>
-        <div className="settings-view-head">
+        <div className="settings-view-head" data-titlebar>
           <div className="settings-view-head-lead">
-            {props.sidebarCollapsed && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                title="Show sidebar"
-                aria-label="Show sidebar"
-                aria-controls="app-sidebar"
-                aria-expanded="false"
-                data-testid="sidebar-expand-toggle"
-                onClick={props.onExpandSidebar}
-              >
-                <SidebarPanelIcon />
-                <span className="sr-only">Show sidebar</span>
-              </Button>
-            )}
+            {props.sidebarCollapsed && <SidebarToggleButton expanded={false} onToggle={props.onExpandSidebar} />}
             <h1>{title}</h1>
           </div>
           <div className="settings-view-head-actions">
@@ -110,7 +104,6 @@ export function SettingsView(props: {
               icon={X}
               label="Close settings"
               tooltip="Close settings"
-              variant="ghost"
               onClick={props.onClose}
             />
           </div>
@@ -151,6 +144,8 @@ export function SettingsView(props: {
             deleteAgentEnvironmentVariable={props.deleteAgentEnvironmentVariable}
           />
         )}
+        {props.section === "scripts" && <ScriptsSettingsSection />}
+        {props.section === "memory" && <MemorySettingsSection />}
         {props.section === "plugins" && (
           <PluginsSettingsSection
             repoPath={props.settings.lastRepoPath}
@@ -167,23 +162,32 @@ export function SettingsView(props: {
             agents={props.agents}
             assistantProviderKind={props.settings.assistantProviderKind}
             repoFileOpenAction={props.settings.repoFileOpenAction}
+            repoFileExternalOpenAction={props.settings.repoFileExternalOpenAction}
             betaUpdates={props.settings.betaUpdates}
+            crashReports={props.settings.crashReports}
             cliAgentRunTimeoutMs={props.settings.cliAgentRunTimeoutMs}
             chatParticipantRequestMaxDepth={props.settings.chatParticipantRequestMaxDepth}
             chatParticipantRequestPromptMaxChars={props.settings.chatParticipantRequestPromptMaxChars}
             chatAutoWatchWakeLimit={props.settings.chatAutoWatchWakeLimit}
             chatPromptContext={props.settings.chatPromptContext}
+            mobileControl={props.settings.mobileControl}
             updateProvider={props.updateProvider}
             setAssistantProviderKind={props.setAssistantProviderKind}
             setRepoFileOpenPreference={props.setRepoFileOpenPreference}
+            setRepoFileExternalOpenPreference={props.setRepoFileExternalOpenPreference}
             setBetaUpdates={props.setBetaUpdates}
+            setCrashReports={props.setCrashReports}
             setCliAgentRunTimeoutMs={props.setCliAgentRunTimeoutMs}
             setChatParticipantRequestMaxDepth={props.setChatParticipantRequestMaxDepth}
             setChatParticipantRequestPromptMaxChars={props.setChatParticipantRequestPromptMaxChars}
             setChatAutoWatchWakeLimit={props.setChatAutoWatchWakeLimit}
             setChatPromptContext={props.setChatPromptContext}
-            cloudRuns={props.settings.cloudRuns}
-            saveCloudRunsSettings={props.saveCloudRunsSettings}
+          />
+        )}
+        {props.section === "aws" && (
+          <AwsSettingsPage
+            settings={props.settings.cloudRuns}
+            onDeleted={() => props.saveCloudRunsSettings({ mode: "aws" })}
           />
         )}
       </div>

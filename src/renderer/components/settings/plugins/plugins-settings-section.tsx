@@ -63,7 +63,6 @@ export function PluginsSettingsSection(props: {
         icon={RefreshCw}
         label="Refresh plugins and skills"
         tooltip="Refresh"
-        variant="ghost"
         disabled={state.loading}
         data-testid="plugins-refresh"
         onClick={() => void load(true)}
@@ -377,10 +376,8 @@ function SkillCard(props: {
         </div>
       </div>
       <div className="plugins-row-actions">
-        <Button type="button" variant="outline" size="sm" onClick={() => void props.onCopy(props.skill.displayName, `/${props.skill.frontmatterName}`)}>
-          <Copy size={14} aria-hidden />
-          Copy
-        </Button>
+        <IconButton icon={Copy} label={`Copy /${props.skill.frontmatterName}`} tooltip="Copy"
+          onClick={() => void props.onCopy(props.skill.displayName, `/${props.skill.frontmatterName}`)} />
       </div>
     </article>
   );

@@ -1,4 +1,5 @@
 import { ChatConversationView } from "../chat/chat-conversation-view";
+import { ChatCreationState } from "../chat/chat-creation-state";
 import { SlackView } from "../review/review-view";
 import { AppLoadingState } from "../loading-states";
 import { planDecisionReplies } from "../review/review-conversation-data";
@@ -48,7 +49,11 @@ export function ConversationPanel({
   }
   return (
     <section className={`conversation-panel ${view.conversationKind === "chat" ? "chat-conversation-panel" : ""}`}>
-      {view.isOpeningConversation ? (
+      {state.busy && !state.conversation && state.startingChatRef.current ? (
+        <ChatCreationState key={state.currentRunId}
+          progress={[...state.progressLog].reverse().find(item => item.runId === state.currentRunId)}
+          stopping={Boolean(state.chatCreationRef.current?.signal.aborted)} />
+      ) : view.isOpeningConversation ? (
         <AppLoadingState title="Loading chat" description={openingConversationDescription} />
       ) : view.conversationKind === "chat" && state.conversation ? (
         <ChatConversationView
@@ -62,6 +67,14 @@ export function ConversationPanel({
           hasOlderMessages={Boolean(state.messagePage?.hasMoreBefore)}
           olderMessagesLoading={state.olderMessagesLoading}
           draft={state.chatMessageDraft}
+          composerPicks={{
+            skillMentions: state.chatComposerSkillMentions,
+            onSkillMentionsChange: state.setChatComposerSkillMentions,
+            pluginMentions: state.chatComposerPluginMentions,
+            onPluginMentionsChange: state.setChatComposerPluginMentions,
+            fileMentions: state.chatComposerFileMentions,
+            onFileMentionsChange: state.setChatComposerFileMentions
+          }}
           onDraftChange={state.setChatMessageDraft}
           onLoadOlderMessages={() => void conversationActions.loadOlderConversationMessages()}
           onLoadMessagePageForMessage={conversationActions.loadConversationMessagePageForMessage}
@@ -87,8 +100,10 @@ export function ConversationPanel({
           }
           onRespondToChoice={(sourceMessageId, choiceId, response) => chatActions.respondToChatChoice(sourceMessageId, choiceId, response)}
           onToggleReaction={(messageId, emoji) => void chatActions.toggleChatReaction(messageId, emoji)}
+          onDismissTurnFinishedNote={(messageId) => void chatActions.dismissTurnFinishedNote(messageId)}
           onRespondToAppToolApproval={chatActions.respondToChatAppToolApproval}
           setRepoFileOpenPreference={settingsActions.setRepoFileOpenPreference}
+          setRepoFileExternalOpenPreference={settingsActions.setRepoFileExternalOpenPreference}
           onCompactParticipant={(participantId) => chatActions.compactChatParticipant(participantId)}
           onStopRun={(runId) => void window.consensus.cancelReview(runId)}
           onJumpToParticipantLastMessage={conversationActions.jumpToParticipantLastMessage}

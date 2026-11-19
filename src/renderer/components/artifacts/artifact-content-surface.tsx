@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { CheckCircle2, Copy, Info, Pencil } from "lucide-react";
+import { BadgeCheck, CheckCircle2, Copy, Info, Pencil } from "lucide-react";
 
 import { MarkdownText } from "../content/markdown-text";
 import { IconButton } from "../primitives/icon-button";
@@ -10,6 +10,8 @@ export function ArtifactContentSurface(props: {
   note?: string;
   onRevise?: () => void;
   reviseDisabled?: boolean;
+  signLabel?: string;
+  onSign?: () => void;
 }): JSX.Element {
   const [copied, setCopied] = useState(false);
   const resetRef = useRef<number | undefined>(undefined);
@@ -29,27 +31,34 @@ export function ArtifactContentSurface(props: {
   }
 
   return (
-    <div className="artifact-content-surface" data-testid={props.testId}>
+    <div className={`artifact-content-surface${props.onSign ? " has-sign" : ""}`} data-testid={props.testId}>
       <div className="artifact-content-fabs">
+        {props.onSign && (
+          <IconButton
+            icon={BadgeCheck}
+            label={props.signLabel ?? "Sign"}
+            tooltip={props.signLabel ?? "Sign"}
+            floating
+            disabled={props.reviseDisabled}
+            data-testid="artifact-sign-shortcut"
+            onClick={props.onSign}
+          />
+        )}
         {props.onRevise && (
           <IconButton
-            className="artifact-content-action"
             icon={Pencil}
             label="Revise"
             tooltip="Revise"
-            size="xs"
-            variant="ghost"
+            floating
             disabled={props.reviseDisabled}
             onClick={props.onRevise}
           />
         )}
         <IconButton
-          className="artifact-content-action artifact-content-copy"
           icon={copied ? CheckCircle2 : Copy}
           label={copied ? "Copied" : "Copy content"}
           tooltip={copied ? "Copied" : "Copy content"}
-          size="xs"
-          variant="ghost"
+          floating
           data-testid="artifact-copy-content"
           onClick={copyContent}
         />

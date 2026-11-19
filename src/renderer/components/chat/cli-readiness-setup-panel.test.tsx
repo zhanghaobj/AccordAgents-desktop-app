@@ -4,17 +4,27 @@ import { act, create, type ReactTestInstance } from "react-test-renderer";
 
 import type { AgentHealth, AppSettings } from "../../../shared/types";
 import { CLI_PROVIDER_SETUP, resolveAssistantProviderKind } from "../../../shared/cliReadiness";
+import { EMPTY_MOBILE_CONTROL_SETTINGS } from "../../../shared/mobilePairing";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { CliReadinessSetupPanel } from "./cli-readiness-setup-panel";
 import { validateChatCliAgents } from "./chat-cli-readiness";
 
+// The app renders under one TooltipProvider; so does every panel here.
+function Panel(props: Parameters<typeof CliReadinessSetupPanel>[0]): JSX.Element {
+  return <TooltipProvider><CliReadinessSetupPanel {...props} /></TooltipProvider>;
+}
+
 const SETTINGS: AppSettings = {
   roundLimitDefault: 2,
+chatCustomAvatars: [],
   betaUpdates: false,
+  crashReports: true,
   cliAgentRunTimeoutMs: 86_400_000,
   chatParticipantRequestMaxDepth: 2,
   chatParticipantRequestPromptMaxChars: 50_000,
   chatAutoWatchWakeLimit: 3,
   chatPromptContext: { thread: { mode: "off" }, timeline: { mode: "off" } },
+  mobileControl: EMPTY_MOBILE_CONTROL_SETTINGS,
   cloudRuns: {
     enabled: false,
     mode: "ssh",
@@ -46,7 +56,7 @@ const MISSING: AgentHealth[] = [
 test("zero-ready onboarding shows stacked provider setup rows with no preselection", () => {
   installWindowBridge();
   const renderer = create(
-    <CliReadinessSetupPanel
+    <Panel
       agents={MISSING}
       settings={SETTINGS}
       checking={false}
@@ -69,7 +79,7 @@ test("check again only refreshes readiness after setup", async () => {
     : health);
   let refreshCalls = 0;
   const renderer = create(
-    <CliReadinessSetupPanel
+    <Panel
       agents={MISSING}
       settings={SETTINGS}
       checking={false}
@@ -93,7 +103,7 @@ test("cold-start readiness auto-expands the first provider that needs recovery o
   installWindowBridge();
   const agents = MISSING.map((health) => health.kind === "claude-code" ? normalized("claude-code", "required") : health);
   const renderer = create(
-    <CliReadinessSetupPanel
+    <Panel
       agents={[]}
       settings={SETTINGS}
       checking={true}
@@ -105,7 +115,7 @@ test("cold-start readiness auto-expands the first provider that needs recovery o
 
   await act(async () => {
     renderer.update(
-      <CliReadinessSetupPanel
+      <Panel
         agents={agents}
         settings={SETTINGS}
         checking={false}
@@ -123,7 +133,7 @@ test("cold-start readiness auto-expands the first provider that needs recovery o
   await click(findButton(claudeCard, "Hide Claude Code"));
   await act(async () => {
     renderer.update(
-      <CliReadinessSetupPanel
+      <Panel
         agents={[...agents]}
         settings={SETTINGS}
         checking={false}
@@ -150,7 +160,7 @@ test("missing, signed-out, unknown, and disabled states show only their safe cur
     providers: SETTINGS.providers.map((provider) => provider.kind === "codex-cli" ? { ...provider, enabled: false } : provider)
   };
   const renderer = create(
-    <CliReadinessSetupPanel
+    <Panel
       agents={states}
       settings={settings}
       checking={false}
@@ -189,7 +199,7 @@ test("could-not-verify offers recovery without claiming sign-in is required", as
   installWindowBridge();
   const agents = MISSING.map((health) => health.kind === "codex-cli" ? normalized("codex-cli", "unknown") : health);
   const renderer = create(
-    <CliReadinessSetupPanel
+    <Panel
       agents={agents}
       settings={SETTINGS}
       checking={false}
@@ -201,7 +211,7 @@ test("could-not-verify offers recovery without claiming sign-in is required", as
   assert.match(textOf(card), /Could not verify/);
   assert.equal(card.props.className.includes("is-expanded"), true);
   const expanded = textOf(renderer.root.findByProps({ "data-provider-kind": "codex-cli" }));
-  assert.match(expanded, /Try sign-in.*codex login/);
+  assert.match(expanded, /Try signing in.*Sign in.*codex login/);
   assert.doesNotMatch(expanded, /Sign-in required/);
   assert.equal(Boolean(findButton(renderer.root.findByProps({ "data-provider-kind": "codex-cli" }), "Open Terminal")), true);
   assert.equal(Boolean(findButton(renderer.root.findByProps({ "data-provider-kind": "codex-cli" }), "Official guide")), true);
@@ -215,7 +225,7 @@ test("failed-to-run offers troubleshooting without claiming auth will fix it", a
     runnable: "failed" as const
   } : health);
   const renderer = create(
-    <CliReadinessSetupPanel
+    <Panel
       agents={agents}
       settings={SETTINGS}
       checking={false}
@@ -238,7 +248,7 @@ test("a stable ready state stays visible with a checking indicator", () => {
     ? { ...normalized("claude-code", "ready"), checking: true }
     : health);
   const renderer = create(
-    <CliReadinessSetupPanel
+    <Panel
       agents={agents}
       settings={SETTINGS}
       checking={true}
@@ -255,7 +265,7 @@ test("unsupported platforms show guide-only installation without a macOS copy ac
   installWindowBridge();
   const agents = MISSING.map((health) => health.kind === "gemini-cli" ? { ...health, platform: "linux" as const } : health);
   const renderer = create(
-    <CliReadinessSetupPanel
+    <Panel
       agents={agents}
       settings={SETTINGS}
       checking={false}
@@ -274,6 +284,25 @@ test("unsupported platforms show guide-only installation without a macOS copy ac
   assert.match(textOf(renderer.root), /Check again/);
   assert.match(textOf(renderer.root), /on this computer/);
   assert.doesNotMatch(textOf(renderer.root), /on this Mac/);
+  renderer.unmount();
+});
+
+test("on Windows a missing CLI gets its PowerShell install command and Open Terminal; one with no Windows command gets the guide", async () => {
+  installWindowBridge();
+  const agents = MISSING.map((health) => ({ ...health, platform: "win32" as const }));
+  const renderer = create(
+    <Panel agents={agents} settings={SETTINGS} checking={false} onRefresh={async () => agents} onOpenSettings={() => undefined} />
+  );
+  await click(findButton(renderer.root.findByProps({ "data-provider-kind": "codex-cli" }), "Set up Codex"));
+  const codex = renderer.root.findByProps({ "data-provider-kind": "codex-cli" });
+  assert.equal(textOf(codex).includes(CLI_PROVIDER_SETUP["codex-cli"].installCommandByPlatform.win32 ?? "missing"), true);
+  assert.doesNotMatch(textOf(codex), /curl /);
+  assert.equal(Boolean(findButton(codex, "Open Terminal")), true);
+  await click(findButton(codex, "Hide Codex"));
+  await click(findButton(renderer.root.findByProps({ "data-provider-kind": "gemini-cli" }), "Set up Antigravity"));
+  const antigravity = renderer.root.findByProps({ "data-provider-kind": "gemini-cli" });
+  assert.match(textOf(antigravity), /Official guide/);
+  assert.doesNotMatch(textOf(antigravity), /curl |Open Terminal/);
   renderer.unmount();
 });
 
@@ -303,7 +332,7 @@ test("renderer provider preview uses Codex priority when no default is stored", 
     agents,
     providers: disabledProviders,
     explicitKind: "claude-code"
-  }), undefined);
+  }), "codex-cli");
 });
 
 function missing(kind: AgentHealth["kind"], label: string): AgentHealth {

@@ -1,27 +1,144 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { access, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
+import { NativeProcessRegistry } from "./nativeProcessRegistry";
 import {
+  ClaudeFolderNotTrustedError,
   claudeModelProbeEnv,
   CliAgentRunner,
   CodexAppServerRunError,
   parseClaudeModelPickerOutput,
+  probeClaudeModelsInFolder,
   resolveClaudeModelProbeCwd,
   resolveCodexCompactTimeoutMs,
   runClaudeModelProbeInPty,
   runClaudeModelProbeWithExpect
 } from "./cliAgents";
-import { CommandError } from "./command";
+import { CommandError, ensureLoginShellEnvPrimed } from "./command";
+import type { CodexServerRequestDelivery } from "./codexApprovals";
 import { buildCodexExecInvocation, CODEX_APP_SERVER_MCP_TOKEN_ENV } from "./codexExec";
+import type { ParticipantRunResult } from "./providers";
 import { defaultChatAgentPermissions } from "../../shared/agentPermissions";
+
+// Claude Code's own config on this computer (Claude in Chrome, for one) must
+// not decide these tests: an empty config folder is a fresh Claude Code.
+process.env.CLAUDE_CONFIG_DIR = mkdtempSync(path.join(tmpdir(), "aa-claude-config-"));
 
 function makeRunner(): CliAgentRunner {
   return new CliAgentRunner();
 }
+
+for (const kind of ["claude-code", "codex-cli"] as const) {
+  test(`${kind}: context usage for a session whose log is gone is read once when asked not to wait`, async () => {
+    const runner = makeRunner();
+    const participant = { id: `${kind}-missing-log`, kind, label: kind };
+    const reads: string[] = [];
+    const lookups = runner as unknown as Record<"findClaudeSessionLogPath" | "findCodexSessionLogPath", (sessionId: string) => Promise<string | undefined>>;
+    lookups[kind === "claude-code" ? "findClaudeSessionLogPath" : "findCodexSessionLogPath"] = async (sessionId) => {
+      reads.push(sessionId);
+      return undefined;
+    };
+
+    assert.equal(await runner.contextUsageForSession(participant, "gone-session", { waitForLog: false }), undefined);
+    assert.deepEqual(reads, ["gone-session"]);
+
+    // The default still waits for a log that may not be written yet (after a turn or a compaction).
+    reads.length = 0;
+    assert.equal(await runner.contextUsageForSession(participant, "fresh-session"), undefined);
+    assert.ok(reads.length > 1, `the default retries a missing log (read ${reads.length} times)`);
+  });
+}
+
+test("Claude context usage read from the end of the log matches reading the whole log", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "accordagents-claude-log-"));
+  try {
+    const runner = makeRunner();
+    const claude = { id: "claude-log", kind: "claude-code" as const, label: "Claude", model: "claude-opus-5-5" };
+    const usage = (input: number): string => JSON.stringify({ type: "assistant", message: { model: "claude-opus-5-5", usage: { input_tokens: input, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 10 } } });
+    const boundary = JSON.stringify({ type: "system", subtype: "compact_boundary" });
+    const filler = JSON.stringify({ type: "user", message: { content: "п".repeat(300_000) } });
+    const internals = runner as unknown as {
+      findClaudeSessionLogPath(sessionId: string): Promise<string | undefined>;
+      agentContextUsageFromEvent(event: unknown, participant: unknown, source: string): unknown;
+      isClaudeCompactBoundary(event: unknown): boolean;
+    };
+    // The whole-log reading this replaced: the last usage after the last compaction boundary.
+    const wholeLog = (content: string): unknown => {
+      let latest: unknown;
+      for (const line of content.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line) as unknown;
+          if (internals.isClaudeCompactBoundary(event)) {
+            latest = undefined;
+            continue;
+          }
+          latest = internals.agentContextUsageFromEvent(event, claude, "claude-code") ?? latest;
+        } catch {
+          // partial line
+        }
+      }
+      return latest;
+    };
+    const cases: Record<string, string[]> = {
+      "usage then filler": [usage(1000), filler, usage(52_000), filler, "{\"type\":\"last-prompt\"}"],
+      "usage before a boundary only": [usage(90_000), boundary, filler],
+      "usage after a boundary": [usage(90_000), boundary, usage(12_000), "{partial"],
+      "no usage at all": [filler, "not json"]
+    };
+    const results: Record<string, number | undefined> = {};
+    for (const [name, lines] of Object.entries(cases)) {
+      const content = `${lines.join("\n")}\n`;
+      const file = path.join(dir, `${name.replace(/ /g, "-")}.jsonl`);
+      await writeFile(file, content);
+      internals.findClaudeSessionLogPath = async () => file;
+      const fromEnd = await runner.contextUsageForSession(claude, "session", { waitForLog: false });
+      const strip = (value: unknown): unknown => value && typeof value === "object" ? { ...(value as Record<string, unknown>), updatedAt: undefined } : value;
+      assert.deepEqual(strip(fromEnd), strip(wholeLog(content)), name);
+      results[name] = (fromEnd as { usedTokens?: number } | undefined)?.usedTokens;
+    }
+    assert.deepEqual(results, {
+      "usage then filler": 52_000,
+      "usage before a boundary only": undefined,
+      "usage after a boundary": 12_000,
+      "no usage at all": undefined
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("idle accounts for native operations before a warm session exists and releases failed operations", async () => {
+  const runner = makeRunner();
+  const participant = { id: "idle-native", kind: "codex-cli" as const, label: "Codex" };
+  let finish!: (value: Awaited<ReturnType<CliAgentRunner["run"]>>) => void;
+  let fail!: (error: Error) => void;
+  const pending = new Promise<Awaited<ReturnType<CliAgentRunner["run"]>>>((resolve, reject) => { finish = resolve; fail = reject; });
+  let calls = 0;
+  const native = runner as unknown as { runCodex(): ReturnType<CliAgentRunner["run"]>; compactCodexSession(): ReturnType<CliAgentRunner["compactSession"]> };
+  native.runCodex = () => { calls++; return pending; };
+  const running = runner.run(participant, "native goal", undefined, undefined, "chat");
+  assert.equal(runner.hasActiveNativeWork(), true);
+  assert.equal(runner.fenceIdleNativeAdmissions(), undefined);
+  finish({ participant, ok: true, content: "complete" }); await running;
+  assert.equal(runner.hasActiveNativeWork(), false);
+  const release = runner.fenceIdleNativeAdmissions()!;
+  assert.equal((await runner.run(participant, "held", undefined, undefined, "chat")).ok, false);
+  assert.equal((await runner.compactSession(participant, undefined, undefined, "chat", undefined, { sessionId: "s" })).ok, false);
+  assert.equal(calls, 1);
+  release();
+  native.runCodex = () => new Promise((_resolve, reject) => { fail = reject; });
+  const failed = runner.run(participant, "fails", undefined, undefined, "chat");
+  await Promise.resolve();
+  fail(new Error("native setup failed")); await assert.rejects(failed, /native setup failed/);
+  assert.equal(runner.hasActiveNativeWork(), false);
+});
 
 async function writeCodexAppServerFixture(fixtureDir: string, source: string): Promise<string> {
   await writeFile(path.join(fixtureDir, "app-server"), source, "utf8");
@@ -48,20 +165,66 @@ function makeCodexPendingTurn(overrides: Partial<Record<string, unknown>> = {}):
   };
 }
 
-function makeClaudeWarmPendingTurn(overrides: Partial<Record<string, unknown>> = {}) {
-  const timer = setTimeout(() => undefined, 1);
-  clearTimeout(timer);
-  return {
-    startedAt: Date.now(),
-    messages: [],
-    streamedText: "",
-    nextTextBlockStartsBlock: false,
-    timer,
-    onOutput: undefined,
-    resolve: undefined,
-    reject: undefined,
-    ...overrides
+/** Drives the warm Claude line router directly: one process state, replies
+ *  added as if written to the CLI, and every line the fixture "prints". */
+function makeClaudeWarmHarness(runner: any, options: { lifecycle?: boolean } = {}) {
+  const written: Array<Record<string, unknown>> = [];
+  const state = {
+    replies: [] as any[],
+    active: undefined as any,
+    stepActive: false,
+    lifecycleSupported: options.lifecycle ?? false,
+    backgroundTasks: new Map<string, string>(),
+    backgroundTaskLabels: new Map<string, string>(),
+    backgroundTaskOrigins: new Map<string, unknown>(),
+    finishedTaskIds: new Set<string>(),
+    pendingNotices: [] as unknown[],
+    cancelRequests: new Map<string, unknown>(),
+    controlWaiters: new Map<string, (response: unknown) => void>(),
+    lastTaskEventAt: 0,
+    selfResumeExpectedUntil: 0,
+    interruptTarget: undefined as unknown,
+    interruptRequestId: undefined as string | undefined,
+    onSelfResumedTurn: undefined as ((turn: any) => void) | undefined
   };
+  const flags = { unusable: false, settled: 0 };
+  const hooks = {
+    write: (message: Record<string, unknown>) => written.push(message),
+    settled: () => { flags.settled += 1; },
+    flush: () => undefined,
+    markUnusable: () => { flags.unusable = true; },
+    markUnusableIfIdle: () => {
+      if (state.replies.length === 0 && state.backgroundTasks.size === 0) {
+        flags.unusable = true;
+      }
+    }
+  };
+  const participant = { id: "p1", label: "Agent", kind: "claude-code" };
+  let commands = 0;
+  const addReply = (overrides: Record<string, unknown> = {}) => {
+    const outputs: Array<{ kind: string; text: string; cumulative?: string; activityKind?: string; activityStatus?: string; activityItemId?: string }> = [];
+    const resolved: any[] = [];
+    const rejected: Error[] = [];
+    commands += 1;
+    const reply = runner.newClaudeWarmReply({
+      commandUuid: `cmd-${commands}`,
+      written: true,
+      onOutput: (event: any) => outputs.push(event),
+      resolve: (result: unknown) => resolved.push(result),
+      reject: (error: Error) => rejected.push(error),
+      ...overrides
+    });
+    state.replies.push(reply);
+    return { reply, outputs, resolved, rejected };
+  };
+  const send = (event: Record<string, unknown>): void => runner.handleClaudeWarmLine(
+    JSON.stringify(event),
+    participant,
+    undefined,
+    state,
+    hooks
+  );
+  return { state, hooks, written, flags, participant, addReply, send };
 }
 
 test("agentRunEnv filters blocked manual keys and preserves app MCP token precedence", () => {
@@ -130,6 +293,122 @@ test("warmAgentKey changes when the manual agent environment version changes", (
   assert.equal(JSON.parse(secondKey).agentEnvKey, "agent-env-v2");
 });
 
+test("a Claude member started with Claude in Chrome gets --chrome and its own process key", () => {
+  const runner = makeRunner() as any;
+  const options = chatOptions({ agentMode: "default", workspaceWrite: false });
+  const config = runner.claudeToolConfig("chat", "/selected/repo", [], options);
+  const launch = (claudeChrome?: boolean) => runner.claudeLaunchArgs(
+    { id: "claude-1", kind: "claude-code", label: "@claude" }, "chat", { ...options, claudeChrome }, config, [], "warm", "session-1"
+  ) as string[];
+  assert.equal(launch(true).includes("--chrome"), true);
+  assert.equal(launch(false).includes("--chrome"), false);
+  assert.equal(launch(undefined).includes("--chrome"), false);
+  const participant = { id: "claude-1", kind: "claude-code" };
+  const warm = { conversationId: "c1", participantId: "claude-1", contextKey: "k" };
+  assert.notEqual(runner.warmAgentKey(participant, "/r", "chat", { warm, claudeChrome: true }), runner.warmAgentKey(participant, "/r", "chat", { warm }),
+    "switching it starts the next turn in a new process");
+  assert.equal(runner.warmAgentKey(participant, "/r", "chat", { warm, claudeChrome: false }), runner.warmAgentKey(participant, "/r", "chat", { warm }),
+    "off keeps the key processes already had");
+});
+
+test("a Chrome switch waits for a busy member process instead of the member waiting for it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "accordagents-chrome-defer-"));
+  try {
+    await writeFile(path.join(dir, ".claude.json"), JSON.stringify({ claudeInChromeDefaultEnabled: true }));
+    const runner = makeRunner() as any;
+    const warm = { conversationId: "c1", participantId: "p1", contextKey: "", idleTimeoutMs: 1 };
+    const options = { agentEnv: { CLAUDE_CONFIG_DIR: dir }, warm };
+    const runningKey = runner.warmAgentKey({ id: "p1", kind: "claude-code" }, "/r", "chat", { warm });
+    let idle = false;
+    runner.warmAgents.set(runningKey, { key: runningKey, scopeKey: "c1:p1", closed: false, isIdle: () => idle });
+    const member = { id: "p1", kind: "claude-code" };
+    const chrome = async (runOptions: Record<string, unknown>, kind = "chat") => (await runner.withClaudeChrome(member, "/r", kind, runOptions)).claudeChrome;
+    assert.equal(await chrome(options), false, "busy (a background task): it keeps what it started with");
+    assert.equal(await chrome({ ...options, nativeGoal: { objective: "x" } }), true, "a goal runs in its own process: the setting as it is now");
+    assert.equal(await chrome({ ...options, warm: { ...warm, contextKey: "changed" } }), true, "other settings changed too: the process is replaced anyway");
+    idle = true;
+    assert.equal(await chrome(options), true, "idle: its next turn gets the new setting");
+    assert.equal(await chrome({ agentEnv: { CLAUDE_CONFIG_DIR: dir } }), true, "a one-shot run reads it too");
+    assert.equal(await chrome({ agentEnv: { CLAUDE_CONFIG_DIR: dir }, isolated: true }), undefined, "the app's own runs never get it");
+    assert.equal(await chrome({ agentEnv: { CLAUDE_CONFIG_DIR: dir } }, "general"), undefined, "nor runs that are not a chat member's");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a changed agent environment closes only member processes that hold no work", async () => {
+  const runner = makeRunner() as any;
+  const closed: string[] = [];
+  runner.closeWarmAgent = async (entry: { key: string; closed: boolean }, reason: string) => {
+    entry.closed = true;
+    closed.push(`${entry.key}:${reason}`);
+  };
+  const entry = (key: string, extra: Record<string, unknown> = {}) => ({ key, scopeKey: key, closed: false, queue: Promise.resolve(), ...extra });
+  runner.warmAgents.set("idle-claude", entry("idle-claude", { isIdle: () => true }));
+  runner.warmAgents.set("answering-claude", entry("answering-claude", { isIdle: () => false }));
+  runner.warmAgents.set("background-claude", entry("background-claude", { isIdle: () => false, hasLiveBackgroundWork: () => true }));
+  runner.warmAgents.set("idle-codex", entry("idle-codex"));
+  const codex: Record<string, unknown> = entry("running-codex");
+  runner.warmAgents.set("running-codex", codex);
+  let finish!: () => void;
+  const turn = runner.enqueueWarmRun(codex, () => new Promise<void>((resolve) => { finish = resolve; }));
+
+  await runner.retireIdleWarmAgents("environment-changed");
+  assert.deepEqual(closed.sort(), ["idle-claude:environment-changed", "idle-codex:environment-changed"]);
+  assert.deepEqual([...runner.warmAgents.keys()].sort(), ["answering-claude", "background-claude", "running-codex"],
+    "a reply in progress, background tasks and a running turn keep their process");
+  assert.equal(runner.warmShutdown, undefined, "new turns are not refused meanwhile");
+
+  finish();
+  await turn;
+  assert.equal(codex.activeRuns, 0);
+  await runner.retireIdleWarmAgents("environment-changed");
+  assert.ok(closed.includes("running-codex:environment-changed"), "once its turn is over it holds no work");
+});
+
+test("an environment change waits for a busy member process instead of the member waiting for it", () => {
+  const runner = makeRunner() as any;
+  const member = { id: "p1", kind: "claude-code" };
+  const warm = { conversationId: "c1", participantId: "p1", contextKey: "", idleTimeoutMs: 1 };
+  const runningKey = runner.warmAgentKey(member, "/r", "chat", { warm, agentEnvKey: "v1" });
+  let idle = false;
+  runner.warmAgents.set(runningKey, { key: runningKey, scopeKey: "c1:p1", closed: false, isIdle: () => idle });
+  const envKey = (runOptions: Record<string, unknown>, kind = "chat") =>
+    runner.withBusyMemberEnvironment(member, "/r", kind, runOptions).agentEnvKey;
+  const options = { warm, agentEnvKey: "v2" };
+  assert.equal(envKey(options), "v1", "busy (a background task): its messages go into the session already running");
+  assert.equal(runner.warmAgentKey(member, "/r", "chat", { ...options, agentEnvKey: envKey(options) }), runningKey);
+  assert.equal(envKey({ ...options, nativeGoal: { objective: "x" } }), "v2", "a goal runs in its own process: the values as they are now");
+  assert.equal(envKey({ ...options, warm: { ...warm, contextKey: "changed" } }), "v2", "other settings changed too: the process is replaced anyway");
+  assert.equal(envKey({ ...options, warm: { ...warm, participantId: "p2" } }), "v2", "another member's busy process changes nothing");
+  idle = true;
+  assert.equal(envKey(options), "v2", "idle: its next turn gets the new values");
+});
+
+test("a shutdown while a Claude turn reads its Chrome setting stops the turn", async () => {
+  for (const compact of [false, true]) {
+    const runner = makeRunner() as any;
+    let release!: () => void;
+    const reading = new Promise<void>((resolve) => { release = resolve; });
+    runner.withClaudeChrome = async (_participant: unknown, _repoPath: unknown, _kind: unknown, options: Record<string, unknown>) => {
+      await reading;
+      return { ...options, claudeChrome: false };
+    };
+    runner.runClaude = runner.compactClaudeSession = async () => { throw new Error("must not start"); };
+    const participant = { id: "p1", label: "Claude", kind: "claude-code" };
+    const warm = { conversationId: "c1", participantId: "p1", contextKey: "k", idleTimeoutMs: 1000 };
+    const pending = compact
+      ? runner.compactSession(participant, undefined, undefined, "chat", undefined, { warm, sessionId: "s1" })
+      : runner.run(participant, "hi", undefined, undefined, "chat", undefined, { warm });
+    const closing = runner.shutdownWarmAgents();
+    release();
+    const result = await pending;
+    await closing;
+    assert.equal(result.ok, false);
+    assert.match(result.error, /shut down while/);
+  }
+});
+
 test("parseClaudeModelPickerOutput extracts aliases and default model from picker text", () => {
   const output = [
     "\u001b[?25lSelect m\u001b[12Gdel",
@@ -164,6 +443,13 @@ test("parseClaudeModelPickerOutput handles ConPTY rows without whitespace betwee
     "claude-sonnet-5[1m]",
     "haiku"
   ]);
+});
+
+test("parseClaudeModelPickerOutput keeps a Unicode cursor on a lower row out of the row above", () => {
+  const output = "Select model 1. Default (recommended) ✔ Opus 5.5 · Best for tasks2. Opus Opus 5.5 · Best for tasks❯ 3. Sonnet Sonnet 5.5 · Routine tasks● Enter to set · Esc to cancel";
+  const models = parseClaudeModelPickerOutput(output);
+  assert.deepEqual(models.map((model) => model.id), ["opus", "sonnet"]);
+  assert.equal(models.some((model) => model.label.includes("❯")), false);
 });
 
 test("parseClaudeModelPickerOutput uses the final ConPTY redraw", () => {
@@ -507,7 +793,7 @@ test("Windows Claude model discovery drives only the non-persistent interactive 
 
   const probe = runClaudeModelProbeInPty({
     executable: "C:\\Program Files\\Claude\\claude.exe",
-    env: { PATH: "C:\\Windows\\System32", CLAUDE_CODE_FORCE_SESSION_PERSISTENCE: "1" },
+    env: { PATH: "C:\\Windows\\System32", CLAUDE_CODE_FORCE_SESSION_PERSISTENCE: "1", NO_COLOR: "1" },
     cwd: "C:\\trusted\\repo",
     timeoutMs: 1_000,
     initialDelayMs: 0,
@@ -545,7 +831,8 @@ test("Windows Claude model discovery drives only the non-persistent interactive 
     cwd: "C:\\trusted\\repo",
     env: {
       PATH: "C:\\Windows\\System32",
-      CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1"
+      CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1",
+      TERM: "xterm-256color"
     }
   });
   assert.deepEqual(writes, ["/model\r", "\u001b", "/exit\r"]);
@@ -553,36 +840,129 @@ test("Windows Claude model discovery drives only the non-persistent interactive 
   assert.equal(writes.some((value) => !["/model\r", "\u001b", "/exit\r"].includes(value)), false);
 });
 
-test("Windows Claude model discovery never accepts a folder trust prompt", async () => {
-  const writes: string[] = [];
-  let killed = false;
-  let onData: ((data: string) => void) | undefined;
+// Claude Code 2.1.316's folder trust question as ConPTY drew it (recorded
+// 2026-11-10; only the folder is replaced). The highlight starts on "No, exit".
+const claudeTrustQuestion = (folder: string): string => "\u001b[38;2;255;193;7m\r\n" + "─".repeat(120)
+  + `\u001b[1m\u001b[3;2HAccessing\u001b[1Cworkspace:\u001b[m\u001b[1m\u001b[5;2H${folder}\u001b[22m`
+  + "\u001b[8;2HQuick\u001b[1Csafety\u001b[1Ccheck:\u001b[1CIs\u001b[1Cthis\u001b[1Ca\u001b[1Cproject\u001b[1Cyou\u001b[1Ccreated\u001b[1Cor\u001b[1Cone\u001b[1Cyou\u001b[1Ctrust?"
+  + "\u001b[1C(Like\u001b[1Cyour\u001b[1Cown\u001b[1Ccode,\u001b[1Ca\u001b[1Cwell-known\u001b[1Copen\u001b[1Csource\u001b[9;2Hproject,\u001b[1Cor\u001b[1Cwork\u001b[1Cfrom\u001b[1Cyour\u001b[1Cteam)."
+  + "\u001b[1CIf\u001b[1Cnot,\u001b[1Ctake\u001b[1Ca\u001b[1Cmoment\u001b[1Cto\u001b[1Creview\u001b[1Cwhat's\u001b[1Cin\u001b[1Cthis\u001b[1Cfolder\u001b[1Cfirst."
+  + "\u001b[11;2HClaude\u001b[1CCode'll\u001b[1Cbe\u001b[1Cable\u001b[1Cto\u001b[1Cread,\u001b[1Cedit,\u001b[1Cand\u001b[1Cexecute\u001b[1Cfiles\u001b[1Chere."
+  + "\u001b[38;2;153;153;153m\u001b[13;2HSecurity\u001b[1Cguide\u001b[38;2;177;185;249m\u001b[15;2H❯\u001b[1CNo,\u001b[1Cexit\u001b[m\u001b[16;4HYes,\u001b[1CI\u001b[1Ctrust\u001b[1Cthis\u001b[1Cfolder"
+  + "\u001b[38;2;153;153;153m\u001b[18;2HEnter\u001b[1Cto\u001b[1Cconfirm\u001b[1C·\u001b[1CEsc\u001b[1Cto\u001b[1Ccancel";
+// What the same Claude Code drew after one Down (recorded with the question above).
+const claudeTrustDownRedraw = ["\u001b[m\u001b[15;2H \u001b[1CNo, exit\u001b[38;2;177;185;249m\u001b[16;2H❯\u001b[1CYes, I trust this folder", "\u001b[m"];
+const windowsProbe = {
+  executable: "C:\\Program Files\\Claude\\claude.exe",
+  env: { PATH: "C:\\Windows\\System32" },
+  timeoutMs: 1_000,
+  initialDelayMs: 0,
+  pickerSettleDelayMs: 0,
+  exitDelayMs: 0,
+  trustKeyIntervalMs: 0
+};
 
-  const probe = runClaudeModelProbeInPty({
-    executable: "C:\\Program Files\\Claude\\claude.exe",
-    env: { PATH: "C:\\Windows\\System32" },
-    cwd: "C:\\untrusted\\repo",
-    timeoutMs: 1_000,
-    initialDelayMs: 0,
-    pickerSettleDelayMs: 0,
-    exitDelayMs: 0,
-    spawnPty: () => {
-      queueMicrotask(() => onData?.("Quick safety check: Is this a project you trust? 1. Yes, I trust this folder"));
-      return {
-        write: (data) => writes.push(data),
-        kill: () => { killed = true; },
-        onData: (listener) => {
-          onData = listener;
-          return { dispose: () => undefined };
-        },
-        onExit: () => ({ dispose: () => undefined })
-      };
-    }
+/** A fake ConPTY: `first` is drawn at start, and each press of a key draws its
+ *  next list of chunks (an empty list: the key drew nothing). */
+function fakeClaudePty(first: string[], replies: Record<string, string[][]>) {
+  const writes: string[] = [];
+  const state = { killed: false };
+  let onData: ((data: string) => void) | undefined;
+  let onExit: ((event: { exitCode: number }) => void) | undefined;
+  const draw = (chunks: string[] = []): void => {
+    for (const chunk of chunks) queueMicrotask(() => onData?.(chunk));
+  };
+  const spawnPty = () => {
+    draw(first);
+    return {
+      write: (data: string) => {
+        writes.push(data);
+        draw(replies[data]?.shift());
+        if (data === "/exit\r") queueMicrotask(() => onExit?.({ exitCode: 0 }));
+      },
+      kill: () => { state.killed = true; },
+      onData: (listener: (data: string) => void) => {
+        onData = listener;
+        return { dispose: () => undefined };
+      },
+      onExit: (listener: (event: { exitCode: number }) => void) => {
+        onExit = listener;
+        return { dispose: () => undefined };
+      }
+    };
+  };
+  return { spawnPty, writes, state };
+}
+
+test("Windows Claude model discovery refuses a folder trust prompt outside the app's own folder", async () => {
+  for (const ownFolder of [undefined, "C:\\app\\probe"]) {
+    const pty = fakeClaudePty([claudeTrustQuestion("C:\\untrusted\\repo")], {});
+    const probe = runClaudeModelProbeInPty({ ...windowsProbe, cwd: "C:\\untrusted\\repo", ownFolder, spawnPty: pty.spawnPty });
+    // The class is what sends the probe on to the app's own folder.
+    await assert.rejects(probe, (error) => error instanceof ClaudeFolderNotTrustedError && error.folder === "C:\\untrusted\\repo");
+    assert.deepEqual(pty.writes, []);
+    assert.equal(pty.state.killed, true);
+  }
+});
+
+test("Windows Claude model discovery answers Yes in the app's own folder, after a lost Down, and ignores the question's late footer", async () => {
+  const pty = fakeClaudePty([claudeTrustQuestion("C:\\app\\probe")], {
+    "\u001b[B": [[], claudeTrustDownRedraw],
+    // A redraw can deliver the question's "Esc to cancel" after Yes was chosen.
+    "\r": [["\u001b[18;2HEnter\u001b[1Cto\u001b[1Cconfirm\u001b[1C·\u001b[1CEsc\u001b[1Cto\u001b[1Ccancel", "Safe mode: customizations disabled\r\nTranscript saving is off"]],
+    "/model\r": [["Select model\r\n1. Default (recommended) ✔ Opus 5.5\r\n2. Opus Opus 5.5\r\n3. Haiku Haiku 5.5\r\n● Enter to set · Esc to cancel"]]
   });
 
-  await assert.rejects(probe, /requires this folder to be trusted/);
-  assert.deepEqual(writes, []);
-  assert.equal(killed, true);
+  const transcript = await runClaudeModelProbeInPty({ ...windowsProbe, cwd: "C:\\app\\probe", ownFolder: "C:\\app\\probe", spawnPty: pty.spawnPty });
+  assert.deepEqual(pty.writes, ["\u001b[B", "\u001b[B", "\r", "/model\r", "\u001b", "/exit\r"]);
+  assert.deepEqual(parseClaudeModelPickerOutput(transcript).map((model) => model.id), ["opus", "haiku"]);
+});
+
+test("Claude model discovery reads an untrusted or missing project folder's models in the app's own folder, its own git work tree", async () => {
+  // userData inside a repository: Claude Code would record trust for the
+  // whole repository unless the app's folder is a work tree of its own.
+  const root = await mkdtemp(path.join(tmpdir(), "accord-claude-probe-folder-"));
+  const project = path.join(root, "project");
+  const ownFolder = path.join(root, "app", "claude-model-probe");
+  await mkdir(project);
+  execFileSync("git", ["init", "--quiet"], { cwd: root });
+  try {
+    // No project folder: the app's own folder, not the folder the app started in.
+    assert.equal(await resolveClaudeModelProbeCwd(undefined, ownFolder), ownFolder);
+    const cases: Array<{ name: string; cwd: string; project: "trusted" | "untrusted" | "broken"; calls: string[]; result: string | RegExp }> = [
+      { name: "trusted project", cwd: project, project: "trusted", calls: [project], result: "models in project" },
+      { name: "untrusted project", cwd: project, project: "untrusted", calls: [project, ownFolder], result: "models in app folder" },
+      { name: "project probe failing otherwise", cwd: project, project: "broken", calls: [project], result: /timed out/ },
+      { name: "no project", cwd: ownFolder, project: "trusted", calls: [ownFolder], result: "models in app folder" }
+    ];
+    for (const item of cases) {
+      await rm(ownFolder, { recursive: true, force: true });
+      const calls: string[] = [];
+      const run = probeClaudeModelsInFolder(item.cwd, ownFolder, async (folder) => {
+        calls.push(folder);
+        if (folder === ownFolder) {
+          const workTree = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: ownFolder, encoding: "utf8" }).trim();
+          assert.equal(path.resolve(workTree), await realpath(ownFolder), item.name);
+          return "models in app folder";
+        }
+        if (item.project === "untrusted") throw new ClaudeFolderNotTrustedError(folder);
+        if (item.project === "broken") throw new Error("Claude model picker probe timed out.");
+        return "models in project";
+      });
+      if (typeof item.result === "string") assert.equal(await run, item.result, item.name);
+      else await assert.rejects(run, item.result, item.name);
+      assert.deepEqual(calls, item.calls, item.name);
+    }
+
+    // A link in place of the app's folder would carry the trust to its target.
+    const linked = path.join(root, "app", "linked-probe");
+    await symlink(project, linked, "junction");
+    let probed = false;
+    await assert.rejects(probeClaudeModelsInFolder(linked, linked, async () => { probed = true; return ""; }));
+    assert.equal(probed, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Windows Claude model discovery bounds captured output", async () => {
@@ -1591,21 +1971,12 @@ test("claude warm stream and final content preserve the shipped fence boundary",
   const runner = makeRunner() as any;
   const outputs: Array<{ kind: string; cumulative?: string }> = [];
   const resolved: unknown[] = [];
-  const pending = makeClaudeWarmPendingTurn({
+  const harness = makeClaudeWarmHarness(runner);
+  harness.addReply({
     onOutput: (event: { kind: string; cumulative?: string }) => outputs.push(event),
     resolve: (result: unknown) => resolved.push(result)
   });
-  const participant = { id: "p1", label: "Agent", kind: "claude-code" };
-  const fail = (error: Error): never => { throw error; };
-  const send = (event: Record<string, unknown>): void => runner.handleClaudeWarmLine(
-    JSON.stringify(event),
-    participant,
-    {},
-    undefined,
-    pending,
-    () => pending,
-    fail
-  );
+  const send = harness.send;
   const fencedBlock = "Here is the helper:\n```ts\nconst value = 1;\n```";
   const continuation = "Done — tests pass.";
   const expected = `${fencedBlock} ${continuation}`;
@@ -1627,20 +1998,11 @@ test("claude warm stream and final content preserve the shipped fence boundary",
 test("claude warm stream rejoins mid-sentence text blocks", () => {
   const runner = makeRunner() as any;
   const outputs: Array<{ kind: string; cumulative?: string }> = [];
-  const pending = makeClaudeWarmPendingTurn({
+  const harness = makeClaudeWarmHarness(runner);
+  harness.addReply({
     onOutput: (event: { kind: string; cumulative?: string }) => outputs.push(event)
   });
-  const participant = { id: "p1", label: "Agent", kind: "claude-code" };
-  const fail = (error: Error): never => { throw error; };
-  const send = (event: Record<string, unknown>): void => runner.handleClaudeWarmLine(
-    JSON.stringify(event),
-    participant,
-    {},
-    undefined,
-    pending,
-    () => pending,
-    fail
-  );
+  const send = harness.send;
 
   send({ type: "stream_event", event: { type: "content_block_start", content_block: { type: "text" } } });
   send({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Current EUR/RUB is" } } });
@@ -1653,20 +2015,11 @@ test("claude warm stream rejoins mid-sentence text blocks", () => {
 test("claude warm fallback excludes paragraph-separated preamble from final content", () => {
   const runner = makeRunner() as any;
   const resolved: unknown[] = [];
-  const pending = makeClaudeWarmPendingTurn({
+  const harness = makeClaudeWarmHarness(runner);
+  harness.addReply({
     resolve: (result: unknown) => resolved.push(result)
   });
-  const participant = { id: "p1", label: "Agent", kind: "claude-code" };
-  const fail = (error: Error): never => { throw error; };
-  const send = (event: Record<string, unknown>): void => runner.handleClaudeWarmLine(
-    JSON.stringify(event),
-    participant,
-    {},
-    undefined,
-    pending,
-    () => pending,
-    fail
-  );
+  const send = harness.send;
 
   send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "I’ll check the existing settings first." }] } });
   send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Final answer." }] } });
@@ -1678,20 +2031,11 @@ test("claude warm fallback excludes paragraph-separated preamble from final cont
 test("claude warm fallback rejoins mid-sentence assistant text items", () => {
   const runner = makeRunner() as any;
   const resolved: unknown[] = [];
-  const pending = makeClaudeWarmPendingTurn({
+  const harness = makeClaudeWarmHarness(runner);
+  harness.addReply({
     resolve: (result: unknown) => resolved.push(result)
   });
-  const participant = { id: "p1", label: "Agent", kind: "claude-code" };
-  const fail = (error: Error): never => { throw error; };
-  const send = (event: Record<string, unknown>): void => runner.handleClaudeWarmLine(
-    JSON.stringify(event),
-    participant,
-    {},
-    undefined,
-    pending,
-    () => pending,
-    fail
-  );
+  const send = harness.send;
 
   send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Current EUR/RUB is" }] } });
   send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "about 1 EUR = 89.88 RUB." }] } });
@@ -1704,23 +2048,14 @@ test("claude warm rejects result events without response content", () => {
   const runner = makeRunner() as any;
   const resolved: unknown[] = [];
   const rejected: Error[] = [];
-  const sessionId = "11111111-1111-4111-8111-111111111111";
-  const pending = makeClaudeWarmPendingTurn({
+  const harness = makeClaudeWarmHarness(runner);
+  harness.addReply({
     resolve: (result: unknown) => resolved.push(result),
     reject: (error: Error) => rejected.push(error)
   });
-  const participant = { id: "p1", label: "Agent", kind: "claude-code" };
-  const fail = (error: Error): never => { throw error; };
 
-  runner.handleClaudeWarmLine(
-    JSON.stringify({ type: "result" }),
-    participant,
-    {},
-    undefined,
-    pending,
-    () => pending,
-    fail
-  );
+  harness.send({ type: "system", subtype: "init" });
+  harness.send({ type: "result" });
 
   assert.equal(resolved.length, 0);
   assert.equal(rejected[0]?.message, "Claude warm process completed without response content.");
@@ -1730,22 +2065,15 @@ test("claude warm permits empty result only when explicitly allowed", () => {
   const runner = makeRunner() as any;
   const resolved: unknown[] = [];
   const rejected: Error[] = [];
-  const pending = makeClaudeWarmPendingTurn({
+  const harness = makeClaudeWarmHarness(runner);
+  harness.addReply({
+    allowEmptyContent: true,
     resolve: (result: unknown) => resolved.push(result),
     reject: (error: Error) => rejected.push(error)
   });
-  const participant = { id: "p1", label: "Agent", kind: "claude-code" };
-  const fail = (error: Error): never => { throw error; };
 
-  runner.handleClaudeWarmLine(
-    JSON.stringify({ type: "result" }),
-    participant,
-    { allowEmptyContent: true },
-    undefined,
-    pending,
-    () => pending,
-    fail
-  );
+  harness.send({ type: "system", subtype: "init" });
+  harness.send({ type: "result" });
 
   assert.equal(rejected.length, 0);
   assert.equal((resolved[0] as { ok: boolean; content: string; sessionId: string }).ok, true);
@@ -2816,9 +3144,9 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   let deliveryAcknowledged = false;
   let guardianSignal: AbortSignal | undefined;
   let resolveDecision!: () => void;
-  let resolveDelivery!: () => void;
+  let resolveDelivery!: (receipt: CodexServerRequestDelivery) => void;
   let rejectDelivery!: (error: unknown) => void;
-  const delivery = new Promise<void>((resolve, reject) => {
+  const delivery = new Promise<CodexServerRequestDelivery>((resolve, reject) => {
     resolveDelivery = resolve;
     rejectDelivery = reject;
   });
@@ -2839,12 +3167,12 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
           contextKey: "context-guardian",
           idleTimeoutMs: 60_000
         },
-        onCodexServerRequest: (request: { method: string; signal: AbortSignal; responseDelivered: Promise<void> }) => {
+        onCodexServerRequest: (request: { method: string; signal: AbortSignal; responseDelivered: Promise<CodexServerRequestDelivery> }) => {
           assert.equal(request.method, "item/autoApprovalReview/denied");
           guardianSignal = request.signal;
-          void request.responseDelivered.then(() => {
+          void request.responseDelivered.then((receipt) => {
             deliveryAcknowledged = true;
-            resolveDelivery();
+            resolveDelivery(receipt);
           }, rejectDelivery);
           return new Promise((resolve, reject) => {
             resolveDecision = () => resolve({ decision: "approveRetry" });
@@ -2858,11 +3186,212 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     assert.equal(guardianSignal?.aborted, false);
     assert.equal(deliveryAcknowledged, false);
     resolveDecision();
-    await Promise.race([
+    const receipt = await Promise.race([
       delivery,
       new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Guardian override was not acknowledged")), 1_500))
     ]);
     assert.equal(deliveryAcknowledged, true);
+    // The turn had completed before the decision: Codex only records it, so
+    // the chat must continue the participant with it.
+    assert.deepEqual(receipt, { turnActive: false });
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("codex app-server reports a Guardian override delivered into the still-running turn", async () => {
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-codex-guardian-live-"));
+  const codexPath = await writeCodexAppServerFixture(fixtureDir, `#!/usr/bin/env node
+const readline = require("node:readline");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { userAgent: "fake-codex", platformFamily: "unix", platformOsName: "macos", platformArch: "arm64" } });
+  } else if (message.method === "thread/start") {
+    send({ id: message.id, result: { thread: { id: "thread-guardian-live" }, model: "gpt-5" } });
+  } else if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn-guardian-live" } } });
+    send({ method: "turn/started", params: { threadId: "thread-guardian-live", turn: { id: "turn-guardian-live" } } });
+    send({ method: "item/autoApprovalReview/completed", params: {
+      threadId: "thread-guardian-live", turnId: "turn-guardian-live", startedAtMs: 10, completedAtMs: 20,
+      reviewId: "review-guardian-live", targetItemId: "item-guardian-live", decisionSource: "agent",
+      review: { status: "denied", riskLevel: "high", userAuthorization: "low", rationale: "Protected action" },
+      action: { type: "command", source: "unifiedExec", command: "git push origin scratch", cwd: process.cwd() }
+    } });
+    send({ method: "item/completed", params: { threadId: "thread-guardian-live", turnId: "turn-guardian-live", item: {
+      id: "item-guardian-live", type: "commandExecution", status: "failed", command: "git push origin scratch"
+    } } });
+    // The turn keeps working: it ends only after the User's decision arrives.
+  } else if (message.method === "thread/approveGuardianDeniedAction") {
+    if (message.params?.threadId !== "thread-guardian-live" || message.params?.event?.id !== "review-guardian-live") process.exit(52);
+    send({ id: message.id, result: {} });
+    send({ method: "item/agentMessage/delta", params: {
+      threadId: "thread-guardian-live", turnId: "turn-guardian-live", itemId: "agent-guardian-live", delta: "Retried inside the running turn."
+    } });
+    send({ method: "item/completed", params: { threadId: "thread-guardian-live", turnId: "turn-guardian-live", item: {
+      id: "agent-guardian-live", type: "agentMessage", text: "Retried inside the running turn."
+    } } });
+    send({ method: "turn/completed", params: {
+      threadId: "thread-guardian-live", turn: { id: "turn-guardian-live", status: "completed" }
+    } });
+  }
+});
+`);
+  const runner = new CliAgentRunner(undefined, undefined, codexPath) as any;
+  let resolveDecision!: () => void;
+  let resolveRequested!: () => void;
+  const requested = new Promise<void>((resolve) => { resolveRequested = resolve; });
+  let resolveDelivery!: (receipt: CodexServerRequestDelivery) => void;
+  let rejectDelivery!: (error: unknown) => void;
+  const delivery = new Promise<CodexServerRequestDelivery>((resolve, reject) => {
+    resolveDelivery = resolve;
+    rejectDelivery = reject;
+  });
+  void delivery.catch(() => undefined);
+  try {
+    const resultPromise: Promise<ParticipantRunResult> = runner.runCodexAppServerWarmOrOneShot(
+      { id: "participant-guardian-live", kind: "codex-cli", label: "Codex" },
+      "Push the scratch branch.",
+      fixtureDir,
+      undefined,
+      "chat",
+      undefined,
+      {
+        agentMode: "auto",
+        warm: {
+          conversationId: "conversation-guardian-live",
+          participantId: "participant-guardian-live",
+          contextKey: "context-guardian-live",
+          idleTimeoutMs: 60_000
+        },
+        onCodexServerRequest: (request: { method: string; signal: AbortSignal; responseDelivered: Promise<CodexServerRequestDelivery> }) => {
+          assert.equal(request.method, "item/autoApprovalReview/denied");
+          void request.responseDelivered.then(resolveDelivery, rejectDelivery);
+          resolveRequested();
+          return new Promise((resolve, reject) => {
+            resolveDecision = () => resolve({ decision: "approveRetry" });
+            request.signal.addEventListener("abort", () => reject(request.signal.reason), { once: true });
+          });
+        }
+      }
+    );
+    await Promise.race([
+      requested,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Guardian denial was not offered")), 1_500))
+    ]);
+    resolveDecision();
+    const receipt = await Promise.race([
+      delivery,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Guardian override was not acknowledged")), 1_500))
+    ]);
+    // Codex applies the decision inside the running turn: no continuation.
+    assert.deepEqual(receipt, { turnActive: true });
+    const result = await resultPromise;
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.match(result.content, /Retried inside the running turn/);
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("codex app-server reports turnActive when the approval ack and turn/completed arrive in one stdout chunk", async () => {
+  // Regression: sampling turnActive AFTER `await sendRequest` let a coalesced
+  // ack+turn/completed clear pendingTurn first, yielding turnActive:false for a
+  // retry Codex already ran in-turn — which restarted it a second time. The fake
+  // writes the ack and the turn/completed in a single write to force coalescing.
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-codex-guardian-coalesced-"));
+  const codexPath = await writeCodexAppServerFixture(fixtureDir, `#!/usr/bin/env node
+const readline = require("node:readline");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { userAgent: "fake-codex", platformFamily: "unix", platformOsName: "macos", platformArch: "arm64" } });
+  } else if (message.method === "thread/start") {
+    send({ id: message.id, result: { thread: { id: "thread-guardian-coalesced" }, model: "gpt-5" } });
+  } else if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn-guardian-coalesced" } } });
+    send({ method: "turn/started", params: { threadId: "thread-guardian-coalesced", turn: { id: "turn-guardian-coalesced" } } });
+    send({ method: "item/autoApprovalReview/completed", params: {
+      threadId: "thread-guardian-coalesced", turnId: "turn-guardian-coalesced", startedAtMs: 10, completedAtMs: 20,
+      reviewId: "review-guardian-coalesced", targetItemId: "item-guardian-coalesced", decisionSource: "agent",
+      review: { status: "denied", riskLevel: "high", userAuthorization: "low", rationale: "Protected action" },
+      action: { type: "command", source: "unifiedExec", command: "git push origin scratch", cwd: process.cwd() }
+    } });
+    send({ method: "item/completed", params: { threadId: "thread-guardian-coalesced", turnId: "turn-guardian-coalesced", item: {
+      id: "item-guardian-coalesced", type: "commandExecution", status: "failed", command: "git push origin scratch"
+    } } });
+  } else if (message.method === "thread/approveGuardianDeniedAction") {
+    if (message.params?.threadId !== "thread-guardian-coalesced" || message.params?.event?.id !== "review-guardian-coalesced") process.exit(53);
+    // One write: the approve ack AND the item/agentMessage + turn/completed for
+    // the in-turn retry, so the runner parses them in a single data event.
+    const lines = [
+      { id: message.id, result: {} },
+      { method: "item/agentMessage/delta", params: { threadId: "thread-guardian-coalesced", turnId: "turn-guardian-coalesced", itemId: "agent-guardian-coalesced", delta: "Retried inside the running turn." } },
+      { method: "item/completed", params: { threadId: "thread-guardian-coalesced", turnId: "turn-guardian-coalesced", item: { id: "agent-guardian-coalesced", type: "agentMessage", text: "Retried inside the running turn." } } },
+      { method: "turn/completed", params: { threadId: "thread-guardian-coalesced", turn: { id: "turn-guardian-coalesced", status: "completed" } } }
+    ];
+    process.stdout.write(lines.map((value) => JSON.stringify(value)).join("\\n") + "\\n");
+  }
+});
+`);
+  const runner = new CliAgentRunner(undefined, undefined, codexPath) as any;
+  let resolveDecision!: () => void;
+  let resolveRequested!: () => void;
+  const requested = new Promise<void>((resolve) => { resolveRequested = resolve; });
+  let resolveDelivery!: (receipt: CodexServerRequestDelivery) => void;
+  let rejectDelivery!: (error: unknown) => void;
+  const delivery = new Promise<CodexServerRequestDelivery>((resolve, reject) => {
+    resolveDelivery = resolve;
+    rejectDelivery = reject;
+  });
+  void delivery.catch(() => undefined);
+  try {
+    const resultPromise: Promise<ParticipantRunResult> = runner.runCodexAppServerWarmOrOneShot(
+      { id: "participant-guardian-coalesced", kind: "codex-cli", label: "Codex" },
+      "Push the scratch branch.",
+      fixtureDir,
+      undefined,
+      "chat",
+      undefined,
+      {
+        agentMode: "auto",
+        warm: {
+          conversationId: "conversation-guardian-coalesced",
+          participantId: "participant-guardian-coalesced",
+          contextKey: "context-guardian-coalesced",
+          idleTimeoutMs: 60_000
+        },
+        onCodexServerRequest: (request: { method: string; signal: AbortSignal; responseDelivered: Promise<CodexServerRequestDelivery> }) => {
+          assert.equal(request.method, "item/autoApprovalReview/denied");
+          void request.responseDelivered.then(resolveDelivery, rejectDelivery);
+          resolveRequested();
+          return new Promise((resolve, reject) => {
+            resolveDecision = () => resolve({ decision: "approveRetry" });
+            request.signal.addEventListener("abort", () => reject(request.signal.reason), { once: true });
+          });
+        }
+      }
+    );
+    await Promise.race([
+      requested,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Guardian denial was not offered")), 1_500))
+    ]);
+    resolveDecision();
+    const receipt = await Promise.race([
+      delivery,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Guardian override was not acknowledged")), 1_500))
+    ]);
+    // The retry ran inside the turn; the receipt must say so even though
+    // turn/completed was coalesced with the ack. Otherwise chat starts a
+    // second continuation and the approved command runs twice.
+    assert.deepEqual(receipt, { turnActive: true });
+    const result = await resultPromise;
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.match(result.content, /Retried inside the running turn/);
   } finally {
     await runner.shutdownWarmAgents();
     await rm(fixtureDir, { recursive: true, force: true });
@@ -3072,7 +3601,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
 });
 `);
-  const runner = new CliAgentRunner(undefined, undefined, codexPath) as any;
+  const runner = new CliAgentRunner(undefined, undefined, { codexExecutable: codexPath, nativeProcessDbPath: path.join(fixtureDir, "native-processes.sqlite3") }) as any;
   const controller = new AbortController();
   let requestSeen!: () => void;
   let approvalAborted = false;
@@ -3124,6 +3653,71 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       process.kill(helperPid, "SIGKILL");
     }
     await rm(fixtureDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("Codex Stop waits for a detached command even after the provider exits", { timeout: 10_000 }, async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX detached process identity test");
+    return;
+  }
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-codex-stop-detached-"));
+  const helperPidFile = path.join(fixtureDir, "helper.pid");
+  const codexPath = await writeCodexAppServerFixture(fixtureDir, `
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const readline = require("node:readline");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") send({ id: message.id, result: {} });
+  if (message.method === "thread/start") send({ id: message.id, result: { thread: { id: "thread-detached" } } });
+  if (message.method === "turn/interrupt") process.exit(0);
+  if (message.method === "turn/start") {
+    send({ id: message.id, result: { turn: { id: "turn-detached" } } });
+    const helper = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); process.send('ready')"], {
+      detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"]
+    });
+    helper.on("message", () => {
+      writeFileSync(${JSON.stringify(helperPidFile)}, String(helper.pid));
+      send({ id: "ready", method: "item/commandExecution/requestApproval", params: {
+        threadId: "thread-detached", turnId: "turn-detached", itemId: "detached-command", startedAtMs: 1,
+        environmentId: null, command: "fixture", cwd: process.cwd(), availableDecisions: ["accept", "decline"]
+      } });
+    });
+  }
+});
+`);
+  const runner = new CliAgentRunner(undefined, undefined, { codexExecutable: codexPath, nativeProcessDbPath: path.join(fixtureDir, "native-processes.sqlite3") }) as any;
+  const controller = new AbortController();
+  let ready!: () => void;
+  const seen = new Promise<void>((resolve) => { ready = resolve; });
+  let helperPid: number | undefined;
+  try {
+    const run = runner.runCodexAppServerWarmOrOneShot(
+      { id: "codex-detached", kind: "codex-cli", label: "Codex" }, "Wait.", fixtureDir,
+      undefined, "chat", controller.signal, {
+        agentMode: "auto",
+        warm: { conversationId: "detached", participantId: "codex-detached", contextKey: "detached" },
+        onCodexServerRequest: (request: { signal: AbortSignal }) => {
+          ready();
+          return new Promise((_resolve, reject) => {
+            request.signal.addEventListener("abort", () => reject(request.signal.reason), { once: true });
+          });
+        }
+      }
+    );
+    await seen;
+    helperPid = Number((await readFile(helperPidFile, "utf8")).trim());
+    assert.equal(testProcessExists(helperPid), true);
+    controller.abort(new Error("Stopped by user."));
+    const result = await run;
+    assert.equal(result.ok, false);
+    assert.equal(testProcessExists(helperPid), false, "Stop must not finish while a captured command survives");
+  } finally {
+    await runner.shutdownWarmAgents();
+    if (helperPid && testProcessExists(helperPid)) process.kill(helperPid, "SIGKILL");
+    await rm(fixtureDir, { recursive: true, force: true });
   }
 });
 
@@ -3218,13 +3812,17 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
 });
 `);
-  const runner = new CliAgentRunner(undefined, undefined, codexPath) as any;
+  const diagnostics: unknown[] = [];
+  const runner = new CliAgentRunner({ write: async (event, payload) => { diagnostics.push({ event, payload }); } }, undefined, { codexExecutable: codexPath, nativeProcessDbPath: path.join(fixtureDir, "native-processes.sqlite3") }) as any;
   const participants = ["one", "two"].map((id) => ({ id: `participant-${id}`, kind: "codex-cli" as const, label: `Codex ${id}` }));
   t.after(async () => {
     await runner.shutdownWarmAgents();
     await rm(fixtureDir, { recursive: true, force: true });
   });
 
+  // Shell readiness can take up to its own eight-second timeout; it is a
+  // fixture prerequisite, not part of this four-second provider-start check.
+  await ensureLoginShellEnvPrimed();
   const runs = participants.map((participant) => runner.runCodexAppServerWarmOrOneShot(
     participant,
     "Keep responding until the app closes.",
@@ -3243,6 +3841,8 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     }
   ));
 
+  const earlyResults: unknown[] = [];
+  for (const run of runs) void run.then((result: unknown) => earlyResults.push(result), (error: unknown) => earlyResults.push(String(error)));
   let startedPids: number[] = [];
   for (let attempt = 0; attempt < 80; attempt += 1) {
     startedPids = await readFile(startedFile, "utf8")
@@ -3253,7 +3853,16 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  assert.equal(startedPids.length, participants.length, "both agent responses should be active before app shutdown");
+  if (startedPids.length !== participants.length) {
+    const native = new NativeProcessRegistry(path.join(fixtureDir, "native-processes.sqlite3"));
+    const diagnostic = { earlyResults, diagnostics, providers: await readFile(pidFile, "utf8").catch(() => "none"),
+      preparing: [...runner.warmPreparations].map((value: { key: string }) => value.key), creating: [...runner.warmAgentCreations.keys()], warm: [...runner.warmAgents.keys()],
+      receipts: await native.openLeases().catch(error => String(error)) };
+    console.error("native-close-startup-diagnostic", JSON.stringify(diagnostic));
+  }
+  assert.equal(startedPids.length, participants.length, `both agent responses should be active before app shutdown; early outcomes: ${JSON.stringify(earlyResults)}`);
+  assert.equal(runner.hasActiveNativeWork(), true);
+  assert.equal(runner.fenceIdleNativeAdmissions(), undefined, "idle stop cannot fence active provider responses");
 
   await runner.shutdownWarmAgents();
   const results = await Promise.all(runs);
@@ -3261,6 +3870,14 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   for (const pid of startedPids) {
     await assertFixtureProcessStops(pid);
   }
+  assert.equal(runner.hasActiveNativeWork(), false);
+  const releaseIdle = runner.fenceIdleNativeAdmissions();
+  assert.equal(typeof releaseIdle, "function");
+  const refused = await runner.runCodexAppServerWarmOrOneShot(participants[0], "Must stay queued.", fixtureDir, undefined,
+    "chat", undefined, { agentMode: "default", warm: { conversationId: "idle-fenced", participantId: participants[0].id, contextKey: "idle-fenced", idleTimeoutMs: 60_000 } });
+  assert.equal(refused.ok, false);
+  assert.equal((await readFile(pidFile, "utf8")).trim().split(/\r?\n/).length, participants.length, "a fenced command never spawns a replacement provider");
+  releaseIdle();
 });
 
 function testProcessExists(pid: number): boolean {
@@ -3272,12 +3889,1361 @@ function testProcessExists(pid: number): boolean {
   }
 }
 
+async function waitForCondition(condition: () => boolean | Promise<boolean>, timeoutMs = 5_000): Promise<void> {
+  const start = Date.now();
+  while (!(await condition())) {
+    if (Date.now() - start > timeoutMs) assert.fail("Timed out waiting for condition.");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 async function assertFixtureProcessStops(pid: number): Promise<void> {
   for (let attempt = 0; attempt < 40 && testProcessExists(pid); attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.equal(testProcessExists(pid), false, `provider descendant ${pid} survived warm-agent shutdown`);
 }
+
+test("Claude public warm-run path: background work outlives the reply, the next message and a Stop, and its result arrives as a new reply", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-background-warm-"));
+  const claudePath = path.join(fixtureDir, "claude-fixture");
+  const processPidsFile = path.join(fixtureDir, "process-pids.txt");
+  const helperPidFile = path.join(fixtureDir, "helper.pid");
+  const stdinLog = path.join(fixtureDir, "stdin.jsonl");
+  // Mirrors Claude Code 2.1.280 on stream-json: uuid-stamped messages get a
+  // command lifecycle, an interrupt ends only the running step with
+  // error_during_execution, and a finished background task makes the CLI
+  // start a step on its own.
+  await writeFile(claudePath, `#!/usr/bin/env node
+const { appendFileSync, writeFileSync } = require("node:fs");
+const { spawn } = require("node:child_process");
+const readline = require("node:readline");
+appendFileSync(${JSON.stringify(processPidsFile)}, String(process.pid) + "\\n");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+let helper;
+let messages = 0;
+let running;
+const input = readline.createInterface({ input: process.stdin });
+input.on("close", () => {
+  if (helper) helper.kill("SIGTERM");
+  process.exit(0);
+});
+input.on("line", (line) => {
+  appendFileSync(${JSON.stringify(stdinLog)}, line + "\\n");
+  const message = JSON.parse(line);
+  if (message.type === "control_request") {
+    send({ type: "control_response", response: { subtype: "success", request_id: message.request_id, response: { still_queued: [] } } });
+    if (message.request.subtype === "interrupt" && running) {
+      send({ type: "result", subtype: "error_during_execution", is_error: true });
+      send({ type: "command_lifecycle", command_uuid: running, state: "cancelled" });
+      running = undefined;
+    }
+    return;
+  }
+  messages += 1;
+  const uuid = message.uuid;
+  send({ type: "command_lifecycle", command_uuid: uuid, state: "queued" });
+  send({ type: "command_lifecycle", command_uuid: uuid, state: "started" });
+  send({ type: "system", subtype: "init", session_id: "fixture-session" });
+  if (messages === 1) {
+    helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    writeFileSync(${JSON.stringify(helperPidFile)}, String(helper.pid));
+    send({ type: "system", subtype: "task_started", task_id: "task-1", description: "fixture background task", is_backgrounded: true });
+    send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Started." }] } });
+    send({ type: "result", subtype: "success", result: "Started." });
+    send({ type: "command_lifecycle", command_uuid: uuid, state: "completed" });
+    return;
+  }
+  if (messages === 2) {
+    running = uuid;
+    send({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Working on it" } } });
+    send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Working on it" }] } });
+    return;
+  }
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Third." }] } });
+  send({ type: "result", subtype: "success", result: "Third." });
+  send({ type: "command_lifecycle", command_uuid: uuid, state: "completed" });
+  setTimeout(() => {
+    helper.kill("SIGTERM");
+    helper = undefined;
+    send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    send({ type: "system", subtype: "task_notification", task_id: "task-1", status: "completed" });
+    send({ type: "system", subtype: "init", session_id: "fixture-session" });
+    send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Background done." }] } });
+    send({ type: "result", subtype: "success", result: "Background done." });
+  }, 100);
+});
+`, "utf8");
+  await chmod(claudePath, 0o755);
+
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-background", kind: "claude-code", label: "Claude" };
+  const selfResumed: any[] = [];
+  let markSelfResumed!: () => void;
+  const selfResumedSeen = new Promise<void>((resolve) => { markSelfResumed = resolve; });
+  let repliesStarted = 0;
+  const backgroundReports: string[][] = [];
+  const warm = {
+    conversationId: "conversation-background",
+    participantId: participant.id,
+    contextKey: "context-background",
+    idleTimeoutMs: 60_000,
+    onReplyStarted: () => { repliesStarted += 1; },
+    onBackgroundTasksChanged: (tasks: any[]) => { backgroundReports.push(tasks.map((task) => `${task.label}@${task.origin?.messageId}`)); },
+    origin: { runId: "run-1", messageId: "reply-1" },
+    onSelfResumedTurn: (turn: any) => {
+      selfResumed.push(turn);
+      markSelfResumed();
+    }
+  };
+  let helperPid: number | undefined;
+  try {
+    const firstOutputs: Array<{ text: string }> = [];
+    const first = await runner.run(participant, "Start work.", fixtureDir, undefined, "chat", undefined, {
+      agentMode: "default",
+      warm,
+      onOutput: (event: { text: string }) => firstOutputs.push(event)
+    });
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.content, "Started.", "the reply ends at its result");
+    assert.equal(repliesStarted, 1, "a fresh process is announced once, before it starts");
+    assert.ok(firstOutputs.some((event) => /Running in the background: fixture background task/.test(event.text)));
+    helperPid = Number.parseInt((await readFile(helperPidFile, "utf8")).trim(), 10);
+    assert.equal(testProcessExists(helperPid), true);
+    assert.equal(runner.hasActiveNativeWork(), true, "native background work keeps the machine busy");
+    assert.equal(runner.fenceIdleNativeAdmissions(), undefined);
+
+    const controller = new AbortController();
+    let markWorking!: () => void;
+    const working = new Promise<void>((resolve) => { markWorking = resolve; });
+    const secondRun = runner.run(participant, "Do a long step.", fixtureDir, undefined, "chat", controller.signal, {
+      agentMode: "default",
+      warm: { ...warm, origin: { runId: "run-2", messageId: "reply-2" } },
+      onOutput: (event: { kind: string; text: string }) => {
+        if (event.kind === "tool" || /Working on it/.test(event.text)) markWorking();
+      }
+    });
+    // Stop only once the step is visibly running, as a user would.
+    await working;
+    controller.abort(new Error("Stopped by user."));
+    const second = await secondRun;
+    assert.equal(second.ok, false, "a stopped reply does not succeed");
+    const control = (await readFile(stdinLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line))
+      .find((message) => message.type === "control_request");
+    assert.equal(control?.request?.subtype, "interrupt", "Stop interrupts the step instead of closing the process");
+    assert.equal(testProcessExists(helperPid), true, "Stop keeps the background work");
+
+    const third = await runner.run(participant, "Anything else?", fixtureDir, undefined, "chat", undefined, {
+      agentMode: "default",
+      warm: { ...warm, origin: { runId: "run-3", messageId: "reply-3" } }
+    });
+    assert.equal(third.content, "Third.");
+    assert.equal(repliesStarted, 3, "on a live process each message is announced when the CLI takes it");
+    const processPids = (await readFile(processPidsFile, "utf8")).trim().split(/\r?\n/).map(Number);
+    assert.equal(processPids.length, 1, "every message went to the same live process");
+
+    await selfResumedSeen;
+    assert.deepEqual(selfResumed[0].origin, { runId: "run-1", messageId: "reply-1" }, "the finished work names the reply that started it");
+    const outputs: Array<{ text: string }> = [];
+    const continuation = await selfResumed[0].attach({ onOutput: (event: { text: string }) => outputs.push(event) });
+    assert.equal(continuation.ok, true);
+    assert.equal(continuation.content, "Background done.");
+    assert.ok(outputs.some((event) => /Background task finished: fixture background task/.test(event.text)));
+    assert.deepEqual(backgroundReports, [["fixture background task@reply-1"], []],
+      "the member's background work is reported once when it starts, with the reply that started it, and once when it ends");
+    await assertFixtureProcessStops(helperPid);
+  } finally {
+    await runner.shutdownWarmAgents();
+    if (helperPid && testProcessExists(helperPid)) {
+      process.kill(helperPid, "SIGKILL");
+    }
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+/** A Claude Code 2.1.280 stand-in for compaction: keeps its conversation in
+ *  memory (what its next reply's context counts), compacts it on `/compact`
+ *  with the boundary the real CLI emits, and answers `get_context_usage` as
+ *  the real CLI does (verified against 2.1.280 on 2026-10-22). */
+async function writeClaudeCompactionFixture(fixtureDir: string, options: { contextUsageAnswer?: "success" | "error" } = {}): Promise<{ claudePath: string; log: string; finishBackground: () => Promise<void> }> {
+  const claudePath = path.join(fixtureDir, "claude-fixture");
+  const log = path.join(fixtureDir, "fixture-log.jsonl");
+  // The background task ends when the test says so, not after a delay.
+  const finishFile = path.join(fixtureDir, "finish-background");
+  await writeFile(claudePath, `#!/usr/bin/env node
+const { appendFileSync, existsSync } = require("node:fs");
+const readline = require("node:readline");
+const log = (entry) => appendFileSync(${JSON.stringify(log)}, JSON.stringify({ pid: process.pid, ...entry }) + "\\n");
+log({ started: process.argv.slice(2) });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+// What this process holds in memory: a resumed session starts from what the
+// session file holds, which a compaction elsewhere would have shrunk.
+const resumed = process.argv.includes("--resume");
+let messagesTokens = resumed ? 9000 : 0;
+let holding;
+let running = false;
+let answerTaskAfter = false;
+const baseline = 20000;
+const compactNow = () => {
+  send({ type: "system", subtype: "init", session_id: "fixture-session" });
+  const pre = baseline + messagesTokens;
+  messagesTokens = 9000;
+  send({ type: "system", subtype: "compact_boundary", session_id: "fixture-session", compact_metadata: { trigger: "manual", pre_tokens: pre, post_tokens: messagesTokens } });
+  send({ type: "user", message: { role: "user", content: "<local-command-stdout>Compacted </local-command-stdout>" } });
+  send({ type: "result", subtype: "success", result: "", session_id: "fixture-session", usage: { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 } });
+};
+const answerTask = () => {
+  send({ type: "system", subtype: "init", session_id: "fixture-session" });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Background done." }] } });
+  send({ type: "result", subtype: "success", result: "Background done.", session_id: "fixture-session", usage: { input_tokens: 2, cache_read_input_tokens: 99997, cache_creation_input_tokens: 0, output_tokens: 1 } });
+};
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.type === "control_request") {
+    log({ control: message.request.subtype });
+    if (message.request.subtype === "interrupt" && holding) {
+      // What Claude Code 2.1.280 answers when a /compact is interrupted
+      // (verified 2026-10-25): its words, a successful empty result.
+      send({ type: "control_response", response: { subtype: "success", request_id: message.request_id, response: {} } });
+      send({ type: "system", subtype: "status", session_id: "fixture-session" });
+      send({ type: "system", subtype: "init", session_id: "fixture-session" });
+      send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Compaction canceled." }] } });
+      send({ type: "result", subtype: "success", is_error: false, result: "", session_id: "fixture-session" });
+      send({ type: "command_lifecycle", command_uuid: holding, state: "cancelled" });
+      holding = undefined;
+      return;
+    }
+    if (message.request.subtype === "get_context_usage") {
+      send(${options.contextUsageAnswer === "error"
+        ? `{ type: "control_response", response: { subtype: "error", request_id: message.request_id, error: "Unknown request" } }`
+        : `{ type: "control_response", response: { subtype: "success", request_id: message.request_id, response: { totalTokens: baseline + messagesTokens, maxTokens: 1000000, percentage: 3 } } }`});
+    } else {
+      send({ type: "control_response", response: { subtype: "success", request_id: message.request_id, response: {} } });
+    }
+    return;
+  }
+  const text = message.message.content[0].text;
+  log({ message: text });
+  const uuid = message.uuid;
+  send({ type: "command_lifecycle", command_uuid: uuid, state: "queued" });
+  send({ type: "command_lifecycle", command_uuid: uuid, state: "started" });
+  if (text === "Start background.") {
+    send({ type: "system", subtype: "init", session_id: "fixture-session" });
+    send({ type: "system", subtype: "task_started", task_id: "task-1", description: "fixture background task", is_backgrounded: true });
+    send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Started." }] } });
+    send({ type: "result", subtype: "success", result: "Started.", session_id: "fixture-session" });
+    send({ type: "command_lifecycle", command_uuid: uuid, state: "completed" });
+    const poll = setInterval(() => {
+      if (!existsSync(${JSON.stringify(finishFile)})) return;
+      clearInterval(poll);
+      log({ background: "finished" });
+      send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+      send({ type: "system", subtype: "task_notification", task_id: "task-1", status: "completed" });
+      // As Claude Code 2.1.280 does (verified): a command running when the
+      // task ends finishes first; the answer to the task is a step after it.
+      if (running) answerTaskAfter = true;
+      else answerTask();
+    }, 20);
+    return;
+  }
+  if (text === "/compact meanwhile" || text === "/compact meanwhile-step") {
+    send({ type: "system", subtype: "status", session_id: "fixture-session" });
+    // A CLI that reports its compaction as a step from the start.
+    if (text.endsWith("-step")) send({ type: "system", subtype: "init", session_id: "fixture-session" });
+    running = true;
+    log({ compacting: text });
+    setTimeout(() => {
+      running = false;
+      log({ compacted: text });
+      compactNow();
+      send({ type: "command_lifecycle", command_uuid: uuid, state: "completed" });
+      if (answerTaskAfter) {
+        answerTaskAfter = false;
+        answerTask();
+      }
+    }, 800);
+    return;
+  }
+  if (text === "Reply slowly.") {
+    send({ type: "system", subtype: "init", session_id: "fixture-session" });
+    setTimeout(() => {
+      messagesTokens += 40000;
+      log({ replied: text });
+      send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Slow reply." }] } });
+      send({ type: "result", subtype: "success", result: "Slow reply.", session_id: "fixture-session" });
+      send({ type: "command_lifecycle", command_uuid: uuid, state: "completed" });
+    }, 400);
+    return;
+  }
+  if (text.startsWith("/compact") && messagesTokens === 0) {
+    // What Claude Code 2.1.280 answers with nothing to compact (verified).
+    send({ type: "system", subtype: "init", session_id: "fixture-session" });
+    send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Error: No messages to compact" }] } });
+    send({ type: "result", subtype: "success", result: "", session_id: "fixture-session" });
+    send({ type: "command_lifecycle", command_uuid: uuid, state: "completed" });
+    return;
+  }
+  if (text === "/compact slowly") {
+    send({ type: "system", subtype: "status", session_id: "fixture-session" });
+    holding = uuid;
+    return;
+  }
+  if (text.startsWith("/compact")) {
+    send({ type: "system", subtype: "status", session_id: "fixture-session" });
+    compactNow();
+  } else {
+    messagesTokens += 40000;
+    send({ type: "system", subtype: "init", session_id: "fixture-session" });
+    send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Reply." }], usage: { input_tokens: 2, cache_read_input_tokens: baseline + messagesTokens - 2, cache_creation_input_tokens: 0, output_tokens: 10 } } });
+    send({ type: "result", subtype: "success", result: "Reply.", session_id: "fixture-session", usage: { input_tokens: 2, cache_read_input_tokens: baseline + messagesTokens - 2, cache_creation_input_tokens: 0, output_tokens: 10 } });
+  }
+  send({ type: "command_lifecycle", command_uuid: uuid, state: "completed" });
+});
+`, "utf8");
+  await chmod(claudePath, 0o755);
+  return { claudePath, log, finishBackground: () => writeFile(finishFile, "") };
+}
+
+async function readFixtureLog(log: string): Promise<Array<{ pid: number; started?: string[]; message?: string; control?: string; background?: string; replied?: string; compacted?: string; compacting?: string }>> {
+  return (await readFile(log, "utf8")).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+}
+
+test("Claude /compact runs in the member's live process, so its next reply continues from the compacted context", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-live-"));
+  const { claudePath, log } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  const warm = { conversationId: "conversation-compact", participantId: participant.id, contextKey: "context-compact", idleTimeoutMs: 60_000 };
+  try {
+    const first = await runner.run(participant, "Write a lot.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    const second = await runner.run(participant, "Write more.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    assert.equal(first.ok && second.ok, true);
+    assert.equal(second.contextUsage?.usedTokens, 109000, "two long replies on the resumed session: 109k in context");
+
+    const compact = await runner.compactSession(participant, fixtureDir, undefined, "chat", undefined,
+      { agentMode: "default", warm, sessionId: "fixture-session", compactInstructions: "keep the plan" });
+    assert.equal(compact.ok, true, JSON.stringify(compact));
+    assert.equal(compact.contextUsage?.usedTokens, 29000, "the CLI's own count of the compacted context, system prompt included");
+    assert.equal(compact.contextUsage?.contextWindowTokens, 1000000);
+
+    const next = await runner.run(participant, "Continue.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    assert.equal(next.contextUsage?.usedTokens, 69000, "the next reply continues from the compacted 29k, not from 109k");
+
+    const entries = await readFixtureLog(log);
+    const pids = new Set(entries.map((entry) => entry.pid));
+    assert.equal(pids.size, 1, "the compaction and every reply ran in the one live process");
+    assert.deepEqual(entries.filter((entry) => entry.message).map((entry) => entry.message),
+      ["Write a lot.", "Write more.", "/compact keep the plan", "Continue."]);
+    assert.ok(entries.some((entry) => entry.control === "get_context_usage"));
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude /compact runs while the member's background work keeps running, as in the dedicated CLI, and the work survives it", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-busy-"));
+  const { claudePath, log, finishBackground } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact-busy", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  const backgroundReports: string[][] = [];
+  let selfResumed: Promise<any> | undefined;
+  const warm = { conversationId: "conversation-compact-busy", participantId: participant.id, contextKey: "context-busy", idleTimeoutMs: 60_000,
+    onSelfResumedTurn: (turn: any) => { selfResumed = turn.attach({}); },
+    onBackgroundTasksChanged: (tasks: any[]) => { backgroundReports.push(tasks.map((task) => task.label)); } };
+  try {
+    const started = await runner.run(participant, "Start background.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    assert.equal(started.ok, true);
+    const live = Array.from(runner.warmAgents.values())[0] as any;
+    assert.equal(live.hasLiveBackgroundWork(), true);
+    const compact = await runner.compactSession(participant, fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    assert.equal(compact.ok, true, JSON.stringify(compact));
+    assert.equal(live.hasLiveBackgroundWork(), true, "the background task is still running after the compaction");
+    assert.deepEqual(backgroundReports, [["fixture background task"]], "its status was never cleared");
+    let entries = await readFixtureLog(log);
+    assert.equal(entries.some((entry) => entry.background === "finished"), false, "compacted while the work ran, without waiting for it");
+
+    await finishBackground();
+    await waitForCondition(() => Boolean(selfResumed));
+    const finished = await selfResumed!;
+    assert.equal(finished.content, "Background done.", "the work finished in the same process and its answer still arrives");
+    assert.deepEqual(backgroundReports, [["fixture background task"], []]);
+    entries = await readFixtureLog(log);
+    assert.ok(entries.findIndex((entry) => entry.message === "/compact") < entries.findIndex((entry) => entry.background === "finished"));
+    assert.equal(new Set(entries.map((entry) => entry.pid)).size, 1, "in the same process, which was not ended");
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude /compact: background work that finishes during the compaction is answered after it, as a reply of its own", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-meanwhile-"));
+  const { claudePath, log, finishBackground } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact-meanwhile", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  const backgroundReports: string[][] = [];
+  let selfResumed: Promise<any> | undefined;
+  const warm = { conversationId: "conversation-compact-meanwhile", participantId: participant.id, contextKey: "context-meanwhile", idleTimeoutMs: 60_000,
+    onSelfResumedTurn: (turn: any) => { selfResumed = turn.attach({}); },
+    onBackgroundTasksChanged: (tasks: any[]) => { backgroundReports.push(tasks.map((task) => task.label)); } };
+  try {
+    await runner.run(participant, "Start background.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    const compacting = runner.compactSession(participant, fixtureDir, undefined, "chat", undefined,
+      { agentMode: "default", warm, sessionId: "fixture-session", compactInstructions: "meanwhile" });
+    await waitForCondition(async () => (await readFixtureLog(log)).some((entry) => entry.compacting));
+    await finishBackground();
+    const compact = await compacting;
+    assert.equal(compact.ok, true, JSON.stringify(compact));
+    assert.equal(compact.content, "", "the compaction's reply is not the task's answer");
+    assert.equal(compact.contextUsage?.usedTokens, 29000, "the compaction's own figure, not the task answer's 100k");
+    await waitForCondition(() => Boolean(selfResumed));
+    assert.equal((await selfResumed!).content, "Background done.", "the task's answer is a reply of its own");
+    assert.deepEqual(backgroundReports, [["fixture background task"], []]);
+    const entries = await readFixtureLog(log);
+    const finishedAt = entries.findIndex((entry) => entry.background === "finished");
+    assert.ok(finishedAt > entries.findIndex((entry) => entry.message === "/compact meanwhile")
+      && finishedAt < entries.findIndex((entry) => entry.compacted), "the task ended while the compaction ran");
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude /compact: the answer to background work that ends during it gets the task's row and the thread that started the task", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-meanwhile-step-"));
+  const { claudePath, log, finishBackground } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact-meanwhile-step", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  let resumed: { origin: unknown; outputs: string[]; done: Promise<any> } | undefined;
+  const warm = { conversationId: "conversation-compact-meanwhile-step", participantId: participant.id, contextKey: "context-meanwhile-step", idleTimeoutMs: 60_000,
+    onSelfResumedTurn: (turn: any) => {
+      const outputs: string[] = [];
+      resumed = { origin: turn.origin, outputs, done: turn.attach({ onOutput: (event: { text: string }) => outputs.push(event.text) }) };
+    } };
+  try {
+    await runner.run(participant, "Start background.", fixtureDir, undefined, "chat", undefined,
+      { agentMode: "default", sessionId: "fixture-session", warm: { ...warm, origin: { runId: "run-started-task", messageId: "reply-started-task" } } });
+    await runner.run(participant, "Write a lot.", fixtureDir, undefined, "chat", undefined,
+      { agentMode: "default", sessionId: "fixture-session", warm: { ...warm, origin: { runId: "run-later", messageId: "reply-later" } } });
+    const compacting = runner.compactSession(participant, fixtureDir, undefined, "chat", undefined,
+      { agentMode: "default", warm, sessionId: "fixture-session", compactInstructions: "meanwhile-step" });
+    await waitForCondition(async () => (await readFixtureLog(log)).some((entry) => entry.compacting));
+    await finishBackground();
+    assert.equal((await compacting).ok, true);
+    await waitForCondition(() => Boolean(resumed));
+    assert.equal((await resumed!.done).content, "Background done.");
+    assert.deepEqual(resumed!.origin, { runId: "run-started-task", messageId: "reply-started-task" }, "in the thread of the turn that started the task");
+    assert.ok(resumed!.outputs.some((text) => /Background task finished: fixture background task/.test(text)), "with the task's row");
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude /compact runs in a process started with other settings while it carries background work, instead of waiting for that work", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-other-settings-"));
+  const { claudePath, log, finishBackground } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact-other-settings", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  const warm = { conversationId: "conversation-compact-other-settings", participantId: participant.id, contextKey: "context-once", idleTimeoutMs: 60_000,
+    onSelfResumedTurn: (turn: any) => { void turn.attach({}); } };
+  try {
+    // A turn with a one-time approval: its process has other settings.
+    await runner.run(participant, "Start background.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    const compact = await runner.compactSession(participant, fixtureDir, undefined, "chat", undefined,
+      { agentMode: "default", warm: { ...warm, contextKey: "context-usual" }, sessionId: "fixture-session" });
+    assert.equal(compact.ok, true, JSON.stringify(compact));
+    const entries = await readFixtureLog(log);
+    assert.equal(entries.filter((entry) => entry.started).length, 1, "no process was started or replaced");
+    assert.equal(entries.some((entry) => entry.background === "finished"), false, "compacted without waiting for the background work");
+    assert.equal((Array.from(runner.warmAgents.values())[0] as any).hasLiveBackgroundWork(), true, "which keeps running");
+    await finishBackground();
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude /compact waits for a reply in progress before it is sent", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-reply-"));
+  const { claudePath, log } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact-reply", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  const warm = { conversationId: "conversation-compact-reply", participantId: participant.id, contextKey: "context-reply", idleTimeoutMs: 60_000 };
+  try {
+    const replying = runner.run(participant, "Reply slowly.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    await waitForCondition(async () => (await readFixtureLog(log).catch(() => [])).some((entry) => entry.message === "Reply slowly."));
+    const compact = await runner.compactSession(participant, fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    assert.equal((await replying).content, "Slow reply.");
+    assert.equal(compact.ok, true, JSON.stringify(compact));
+    assert.equal(compact.contextUsage?.usedTokens, 29000);
+    const entries = await readFixtureLog(log);
+    const repliedAt = entries.findIndex((entry) => entry.replied === "Reply slowly.");
+    const compactAt = entries.findIndex((entry) => entry.message === "/compact");
+    assert.ok(repliedAt >= 0 && compactAt > repliedAt, "the compaction was sent only once the reply had ended");
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude /compact queued behind a reply is sent when that reply ends, while background work keeps running", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-queued-"));
+  const { claudePath, log, finishBackground } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact-queued", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  const warm = { conversationId: "conversation-compact-queued", participantId: participant.id, contextKey: "context-queued", idleTimeoutMs: 60_000,
+    onSelfResumedTurn: (turn: any) => { void turn.attach({}); } };
+  try {
+    await runner.run(participant, "Start background.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    const live = Array.from(runner.warmAgents.values())[0] as any;
+    const replying = runner.run(participant, "Reply slowly.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    await waitForCondition(async () => (await readFixtureLog(log)).some((entry) => entry.message === "Reply slowly."));
+    const compact = await runner.compactSession(participant, fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    assert.equal((await replying).content, "Slow reply.");
+    assert.equal(compact.ok, true, JSON.stringify(compact));
+    const entries = await readFixtureLog(log);
+    assert.ok(entries.findIndex((entry) => entry.message === "/compact") > entries.findIndex((entry) => entry.replied === "Reply slowly."),
+      "sent once the reply ended");
+    assert.equal(entries.some((entry) => entry.background === "finished"), false, "without waiting for the background work");
+    assert.equal(live.hasLiveBackgroundWork(), true);
+    await finishBackground();
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude /compact: Stop while it waits for a reply in progress cancels it before it is sent, and the process keeps serving", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-stop-waiting-"));
+  const { claudePath, log } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact-stop-waiting", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  const warm = { conversationId: "conversation-compact-stop-waiting", participantId: participant.id, contextKey: "context-stop-waiting", idleTimeoutMs: 60_000 };
+  try {
+    const replying = runner.run(participant, "Reply slowly.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    await waitForCondition(async () => (await readFixtureLog(log).catch(() => [])).some((entry) => entry.message === "Reply slowly."));
+    const stop = new AbortController();
+    const compacting = runner.compactSession(participant, fixtureDir, undefined, "chat", stop.signal, { agentMode: "default", warm, sessionId: "fixture-session" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    stop.abort(new Error("Stopped by user."));
+    const stopped = await compacting;
+    assert.equal(stopped.ok, false);
+    assert.equal(stopped.error, "Compaction was cancelled.");
+    assert.equal((await replying).content, "Slow reply.", "the reply in progress is not touched");
+    const live = Array.from(runner.warmAgents.values())[0] as any;
+    assert.ok(live.idleTimer, "the member's idle timer is re-armed");
+    const next = await runner.run(participant, "Still there?", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    assert.equal(next.ok, true);
+    const entries = await readFixtureLog(log);
+    assert.equal(entries.some((entry) => entry.message?.startsWith("/compact")), false, "never sent");
+    assert.equal(new Set(entries.map((entry) => entry.pid)).size, 1);
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude /compact: Stop interrupts it in the live process, which keeps serving the member", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-stop-"));
+  const { claudePath, log } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact-stop", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  const warm = { conversationId: "conversation-compact-stop", participantId: participant.id, contextKey: "context-stop", idleTimeoutMs: 60_000 };
+  try {
+    await runner.run(participant, "Hello.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm });
+    const fresh = await runner.run(participant, "Hello again.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm });
+    assert.equal(fresh.ok, true);
+    const stop = new AbortController();
+    const stopping = runner.compactSession(participant, fixtureDir, undefined, "chat", stop.signal,
+      { agentMode: "default", warm, sessionId: "fixture-session", compactInstructions: "slowly" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    stop.abort(new Error("Stopped by user."));
+    const stopped = await stopping;
+    assert.equal(stopped.ok, false);
+    assert.equal(stopped.error, "Compaction was cancelled.");
+    const after = await runner.run(participant, "Still there?", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    assert.equal(after.ok, true, "the member's process survived the Stop and serves the next reply");
+    const entries = await readFixtureLog(log);
+    assert.equal(new Set(entries.map((entry) => entry.pid)).size, 1);
+    assert.ok(entries.some((entry) => entry.control === "interrupt"), "Stop interrupted the step instead of ending the process");
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude /compact the CLI declines is reported with the CLI's own words, not as compacted", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-refused-"));
+  const { claudePath } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact-refused", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  const warm = { conversationId: "conversation-compact-refused", participantId: participant.id, contextKey: "context-refused", idleTimeoutMs: 60_000 };
+  try {
+    // A live process of a brand-new session (nothing said yet in it).
+    runner.warmAgents.clear();
+    const entry = await runner.createClaudeWarmAgent(runner.warmAgentKey(participant, fixtureDir, "chat", { agentMode: "default", warm }),
+      `${warm.conversationId}:${warm.participantId}`, participant, fixtureDir, "chat", { agentMode: "default", warm, persistSession: true }, claudePath);
+    runner.warmAgents.set(entry.key, entry);
+    const refused = await runner.compactSession(participant, fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, sessionId: "fixture-session" });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.error, "No messages to compact");
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude /compact with no live process starts the member's live process as its turn would, and the next turn continues in it", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") return;
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-compact-own-"));
+  const { claudePath, log } = await writeClaudeCompactionFixture(fixtureDir);
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-compact-own", kind: "claude-code", label: "Claude", model: "claude-opus-5-5[1m]" };
+  const warm = { conversationId: "conversation-compact-own", participantId: participant.id, contextKey: "context-a", idleTimeoutMs: 60_000 };
+  const appMcp = { url: "http://127.0.0.1:9/mcp", token: "member-token", toolNames: ["app_chat_send_message"] };
+  try {
+    // A live process started with other settings: its next turn replaces it.
+    await runner.run(participant, "Write a lot.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm, appMcp, sessionId: "fixture-session" });
+    const member = { agentMode: "default", warm: { ...warm, contextKey: "context-b" }, appMcp, sessionId: "fixture-session", persistSession: true };
+    const compact = await runner.compactSession(participant, fixtureDir, undefined, "chat", undefined, member);
+    assert.equal(compact.ok, true, JSON.stringify(compact));
+    assert.equal(compact.contextUsage?.usedTokens, 29000, "the figure of the process that holds the compacted session");
+
+    let entries = await readFixtureLog(log);
+    const starts = entries.filter((entry) => entry.started);
+    assert.equal(starts.length, 2, "the stale process was replaced by the member's process");
+    const started = starts[1].started!;
+    assert.ok(started.includes("--resume") && started.includes("fixture-session"), "resumed on the member's session");
+    assert.ok(started.includes("--mcp-config"), "with the member's app tools, as its turns start it");
+    assert.equal(entries.find((entry) => entry.message?.startsWith("/compact"))?.pid, starts[1].pid);
+    assert.equal(runner.warmAgents.size, 1, "kept as the member's live process");
+    await assertFixtureProcessStops(starts[0].pid);
+
+    const next = await runner.run(participant, "Continue.", fixtureDir, undefined, "chat", undefined, member);
+    assert.equal(next.ok, true);
+    assert.equal(next.contextUsage?.usedTokens, 69000, "the next turn continues from the 29k shown after compacting");
+    entries = await readFixtureLog(log);
+    assert.equal(entries.filter((entry) => entry.started).length, 2, "no further process was started");
+    assert.equal(entries.find((entry) => entry.message === "Continue.")?.pid, starts[1].pid, "the next turn ran in the process the compaction started");
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude public warm-run path: the idle timer never closes a process with live background work, and closes it once that work and its reply are done", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-idle-"));
+  const claudePath = path.join(fixtureDir, "claude-fixture");
+  const providerPidFile = path.join(fixtureDir, "provider.pid");
+  const helperPidFile = path.join(fixtureDir, "helper.pid");
+  await writeFile(claudePath, `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+const { spawn } = require("node:child_process");
+const readline = require("node:readline");
+writeFileSync(${JSON.stringify(providerPidFile)}, String(process.pid));
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+let helper;
+const input = readline.createInterface({ input: process.stdin });
+input.on("close", () => { if (helper) helper.kill("SIGTERM"); process.exit(0); });
+input.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.type !== "user") return;
+  send({ type: "command_lifecycle", command_uuid: message.uuid, state: "started" });
+  send({ type: "system", subtype: "init", session_id: "idle-session" });
+  helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  writeFileSync(${JSON.stringify(helperPidFile)}, String(helper.pid));
+  send({ type: "system", subtype: "task_started", task_id: "task-1", description: "long task", is_backgrounded: true });
+  send({ type: "result", subtype: "success", result: "Started." });
+  setTimeout(() => {
+    helper.kill("SIGTERM");
+    helper = undefined;
+    send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    send({ type: "system", subtype: "task_notification", task_id: "task-1", status: "completed" });
+    send({ type: "system", subtype: "init", session_id: "idle-session" });
+    send({ type: "result", subtype: "success", result: "Done." });
+  }, 900);
+});
+`, "utf8");
+  await chmod(claudePath, 0o755);
+  const runner = makeRunner() as any;
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-idle", kind: "claude-code", label: "Claude" };
+  let attachResult: Promise<any> | undefined;
+  const warm = {
+    conversationId: "conversation-idle",
+    participantId: participant.id,
+    contextKey: "context-idle",
+    idleTimeoutMs: 150,
+    onSelfResumedTurn: (turn: any) => { attachResult = turn.attach({}); }
+  };
+  let providerPid: number | undefined;
+  try {
+    const first = await runner.run(participant, "Start.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm });
+    assert.equal(first.content, "Started.");
+    providerPid = Number.parseInt((await readFile(providerPidFile, "utf8")).trim(), 10);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(testProcessExists(providerPid), true, "the idle timer fired while background work was live and left the process alone");
+    assert.equal(runner.warmAgents.size, 1);
+    for (let attempt = 0; attempt < 100 && !attachResult; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(attachResult, "the CLI's own reply was offered");
+    assert.equal((await attachResult).content, "Done.");
+    await assertFixtureProcessStops(providerPid);
+    assert.equal(runner.warmAgents.size, 0, "once idle, the process is retired by the re-armed timer");
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude public warm-run path: without the CLI's command lifecycle, a second message waits for the first reply, and Stop drops it before it is sent", { timeout: 15_000 }, async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-nolifecycle-"));
+  const claudePath = path.join(fixtureDir, "claude-fixture");
+  const stdinLog = path.join(fixtureDir, "stdin.jsonl");
+  await writeFile(claudePath, `#!/usr/bin/env node
+const { appendFileSync } = require("node:fs");
+const readline = require("node:readline");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+let results = 0;
+let messages = 0;
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  appendFileSync(${JSON.stringify(stdinLog)}, JSON.stringify({ type: message.type, results }) + "\\n");
+  if (message.type !== "user") return;
+  messages += 1;
+  const reply = "Reply " + messages + ".";
+  setTimeout(() => {
+    send({ type: "system", subtype: "init", session_id: "old-cli" });
+    send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: reply }] } });
+    send({ type: "result", subtype: "success", result: reply });
+    results += 1;
+  }, messages === 1 ? 300 : 10);
+});
+`, "utf8");
+  await chmod(claudePath, 0o755);
+  const runner = makeRunner() as any;
+  runner.providerExecutableForRun = async () => claudePath;
+  const participant = { id: "claude-old", kind: "claude-code", label: "Claude" };
+  const warm = { conversationId: "conversation-old", participantId: participant.id, contextKey: "context-old", idleTimeoutMs: 60_000 };
+  try {
+    const firstRun = runner.run(participant, "One.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const secondRun = runner.run(participant, "Two.", fixtureDir, undefined, "chat", undefined, { agentMode: "default", warm });
+    const controller = new AbortController();
+    const thirdRun = runner.run(participant, "Three.", fixtureDir, undefined, "chat", controller.signal, { agentMode: "default", warm });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    controller.abort(new Error("Stopped by user."));
+    const third = await thirdRun;
+    assert.equal(third.ok, false, "a message never sent is dropped at once");
+    const [first, second] = await Promise.all([firstRun, secondRun]);
+    assert.equal(first.content, "Reply 1.");
+    assert.equal(second.content, "Reply 2.");
+    const log = (await readFile(stdinLog, "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    assert.deepEqual(log.map((entry) => entry.type), ["user", "user"], "the stopped message was never written and no control request was needed");
+    assert.equal(log[1].results, 1, "the second message was written only after the first reply ended");
+  } finally {
+    await runner.shutdownWarmAgents();
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude public warm-run path: a provider that dies with background work kills that work and the next message starts fresh without replaying", { timeout: 10_000 }, async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-background-failure-"));
+  const claudePath = path.join(fixtureDir, "claude-fixture");
+  const countFile = path.join(fixtureDir, "count.txt");
+  const pidsFile = path.join(fixtureDir, "pids.txt");
+  const taskPidFile = path.join(fixtureDir, "task.pid");
+  const helperPidFile = path.join(fixtureDir, "helper.pid");
+  const backgroundTaskScript = `
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+process.on("SIGTERM", () => {});
+setTimeout(() => {
+  const helper = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
+  writeFileSync(${JSON.stringify(helperPidFile)}, String(helper.pid));
+}, 150);
+setInterval(() => {}, 1000);
+`;
+  await writeFile(claudePath, `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
+const readline = require("node:readline");
+const countFile = ${JSON.stringify(countFile)};
+const count = existsSync(countFile) ? Number(readFileSync(countFile, "utf8")) + 1 : 1;
+writeFileSync(countFile, String(count));
+appendFileSync(${JSON.stringify(pidsFile)}, String(process.pid) + "\\n");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", () => {
+  send({ type: "system", subtype: "init", session_id: "failure-session-" + count });
+  if (count === 1) {
+    const task = spawn(process.execPath, ["-e", ${JSON.stringify(backgroundTaskScript)}], { stdio: "ignore", detached: true });
+    writeFileSync(${JSON.stringify(taskPidFile)}, String(task.pid));
+    send({ type: "system", subtype: "task_started", task_id: "task-1", description: "failing background task", is_backgrounded: true });
+    send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Work started." }] } });
+    send({ type: "result", subtype: "success", result: "Work started." });
+    const failWhenHelperStarts = () => {
+      if (!existsSync(${JSON.stringify(helperPidFile)})) {
+        setTimeout(failWhenHelperStarts, 5);
+        return;
+      }
+      process.stdout.write(JSON.stringify({ type: "error", error: "fixture provider failed" }) + "\\n", () => process.exit(1));
+    };
+    failWhenHelperStarts();
+    return;
+  }
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Fresh after failure." }] } });
+  send({ type: "result", subtype: "success", result: "Fresh after failure." });
+});
+`, "utf8");
+  await chmod(claudePath, 0o755);
+
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  let oneShotFallbacks = 0;
+  runner.runClaudeOneShot = async (): Promise<never> => {
+    oneShotFallbacks += 1;
+    throw new Error("prompt replayed through one-shot fallback");
+  };
+  const participant = { id: "claude-failure", kind: "claude-code", label: "Claude" };
+  const warm = {
+    conversationId: "conversation-failure",
+    participantId: participant.id,
+    contextKey: "context-failure",
+    idleTimeoutMs: 60_000
+  };
+  let taskPid: number | undefined;
+  let helperPid: number | undefined;
+  try {
+    const first = await runner.run(participant, "Start work.", fixtureDir, undefined, "chat", undefined, {
+      agentMode: "default",
+      warm
+    });
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.content, "Work started.");
+    assert.equal(first.warnings, undefined, "the reply itself finished cleanly");
+    assert.equal(oneShotFallbacks, 0);
+    taskPid = Number.parseInt((await readFile(taskPidFile, "utf8")).trim(), 10);
+    // The provider dies only after its background task has started a helper.
+    for (let attempt = 0; attempt < 200 && helperPid === undefined; attempt += 1) {
+      const text = await readFile(helperPidFile, "utf8").catch(() => "");
+      helperPid = text.trim() ? Number.parseInt(text.trim(), 10) : undefined;
+      if (helperPid === undefined) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    assert.ok(helperPid, "the background task started its helper");
+    await assertFixtureProcessStops(taskPid);
+    await assertFixtureProcessStops(helperPid);
+
+    const second = await runner.run(participant, "Continue safely.", fixtureDir, undefined, "chat", undefined, {
+      agentMode: "default",
+      warm
+    });
+    assert.equal(second.ok, true, JSON.stringify(second));
+    assert.equal(second.content, "Fresh after failure.");
+    const pids = (await readFile(pidsFile, "utf8")).trim().split(/\r?\n/).map(Number);
+    assert.equal(pids.length, 2);
+    assert.notEqual(pids[0], pids[1]);
+    assert.equal(oneShotFallbacks, 0);
+  } finally {
+    await runner.shutdownWarmAgents();
+    for (const pid of [taskPid, helperPid]) {
+      if (pid && testProcessExists(pid)) {
+        process.kill(pid, "SIGKILL");
+      }
+    }
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude live background shutdown escalates when the provider ignores stdin EOF", { timeout: 10_000 }, async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-background-escalation-"));
+  const claudePath = path.join(fixtureDir, "claude-fixture");
+  const providerPidFile = path.join(fixtureDir, "provider.pid");
+  const helperPidFile = path.join(fixtureDir, "helper.pid");
+  const stdinClosedMarker = path.join(fixtureDir, "stdin-closed.marker");
+  await writeFile(claudePath, `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const readline = require("node:readline");
+writeFileSync(${JSON.stringify(providerPidFile)}, String(process.pid));
+// It ignores SIGTERM as well, so only the final SIGKILL ends it, and a slow
+// machine still gets to record the EOF before then.
+process.on("SIGTERM", () => {});
+const helper = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
+writeFileSync(${JSON.stringify(helperPidFile)}, String(helper.pid));
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const input = readline.createInterface({ input: process.stdin });
+input.on("close", () => {
+  writeFileSync(${JSON.stringify(stdinClosedMarker)}, "closed");
+  setInterval(() => {}, 1000);
+});
+input.on("line", () => {
+  send({ type: "system", subtype: "init", session_id: "escalation-session" });
+  send({ type: "system", subtype: "task_started", task_id: "task-1", description: "stuck background task", is_backgrounded: true });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Still running." }] } });
+  send({ type: "result", subtype: "success", result: "Still running." });
+});
+`, "utf8");
+  await chmod(claudePath, 0o755);
+
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  runner.claudeBackgroundCloseGraceMs = 20;
+  const participant = { id: "claude-escalation", kind: "claude-code", label: "Claude" };
+  const controller = new AbortController();
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => { markHeld = resolve; });
+  let providerPid: number | undefined;
+  let helperPid: number | undefined;
+  try {
+    const run = runner.run(participant, "Start work.", fixtureDir, undefined, "chat", controller.signal, {
+      agentMode: "default",
+      warm: {
+        conversationId: "conversation-escalation",
+        participantId: participant.id,
+        contextKey: "context-escalation",
+        idleTimeoutMs: 60_000
+      },
+      onOutput: (event: { activityStatus?: string; text: string }) => {
+        if (/Running in the background/.test(event.text)) {
+          markHeld();
+        }
+      }
+    });
+    await held;
+    providerPid = Number.parseInt((await readFile(providerPidFile, "utf8")).trim(), 10);
+    helperPid = Number.parseInt((await readFile(helperPidFile, "utf8")).trim(), 10);
+    const result = await run;
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.content, "Still running.");
+    assert.equal(controller.signal.aborted, false);
+    // Removing the member (or closing the chat) retires its process with the
+    // background work it still carries.
+    await runner.closeWarmAgents("conversation-escalation", participant.id, "member-removed");
+    assert.equal(await readFile(stdinClosedMarker, "utf8"), "closed");
+    await assertFixtureProcessStops(providerPid);
+    await assertFixtureProcessStops(helperPid);
+  } finally {
+    await runner.shutdownWarmAgents();
+    for (const pid of [providerPid, helperPid]) {
+      if (pid && testProcessExists(pid)) {
+        process.kill(pid, "SIGKILL");
+      }
+    }
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude live background shutdown kills descendants after the provider exits on stdin EOF", { timeout: 10_000 }, async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-background-eof-exit-"));
+  const claudePath = path.join(fixtureDir, "claude-fixture");
+  const helperPidFile = path.join(fixtureDir, "helper.pid");
+  const stdinClosedMarker = path.join(fixtureDir, "stdin-closed.marker");
+  await writeFile(claudePath, `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const readline = require("node:readline");
+// SIGTERM (sent 300 ms after EOF) must not end it before it handles the
+// EOF itself on a slow machine; it exits on EOF as the scenario says.
+process.on("SIGTERM", () => {});
+const helper = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
+writeFileSync(${JSON.stringify(helperPidFile)}, String(helper.pid));
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const input = readline.createInterface({ input: process.stdin });
+input.on("close", () => {
+  writeFileSync(${JSON.stringify(stdinClosedMarker)}, "closed");
+  process.exit(0);
+});
+input.on("line", () => {
+  send({ type: "system", subtype: "init", session_id: "eof-exit-session" });
+  send({ type: "system", subtype: "task_started", task_id: "task-1", description: "orphan-prone background task", is_backgrounded: true });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Still running." }] } });
+  send({ type: "result", subtype: "success", result: "Still running." });
+});
+`, "utf8");
+  await chmod(claudePath, 0o755);
+
+  const runner = makeRunner() as any;
+  runner.nativeProcessDbPath = path.join(fixtureDir, "native-processes.sqlite3");
+  runner.providerExecutableForRun = async () => claudePath;
+  runner.claudeBackgroundCloseGraceMs = 200;
+  const participant = { id: "claude-eof-exit", kind: "claude-code", label: "Claude" };
+  const controller = new AbortController();
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => { markHeld = resolve; });
+  let helperPid: number | undefined;
+  try {
+    const run = runner.run(participant, "Start work.", fixtureDir, undefined, "chat", controller.signal, {
+      agentMode: "default",
+      warm: {
+        conversationId: "conversation-eof-exit",
+        participantId: participant.id,
+        contextKey: "context-eof-exit",
+        idleTimeoutMs: 60_000
+      },
+      onOutput: (event: { activityStatus?: string; text: string }) => {
+        if (/Running in the background/.test(event.text)) {
+          markHeld();
+        }
+      }
+    });
+    await held;
+    helperPid = Number.parseInt((await readFile(helperPidFile, "utf8")).trim(), 10);
+    const result = await run;
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.content, "Still running.");
+    assert.equal(controller.signal.aborted, false);
+    await runner.closeWarmAgents("conversation-eof-exit", participant.id, "member-removed");
+    assert.equal(await readFile(stdinClosedMarker, "utf8"), "closed");
+    await assertFixtureProcessStops(helperPid);
+  } finally {
+    await runner.shutdownWarmAgents();
+    if (helperPid && testProcessExists(helperPid)) {
+      process.kill(helperPid, "SIGKILL");
+    }
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("update quit immediately terminates a warm Claude provider and its detached background task", { timeout: 10_000 }, async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-update-quit-"));
+  const claudePath = path.join(fixtureDir, "claude-fixture");
+  const providerPidFile = path.join(fixtureDir, "provider.pid");
+  const helperPidFile = path.join(fixtureDir, "helper.pid");
+  await writeFile(claudePath, `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const readline = require("node:readline");
+writeFileSync(${JSON.stringify(providerPidFile)}, String(process.pid));
+const helper = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
+writeFileSync(${JSON.stringify(helperPidFile)}, String(helper.pid));
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", () => {
+  send({ type: "system", subtype: "init", session_id: "update-quit-session" });
+  send({ type: "system", subtype: "task_started", task_id: "task-1", description: "update-sensitive task", is_backgrounded: true });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Still running." }] } });
+  send({ type: "result", subtype: "success", result: "Still running." });
+});
+`, "utf8");
+  await chmod(claudePath, 0o755);
+
+  const runner = makeRunner() as any;
+  runner.providerExecutableForRun = async () => claudePath;
+  let captureCount = 0;
+  runner.readClaudeBackgroundProcessTable = async () => {
+    captureCount += 1;
+    const { readPosixProcessTableAsync } = await import("./processTermination");
+    return readPosixProcessTableAsync();
+  };
+  const participant = { id: "claude-update-quit", kind: "claude-code", label: "Claude" };
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => { markHeld = resolve; });
+  let providerPid: number | undefined;
+  let helperPid: number | undefined;
+  try {
+    const run = runner.run(participant, "Start work.", fixtureDir, undefined, "chat", undefined, {
+      agentMode: "default",
+      warm: {
+        conversationId: "conversation-update-quit",
+        participantId: participant.id,
+        contextKey: "context-update-quit",
+        idleTimeoutMs: 60_000
+      },
+      onOutput: (event: { activityStatus?: string; text: string }) => {
+        if (/Running in the background/.test(event.text)) {
+          markHeld();
+        }
+      }
+    });
+    await held;
+    providerPid = Number.parseInt((await readFile(providerPidFile, "utf8")).trim(), 10);
+    helperPid = Number.parseInt((await readFile(helperPidFile, "utf8")).trim(), 10);
+    await run;
+    assert.ok(captureCount > 0, "the shared descendant sampler ran while background work was live");
+    runner.terminateWarmAgentsImmediately("update installation");
+    await assertFixtureProcessStops(providerPid);
+    await assertFixtureProcessStops(helperPid);
+    const capturesAfterShutdown = captureCount;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(captureCount, capturesAfterShutdown, "update shutdown stopped the shared descendant sampler");
+  } finally {
+    runner.terminateWarmAgentsImmediately("test cleanup");
+    for (const pid of [providerPid, helperPid]) {
+      if (pid && testProcessExists(pid)) {
+        process.kill(pid, "SIGKILL");
+      }
+    }
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("update quit also terminates a Claude provider already in graceful close", { timeout: 10_000 }, async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-claude-update-during-close-"));
+  const claudePath = path.join(fixtureDir, "claude-fixture");
+  const providerPidFile = path.join(fixtureDir, "provider.pid");
+  const helperPidFile = path.join(fixtureDir, "helper.pid");
+  const stdinClosedMarker = path.join(fixtureDir, "stdin-closed.marker");
+  await writeFile(claudePath, `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const readline = require("node:readline");
+writeFileSync(${JSON.stringify(providerPidFile)}, String(process.pid));
+const helper = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });
+writeFileSync(${JSON.stringify(helperPidFile)}, String(helper.pid));
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const input = readline.createInterface({ input: process.stdin });
+input.on("close", () => {
+  writeFileSync(${JSON.stringify(stdinClosedMarker)}, "closed");
+  setInterval(() => {}, 1000);
+});
+input.on("line", () => {
+  send({ type: "system", subtype: "init", session_id: "update-during-close-session" });
+  send({ type: "system", subtype: "task_started", task_id: "task-1", description: "update-sensitive task", is_backgrounded: true });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Still running." }] } });
+  send({ type: "result", subtype: "success", result: "Still running." });
+});
+`, "utf8");
+  await chmod(claudePath, 0o755);
+
+  const runner = makeRunner() as any;
+  runner.providerExecutableForRun = async () => claudePath;
+  runner.claudeBackgroundCloseGraceMs = 5_000;
+  const participant = { id: "claude-update-during-close", kind: "claude-code", label: "Claude" };
+  const controller = new AbortController();
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => { markHeld = resolve; });
+  let providerPid: number | undefined;
+  let helperPid: number | undefined;
+  try {
+    const run = runner.run(participant, "Start work.", fixtureDir, undefined, "chat", controller.signal, {
+      agentMode: "default",
+      warm: {
+        conversationId: "conversation-update-during-close",
+        participantId: participant.id,
+        contextKey: "context-update-during-close",
+        idleTimeoutMs: 60_000
+      },
+      onOutput: (event: { activityStatus?: string; text: string }) => {
+        if (/Running in the background/.test(event.text)) {
+          markHeld();
+        }
+      }
+    });
+    await held;
+    providerPid = Number.parseInt((await readFile(providerPidFile, "utf8")).trim(), 10);
+    helperPid = Number.parseInt((await readFile(helperPidFile, "utf8")).trim(), 10);
+    const result = await run;
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(controller.signal.aborted, false);
+    const closing = runner.closeWarmAgents("conversation-update-during-close", participant.id, "member-removed");
+    let stdinClosed = false;
+    for (let attempt = 0; attempt < 100 && !stdinClosed; attempt += 1) {
+      stdinClosed = await readFile(stdinClosedMarker, "utf8")
+        .then((value) => value === "closed")
+        .catch(() => false);
+      if (!stdinClosed) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    assert.equal(stdinClosed, true, "ordinary close entered its graceful stdin-EOF wait");
+    assert.equal(runner.warmAgents.size, 0, "the closing provider already left the active map");
+    assert.equal(runner.closingWarmAgents.size, 1, "the closing provider remains visible to update shutdown");
+
+    runner.terminateWarmAgentsImmediately("update installation");
+    await closing;
+    await assertFixtureProcessStops(providerPid);
+    await assertFixtureProcessStops(helperPid);
+  } finally {
+    runner.terminateWarmAgentsImmediately("test cleanup");
+    for (const pid of [providerPid, helperPid]) {
+      if (pid && testProcessExists(pid)) {
+        process.kill(pid, "SIGKILL");
+      }
+    }
+    await rm(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("Claude background-process sampling is shared, non-overlapping, and lives until the last agent stops", async () => {
+  const runner = makeRunner() as any;
+  const rows = new Map<number, never>();
+  let reads = 0;
+  let resolveFirstRead!: (value: Map<number, never>) => void;
+  const firstRead = new Promise<Map<number, never>>((resolve) => { resolveFirstRead = resolve; });
+  runner.readClaudeBackgroundProcessTable = () => {
+    reads += 1;
+    return reads === 1 ? firstRead : Promise.resolve(new Map<number, never>());
+  };
+  let firstLive = true;
+  let secondLive = true;
+  const firstTables: unknown[] = [];
+  const secondTables: unknown[] = [];
+  let markSharedDelivery!: () => void;
+  const sharedDelivery = new Promise<void>((resolve) => { markSharedDelivery = resolve; });
+  let markSoloDelivery!: () => void;
+  const soloDelivery = new Promise<void>((resolve) => { markSoloDelivery = resolve; });
+  const noteDelivery = (): void => {
+    if (firstTables.length === 1 && secondTables.length === 1) {
+      markSharedDelivery();
+    }
+    if (secondTables.length === 2) {
+      markSoloDelivery();
+    }
+  };
+  runner.warmAgents.set("first", {
+    closed: false,
+    hasLiveBackgroundWork: () => firstLive,
+    refreshCapturedBackgroundProcesses: (table: unknown) => {
+      firstTables.push(table);
+      noteDelivery();
+    }
+  });
+  runner.warmAgents.set("second", {
+    closed: false,
+    hasLiveBackgroundWork: () => secondLive,
+    refreshCapturedBackgroundProcesses: (table: unknown) => {
+      secondTables.push(table);
+      noteDelivery();
+    }
+  });
+
+  try {
+    runner.ensureClaudeBackgroundProcessCapture();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(reads, 1, "timer ticks do not overlap an in-flight process-table read");
+
+    resolveFirstRead(rows);
+    await sharedDelivery;
+    assert.equal(reads, 1, "one completed sample used one process-table read");
+    assert.deepEqual(firstTables, [rows]);
+    assert.deepEqual(secondTables, [rows]);
+
+    firstLive = false;
+    await soloDelivery;
+    assert.equal(reads, 2, "the remaining agent kept the sampler alive for one shared tick");
+    assert.deepEqual(firstTables, [rows]);
+    assert.equal(secondTables.length, 2);
+    assert.notEqual(secondTables[1], rows, "the second tick used its own table snapshot");
+
+    secondLive = false;
+    runner.maybeStopClaudeBackgroundProcessCapture();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(reads, 2, "the shared sampler stopped after the last agent retired");
+  } finally {
+    firstLive = false;
+    secondLive = false;
+    runner.stopClaudeBackgroundProcessCapture();
+    runner.warmAgents.clear();
+  }
+});
+
+test("immediate shutdown ignores a recycled warm-agent root PID and its unrelated children", (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX process identity checks are unavailable on Windows");
+    return;
+  }
+  const runner = makeRunner() as any;
+  const oldIdentity = { pid: 42, startedAt: "Fri Sep  5 12:00:00 2026" };
+  runner.readPosixProcessTableForTermination = () => new Map([
+    [42, { pid: 42, ppid: 1, pgid: 42, startedAt: "Fri Sep  5 12:01:00 2026" }],
+    [43, { pid: 43, ppid: 42, pgid: 42, startedAt: "Fri Sep  5 12:01:01 2026" }]
+  ]);
+  const childSignals: NodeJS.Signals[] = [];
+  const processSignals: Array<{ pid: number; signal: NodeJS.Signals | number }> = [];
+  const originalKill = process.kill;
+  process.kill = ((pid: number, signal: NodeJS.Signals | number) => {
+    processSignals.push({ pid, signal });
+    return true;
+  }) as typeof process.kill;
+  runner.warmAgents.set("stale", {
+    closed: false,
+    providerKind: "claude-code",
+    process: {
+      pid: 42,
+      exitCode: 0,
+      signalCode: null,
+      killed: false,
+      kill: (signal: NodeJS.Signals) => {
+        childSignals.push(signal);
+        return true;
+      }
+    },
+    processIdentity: () => oldIdentity,
+    capturedBackgroundProcesses: () => []
+  });
+  try {
+    runner.terminateWarmAgentsImmediately("update installation");
+    assert.deepEqual(processSignals, []);
+    assert.deepEqual(childSignals, []);
+  } finally {
+    process.kill = originalKill;
+    runner.warmAgents.clear();
+  }
+});
 
 test("Codex ignores cross-thread resolution and retires approval when its item completes", async () => {
   const fixtureDir = await mkdtemp(path.join(tmpdir(), "accord-codex-retire-approval-"));
@@ -3386,7 +5352,77 @@ test("codex app-server never replays a prompt after the provider accepted the tu
   assert.equal(oneShotRuns, 0);
 });
 
-test("codex app-server retains one-shot fallback only before provider turn acceptance", async () => {
+test("shutdown waits for a session still being constructed and duplicate construction shares its owner", async () => {
+  const runner = makeRunner() as any;
+  let create!: (entry: any) => void;
+  const ready = new Promise<any>((resolve) => { create = resolve; });
+  let constructions = 0;
+  let started!: () => void;
+  const constructing = new Promise<void>(resolve => { started = resolve; });
+  const closed: string[] = [];
+  runner.closeWarmAgent = async (entry: any) => { closed.push(entry.key); entry.closed = true; };
+  const first = runner.createTrackedWarmAgent("starting", () => { constructions += 1; started(); return ready; });
+  const duplicate = runner.createTrackedWarmAgent("starting", () => { constructions += 1; return ready; });
+  assert.equal(first, duplicate);
+  await constructing;
+  const shuttingDown = runner.shutdownWarmAgents();
+  await assert.rejects(runner.createTrackedWarmAgent("new", async () => ({})), /shutting down/);
+  create({ key: "starting", closed: false });
+  await assert.rejects(first, /before this command started/);
+  await shuttingDown;
+  assert.deepEqual(closed, ["starting"]);
+  assert.equal(constructions, 1);
+  assert.equal(runner.warmAgents.size, 0);
+});
+
+test("conversation shutdown keeps other chats running and retries failed native closure", async () => {
+  const runner = makeRunner() as any;
+  const entry = (conversationId: string) => ({ key: JSON.stringify({ conversationId, participantId: "member" }), scopeKey: `${conversationId}:member`, closed: false });
+  const archived = entry("chat");
+  const other = entry("chat:other");
+  runner.warmAgents.set(archived.key, archived);
+  runner.warmAgents.set(other.key, other);
+  runner.clearWarmIdleTimer = () => {};
+  runner.maybeStopClaudeBackgroundProcessCapture = () => {};
+  let attempts = 0;
+  runner.closeWarmAgentProcess = async (value: unknown) => {
+    assert.equal(value, archived);
+    if (++attempts === 1) throw new Error("closure receipt could not be stored");
+  };
+  await assert.rejects(runner.closeConversationSessions("chat"), /receipt could not be stored/);
+  assert.equal(runner.hasActiveNativeWork(), true, "a closed flag is not a proof that descendants are gone");
+  await assert.rejects(runner.createTrackedWarmAgent(archived.key, async () => archived), /sessions are closing/);
+  assert.equal(runner.warmAgents.get(other.key), other);
+  assert.equal(other.closed, false);
+  await runner.closeConversationSessions("chat");
+  assert.equal(attempts, 2);
+  assert.equal(runner.hasActiveNativeWork(), false);
+  assert.equal(runner.warmAgents.get(other.key), other);
+});
+
+test("conversation shutdown fences concurrent construction and preserves another chat's startup", async () => {
+  const runner = makeRunner() as any;
+  const key = JSON.stringify({ conversationId: "closing", participantId: "member" });
+  let finish!: (entry: unknown) => void;
+  let started!: () => void;
+  const constructing = new Promise<void>(resolve => { started = resolve; });
+  const creating = runner.createTrackedWarmAgent(key, () => new Promise(resolve => { finish = resolve; started(); }));
+  await constructing;
+  const closed: string[] = [];
+  runner.closeWarmAgent = async (entry: { key: string }) => { closed.push(entry.key); };
+  const closing = runner.closeConversationSessions("closing");
+  assert.equal(runner.closeConversationSessions("closing"), closing);
+  await assert.rejects(runner.createTrackedWarmAgent(key, async () => ({})), /sessions are closing/);
+  const unrelated = JSON.stringify({ conversationId: "another", participantId: "member" });
+  await runner.createTrackedWarmAgent(unrelated, async () => ({ key: unrelated }));
+  finish({ key });
+  await assert.rejects(creating, /before this command started/);
+  await closing;
+  assert.deepEqual(closed, [key]);
+  assert.ok(runner.warmAgents.has(unrelated));
+});
+
+test("codex app-server initialization failure never replays a command through one-shot execution", async () => {
   const runner = makeRunner() as any;
   let oneShotRuns = 0;
   runner.createCodexAppServerWarmAgent = () => ({
@@ -3423,9 +5459,9 @@ test("codex app-server retains one-shot fallback only before provider turn accep
     }
   );
 
-  assert.equal(result.ok, true);
-  assert.equal(result.content, "FALLBACK");
-  assert.equal(oneShotRuns, 1);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /initialize failed/);
+  assert.equal(oneShotRuns, 0);
 });
 
 test("reasoning effort mapping is provider-specific", () => {
@@ -3952,76 +5988,147 @@ test("agentContextUsageFromEvent resolves a window for current model ids", () =>
   assert.equal(claude.contextWindowTokens, 1_000_000);
 });
 
-test("claude compact uses the compact-specific timeout", async () => {
+/** A stand-in for the process a compaction runs in: records what it was
+ *  asked and answers like the CLI. */
+function fakeCompactionProcess(answer: { ok?: boolean; contextUsage?: unknown; postTokens?: number } = {}) {
+  const calls: Array<{ prompt: string; timeoutMs?: number; allowEmptyContent?: boolean; observers?: string[] }> = [];
+  let compactions = 0;
+  const entry: any = {
+    key: "compact-entry", scopeKey: "compact-scope", providerKind: "claude-code", closed: false, queue: Promise.resolve(),
+    process: { exitCode: null },
+    isIdle: () => true,
+    run: async (prompt: string, _signal: unknown, _onOutput: unknown, _onSessionId: unknown, timeoutMs?: number, _goal?: unknown, _codex?: unknown, claude?: Record<string, unknown>) => {
+      calls.push({
+        prompt,
+        timeoutMs,
+        allowEmptyContent: claude?.allowEmptyContent as boolean | undefined,
+        observers: ["onSelfResumedTurn", "onBackgroundTasksChanged"].filter((name) => typeof claude?.[name] === "function")
+      });
+      if (answer.ok === false) return { ok: false, sessionId: "session-1", error: "compaction failed" };
+      compactions += 1;
+      return { ok: true, sessionId: "session-1", content: "" };
+    },
+    contextUsage: async () => answer.contextUsage,
+    lastCompactBoundary: () => (compactions ? { count: compactions, ...(answer.postTokens ? { postTokens: answer.postTokens } : {}) } : undefined)
+  };
+  return { entry, calls };
+}
+
+const COMPACT_WARM = { conversationId: "c1", participantId: "p1", contextKey: "k", idleTimeoutMs: 60_000, onSelfResumedTurn: () => undefined, onBackgroundTasksChanged: () => undefined };
+
+function startsFakeMemberProcess(runner: any, entry: any): { created?: { key: string; scopeKey: string; options: any } } {
+  const record: { created?: { key: string; scopeKey: string; options: any } } = {};
+  runner.providerExecutableForRun = async () => "claude";
+  runner.createClaudeWarmAgent = async (key: string, scopeKey: string, _participant: unknown, _repoPath: unknown, _kind: unknown, options: any) => {
+    record.created = { key, scopeKey, options };
+    entry.key = key;
+    entry.scopeKey = scopeKey;
+    runner.warmAgents.set(key, entry);
+    return entry;
+  };
+  return record;
+}
+
+test("claude compact with no live process starts the member's process as its turn would and keeps it: its key, role and app tools, its turns' timeout, the CLI's count reported", async () => {
   const runner = makeRunner() as any;
   runner.setRunTimeoutMs(2 * 60 * 60_000);
-  let timeoutMs: unknown;
-  runner.runClaude = async (_participant: unknown, _prompt: string, _repoPath: string | undefined, _kind: string, _signal: AbortSignal | undefined, options: { timeoutMs?: number }) => {
-    timeoutMs = options.timeoutMs;
-    return { ok: false, sessionId: "session-1", error: "timeout" };
+  const usage = { usedTokens: 1995, contextWindowTokens: 1_000_000, percentage: 0, source: "claude-code", updatedAt: "2026-06-17T00:00:00.000Z" };
+  const { entry, calls } = fakeCompactionProcess({ contextUsage: usage });
+  const record = startsFakeMemberProcess(runner, entry);
+  const closed: string[] = [];
+  runner.closeWarmAgent = async (_entry: unknown, reason: string) => { closed.push(reason); };
+  const participant = { kind: "claude-code", label: "@claude" };
+  const options = {
+    sessionId: "session-1",
+    role: { name: "role", description: "d", instructions: "i", promptFallbackPrompt: "" },
+    appMcp: { url: "http://127.0.0.1:1", token: "t", toolNames: [] },
+    warm: COMPACT_WARM
   };
 
-  await runner.compactClaudeSession(
-    { kind: "claude-code", label: "@claude" },
-    "/repo",
-    "chat",
-    undefined,
-    {
-      sessionId: "session-1"
-    }
-  );
+  const result = await runner.compactClaudeSession(participant, "/repo", "chat", undefined, options);
 
-  assert.equal(timeoutMs, 5 * 60_000);
-});
-
-test("claude compact runs one-shot so the result reports post-compact usage", async () => {
-  const runner = makeRunner() as any;
-  let seenWarm: unknown = "unset";
-  let seenAllowEmptyContent: unknown = "unset";
-  runner.runClaude = async (_participant: unknown, _prompt: string, _repoPath: string | undefined, _kind: string, _signal: AbortSignal | undefined, options: { warm?: unknown; allowEmptyContent?: boolean }) => {
-    seenWarm = options.warm;
-    seenAllowEmptyContent = options.allowEmptyContent;
-    return { ok: true, sessionId: "session-1", contextUsage: { usedTokens: 1995, contextWindowTokens: 1_000_000, percentage: 0, source: "claude-code", updatedAt: "2026-06-17T00:00:00.000Z" } };
-  };
-
-  const result = await runner.compactClaudeSession(
-    { kind: "claude-code", label: "@claude" },
-    "/repo",
-    "chat",
-    undefined,
-    {
-      sessionId: "session-1",
-      warm: { conversationId: "c1", participantId: "p1", contextKey: "k", idleTimeoutMs: 1000 }
-    }
-  );
-
-  assert.equal(seenWarm, undefined);
-  assert.equal(seenAllowEmptyContent, true);
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [{ prompt: "/compact", timeoutMs: 2 * 60 * 60_000, allowEmptyContent: true, observers: ["onSelfResumedTurn", "onBackgroundTasksChanged"] }]);
+  assert.equal(record.created!.key, runner.warmAgentKey(participant, "/repo", "chat", options), "under the key the member's next turn looks up");
+  assert.equal(record.created!.scopeKey, "c1:p1");
+  assert.equal(record.created!.options.sessionId, "session-1", "resumed on the member's session");
+  assert.equal(record.created!.options.role, options.role);
+  assert.equal(record.created!.options.appMcp, options.appMcp);
+  assert.equal(record.created!.options.warm, options.warm);
+  assert.deepEqual(closed, [], "not closed afterwards");
+  assert.equal(runner.warmAgents.get(record.created!.key), entry, "kept as the member's live process");
+  assert.ok(entry.idleTimer, "with the member's idle timer re-armed");
+  clearTimeout(entry.idleTimer);
   assert.equal(result.contextUsage.usedTokens, 1995);
-  assert.equal(result.contextUsage.percentage, 0);
 });
 
 test("claude compact instructions are sent as part of the native compact command", async () => {
   const runner = makeRunner() as any;
-  let prompt: string | undefined;
-  runner.runClaude = async (_participant: unknown, value: string) => {
-    prompt = value;
-    return { ok: true, sessionId: "session-1" };
-  };
+  const { entry, calls } = fakeCompactionProcess({ postTokens: 9000 });
+  startsFakeMemberProcess(runner, entry);
 
   const result = await runner.compactClaudeSession(
-    { kind: "claude-code", label: "@claude" },
+    { kind: "claude-code", label: "@claude", model: "claude-opus-5-5[1m]" },
     "/repo",
     "chat",
     undefined,
     {
       sessionId: "session-1",
-      compactInstructions: "keep focus on user approval and test output"
+      compactInstructions: "keep focus on user approval and test output",
+      warm: COMPACT_WARM
     }
   );
 
   assert.equal(result.ok, true);
-  assert.equal(prompt, "/compact keep focus on user approval and test output");
+  assert.equal(calls[0].prompt, "/compact keep focus on user approval and test output");
+  assert.equal(result.contextUsage?.usedTokens, 9000, "without get_context_usage, the CLI's own compaction figure");
+  clearTimeout(entry.idleTimer);
+});
+
+test("claude compact reports the CLI's failure as the compaction's and keeps the member's process; one left unusable is closed", async () => {
+  const runner = makeRunner() as any;
+  const { entry } = fakeCompactionProcess({ ok: false });
+  startsFakeMemberProcess(runner, entry);
+  const closed: string[] = [];
+  runner.closeWarmAgent = async (_entry: unknown, reason: string) => { closed.push(reason); };
+  const options = { sessionId: "session-1", warm: COMPACT_WARM };
+  const result = await runner.compactClaudeSession({ kind: "claude-code", label: "@claude" }, "/repo", "chat", undefined, options);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "compaction failed");
+  assert.equal(runner.warmAgents.get(entry.key), entry, "still the member's process");
+  assert.ok(entry.idleTimer, "with its idle timer");
+  entry.run = async () => { entry.unusable = true; throw new Error("claude warm process exited with code 1"); };
+  const crashed = await runner.compactClaudeSession({ kind: "claude-code", label: "@claude" }, "/repo", "chat", undefined, options);
+  assert.equal(crashed.ok, false);
+  assert.match(crashed.error, /exited with code 1/);
+  assert.deepEqual(closed, ["unusable"]);
+  assert.equal(runner.warmAgents.has(entry.key), false);
+  clearTimeout(entry.idleTimer);
+});
+
+test("claude compact that waited for a process with other settings does not start one once native sessions shut down", async () => {
+  const runner = makeRunner() as any;
+  let created = false;
+  runner.createClaudeWarmAgent = async () => { created = true; throw new Error("must not start"); };
+  const busy: any = {
+    key: "other-settings", scopeKey: "c1:p1", providerKind: "claude-code", closed: false, queue: Promise.resolve(), process: { exitCode: null },
+    isIdle: () => false,
+    whenIdle: async () => { runner.warmShutdown = true; }
+  };
+  runner.warmAgents.set(busy.key, busy);
+  const result = await runner.compactClaudeSession({ kind: "claude-code", label: "@claude" }, "/repo", "chat", undefined, { sessionId: "session-1", warm: COMPACT_WARM });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /shutting down/);
+  assert.equal(created, false);
+  runner.warmShutdown = false;
+});
+
+test("claude compact without a member session has nothing to compact", async () => {
+  const runner = makeRunner() as any;
+  runner.createClaudeWarmAgent = async () => assert.fail("no process is started without a member session");
+  const result = await runner.compactClaudeSession({ kind: "claude-code", label: "@claude" }, "/repo", "chat", undefined, { sessionId: "session-1" });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "@claude has no chat session to compact.");
 });
 
 test("codexPrompt chat envelope passes the inner prompt through and does not duplicate permission text", () => {
@@ -4119,4 +6226,537 @@ test("failed formats CLI timeout content in human-readable time", () => {
 
   assert.equal(result.content, "@sam-codex-qa-lead timed out after 24 hours.");
   assert.match(result.error, /86400000ms/);
+});
+
+// Parity with the dedicated CLI in bidirectional stream-json mode (verified on
+// Claude Code 2.1.257): a `result` while a background task is live is not the
+// end of the turn — the CLI keeps the process alive, resumes the model with the
+// task notification and streams the continuation on the same session.
+test("claude warm reply ends at its result while its background task keeps running, and says so", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { outputs, resolved } = harness.addReply({ origin: { runId: "run-1", messageId: "reply-1" } });
+  const { send, state } = harness;
+
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", name: "Bash", input: { command: "sleep 8; echo done", run_in_background: true } }] } });
+  send({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "t1", task_type: "local_bash", description: "Run the soak" }] });
+  send({ type: "system", subtype: "task_started", task_id: "t1", tool_use_id: "toolu_1", description: "Run the soak", is_backgrounded: true, task_type: "local_bash" });
+  send({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "Command running in background with ID: t1" }] } });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Started the soak" }] } });
+  send({ type: "result", subtype: "success", result: "Started the soak", num_turns: 2 });
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "completed" });
+
+  assert.equal(resolved.length, 1, "the reply is finished at its result, as in the dedicated CLI");
+  assert.equal(resolved[0].content, "Started the soak");
+  assert.equal(state.replies.length, 0);
+  assert.equal(state.stepActive, false);
+  assert.deepEqual(Array.from(state.backgroundTasks.keys()), ["t1"], "the task belongs to the process and is still live");
+  const running = outputs.find((event) => /Running in the background: Run the soak/.test(event.text));
+  assert.equal(running?.activityKind, "status");
+  assert.equal(outputs.some((event) => /Waiting for background work/.test(event.text)), false);
+});
+
+test("claude warm: a background task finishing while idle produces a self-started reply that is attached, replayed and settled", async () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state } = harness;
+  harness.addReply({ origin: { runId: "run-1", messageId: "reply-1" } });
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  send({ type: "system", subtype: "task_started", task_id: "t1", description: "Run the soak", is_backgrounded: true });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Started." }] } });
+  send({ type: "result", subtype: "success", result: "Started." });
+
+  const turns: any[] = [];
+  state.onSelfResumedTurn = (turn: any) => turns.push(turn);
+  send({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+  send({ type: "system", subtype: "task_notification", task_id: "t1", status: "completed" });
+  assert.equal(turns.length, 0, "the notification alone does not start a reply");
+  send({ type: "system", subtype: "init" });
+  assert.equal(turns.length, 1, "the CLI's own step becomes a new reply");
+  assert.deepEqual(turns[0].origin, { runId: "run-1", messageId: "reply-1" }, "the reply that started the work is named");
+  send({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "The soak finished." } } });
+
+  const outputs: any[] = [];
+  const settled = turns[0].attach({ onOutput: (event: any) => outputs.push(event) });
+  assert.ok(outputs.some((event) => /Background task finished: Run the soak/.test(event.text)), "the notification row is replayed into the new reply");
+  assert.equal(outputs.filter((event) => event.kind === "text").at(-1)?.cumulative, "The soak finished.");
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "The soak finished." }] } });
+  send({ type: "result", subtype: "success", result: "The soak finished." });
+  const result = await settled;
+  assert.equal(result.ok, true);
+  assert.equal(result.content, "The soak finished.");
+  assert.equal(state.replies.length, 0);
+  assert.equal(harness.flags.unusable, false);
+});
+
+test("claude warm: a self-started step with no handler is dropped without retiring the process", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state } = harness;
+  send({ type: "system", subtype: "init" });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Nobody asked." }] } });
+  send({ type: "result", subtype: "success", result: "Nobody asked." });
+  assert.equal(state.replies.length, 0);
+  assert.equal(state.stepActive, false);
+  assert.equal(harness.flags.unusable, false);
+  // The next message is still routed to its own reply.
+  const { resolved } = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  send({ type: "result", subtype: "success", result: "Mine." });
+  assert.equal(resolved[0].content, "Mine.");
+});
+
+test("claude warm: a message the CLI hands to the running step ends the reply so far and answers the new message", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send } = harness;
+  const first = harness.addReply();
+  const second = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "queued" });
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  send({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Running the check." } } });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Running the check." }] } });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", name: "Bash", input: { command: "sleep 10" } }] } });
+  send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "queued" });
+  assert.equal(first.resolved.length, 0, "queued is not taken yet");
+  send({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "ok" }] } });
+  send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "started" });
+  assert.equal(first.resolved.length, 1, "the first reply ends where the new message joined the step");
+  assert.equal(first.resolved[0].content, "Running the check.");
+  send({ type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "TWO" } } });
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "TWO" }] } });
+  send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "completed" });
+  send({ type: "result", subtype: "success", result: "TWO" });
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "completed" });
+  assert.equal(second.resolved.length, 1);
+  assert.equal(second.resolved[0].content, "TWO");
+  assert.equal(second.outputs.filter((event) => event.kind === "text").at(-1)?.cumulative, "TWO", "nothing of the first reply leaks into the second");
+  assert.equal(first.resolved.length, 1);
+});
+
+test("claude warm: a message sent while the model is idle starts its own step even with background work live", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state } = harness;
+  harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  send({ type: "system", subtype: "task_started", task_id: "t1", description: "agent", is_backgrounded: true });
+  send({ type: "result", subtype: "success", result: "Started." });
+  const second = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "queued" });
+  send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "started" });
+  send({ type: "system", subtype: "init" });
+  send({ type: "result", subtype: "success", result: "4" });
+  assert.equal(second.resolved[0].content, "4");
+  assert.equal(state.backgroundTasks.size, 1);
+});
+
+test("claude warm: Stop interrupts only the running step and keeps the process and its background work", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state, written, hooks, participant } = harness;
+  const { reply, rejected, resolved } = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  send({ type: "system", subtype: "task_started", task_id: "t1", description: "agent", is_backgrounded: true });
+  runner.stopClaudeWarmReply(state, reply, hooks, participant);
+  const interrupt = written.find((message) => message.type === "control_request");
+  assert.deepEqual((interrupt as any)?.request, { subtype: "interrupt" });
+  send({ type: "control_response", response: { subtype: "success", request_id: (interrupt as any).request_id, response: { still_queued: [] } } });
+  send({ type: "result", subtype: "error_during_execution", is_error: true });
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "cancelled" });
+  assert.equal(resolved.length, 0);
+  assert.equal(rejected[0]?.message, "claude warm process was cancelled");
+  assert.equal(harness.flags.unusable, false, "an acknowledged Stop does not retire the process");
+  assert.equal(state.backgroundTasks.size, 1, "background work survives the Stop");
+  clearTimeout(reply.stopTimer);
+});
+
+test("claude warm: Stop on a message still queued in the CLI removes it from the queue", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state, written, hooks, participant } = harness;
+  harness.addReply();
+  const queued = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "queued" });
+  runner.stopClaudeWarmReply(state, queued.reply, hooks, participant);
+  const cancel = written.find((message) => (message as any).request?.subtype === "cancel_async_message") as any;
+  assert.equal(cancel?.request.message_uuid, "cmd-2");
+  assert.equal(written.some((message) => (message as any).request?.subtype === "interrupt"), false, "the running step is left alone");
+  send({ type: "control_response", response: { subtype: "success", request_id: cancel.request_id, response: { cancelled: true } } });
+  assert.equal(queued.rejected[0]?.message, "claude warm process was cancelled");
+  send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "cancelled" });
+  assert.equal(queued.rejected.length, 1);
+});
+
+test("claude warm: a queued message the CLI took before the removal arrived is interrupted when it starts", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state, written, hooks, participant } = harness;
+  const queued = harness.addReply();
+  runner.stopClaudeWarmReply(state, queued.reply, hooks, participant);
+  const cancel = written.find((message) => (message as any).request?.subtype === "cancel_async_message") as any;
+  send({ type: "control_response", response: { subtype: "success", request_id: cancel.request_id, response: { cancelled: false } } });
+  assert.equal(queued.rejected.length, 0);
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  assert.equal(written.some((message) => (message as any).request?.subtype === "interrupt"), true);
+  send({ type: "system", subtype: "init" });
+  send({ type: "result", subtype: "error_during_execution", is_error: true });
+  assert.equal(queued.rejected[0]?.message, "claude warm process was cancelled");
+  clearTimeout(queued.reply.stopTimer);
+});
+
+test("claude warm: a Stop the CLI never acknowledges settles the reply and retires the process", async () => {
+  const runner = makeRunner() as any;
+  runner.claudeWarmStopAckTimeoutMs = 20;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state, hooks, participant } = harness;
+  const { reply, rejected } = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  runner.stopClaudeWarmReply(state, reply, hooks, participant);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(rejected[0]?.message, "claude warm process was cancelled");
+  assert.equal(harness.flags.unusable, true);
+  // The step's remaining output drains into the settled reply until its
+  // result, instead of turning into a reply of its own.
+  assert.equal(state.active, reply);
+  assert.equal(state.stepActive, true);
+  const turns: unknown[] = [];
+  state.onSelfResumedTurn = (turn: unknown) => turns.push(turn);
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "tail" }] } });
+  assert.equal(turns.length, 0);
+});
+
+test("claude warm: a reply that finishes as Stop lands keeps its content", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state, hooks, participant } = harness;
+  const { reply, resolved } = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  runner.stopClaudeWarmReply(state, reply, hooks, participant);
+  send({ type: "result", subtype: "success", result: "Already done." });
+  assert.equal(resolved[0]?.content, "Already done.");
+});
+
+test("claude warm: an error result fails only that reply; the process is retired only when nothing else is live", () => {
+  const runner = makeRunner() as any;
+  const busy = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const failed = busy.addReply();
+  busy.send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  busy.send({ type: "system", subtype: "init" });
+  busy.send({ type: "system", subtype: "task_started", task_id: "t1", description: "agent", is_backgrounded: true });
+  busy.send({ type: "result", subtype: "error_during_execution", is_error: true, result: "API Error: overloaded" });
+  assert.equal(failed.resolved[0]?.ok, false);
+  assert.match(String(failed.resolved[0]?.error), /overloaded/);
+  assert.equal(busy.flags.unusable, false, "live background work keeps the process");
+
+  const idle = makeClaudeWarmHarness(runner, { lifecycle: true });
+  idle.addReply();
+  idle.send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  idle.send({ type: "system", subtype: "init" });
+  idle.send({ type: "result", subtype: "error_during_execution", is_error: true, result: "API Error" });
+  assert.equal(idle.flags.unusable, true);
+});
+
+test("claude warm: a background task finishing during a running step is shown in that step's reply", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state } = harness;
+  const { outputs } = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  send({ type: "system", subtype: "task_started", task_id: "t1", description: "Explore", is_backgrounded: true });
+  send({ type: "system", subtype: "task_notification", task_id: "t1", status: "completed" });
+  assert.ok(outputs.some((event) => /Background task finished: Explore/.test(event.text)));
+  assert.equal(state.pendingNotices.length, 0);
+  // A foreground command reported as a task gets no background row.
+  send({ type: "system", subtype: "task_started", task_id: "fg", description: "sleep 10", is_backgrounded: false });
+  send({ type: "system", subtype: "task_notification", task_id: "fg", status: "completed" });
+  assert.equal(outputs.filter((event) => /Background task finished/.test(event.text)).length, 1);
+});
+
+test("claude warm: a Stop that reaches the CLI after the next message started stops that message too, reported as such", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state, hooks, participant, written } = harness;
+  const first = harness.addReply();
+  const second = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  runner.stopClaudeWarmReply(state, first.reply, hooks, participant);
+  // The step had already finished: its result was on its way.
+  send({ type: "result", subtype: "success", result: "One." });
+  assert.equal(first.resolved[0]?.content, "One.");
+  send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "started" });
+  send({ type: "system", subtype: "init" });
+  const interrupt = written.find((message) => (message as any).request?.subtype === "interrupt") as any;
+  send({ type: "control_response", response: { subtype: "success", request_id: interrupt.request_id, response: { still_queued: [] } } });
+  send({ type: "result", subtype: "error_during_execution", is_error: true });
+  assert.equal(second.resolved[0]?.ok, false);
+  assert.match(String(second.resolved[0]?.error), /Stopped together with the previous reply/);
+  assert.equal(harness.flags.unusable, false);
+  clearTimeout(first.reply.stopTimer);
+});
+
+test("claude warm: an interrupt the CLI took while nothing ran is not blamed for a later failure", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state, hooks, participant, written } = harness;
+  const first = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  runner.stopClaudeWarmReply(state, first.reply, hooks, participant);
+  send({ type: "result", subtype: "success", result: "One." });
+  const interrupt = written.find((message) => (message as any).request?.subtype === "interrupt") as any;
+  send({ type: "control_response", response: { subtype: "success", request_id: interrupt.request_id, response: { still_queued: [] } } });
+  const later = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "started" });
+  send({ type: "system", subtype: "init" });
+  send({ type: "result", subtype: "error_during_execution", is_error: true, result: "API Error" });
+  assert.match(String(later.resolved[0]?.error), /API Error/);
+  clearTimeout(first.reply.stopTimer);
+});
+
+test("claude warm: a reply stopped as the next message joins its step ends stopped", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state, hooks, participant } = harness;
+  const first = harness.addReply();
+  const second = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  runner.stopClaudeWarmReply(state, first.reply, hooks, participant);
+  send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "started" });
+  assert.equal(first.rejected[0]?.message, "claude warm process was cancelled");
+  assert.equal(first.resolved.length, 0);
+  assert.equal(state.active, second.reply);
+});
+
+test("claude warm: once the CLI refuses to drop a queued message, Stop waits for it to start without a deadline", async () => {
+  const runner = makeRunner() as any;
+  runner.claudeWarmStopAckTimeoutMs = 20;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { send, state, hooks, participant, written } = harness;
+  harness.addReply();
+  const queued = harness.addReply();
+  send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  send({ type: "system", subtype: "init" });
+  runner.stopClaudeWarmReply(state, queued.reply, hooks, participant);
+  const cancel = written.find((message) => (message as any).request?.subtype === "cancel_async_message") as any;
+  send({ type: "control_response", response: { subtype: "success", request_id: cancel.request_id, response: { cancelled: false } } });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(harness.flags.unusable, false, "a long step ahead of it does not retire the process");
+  assert.equal(queued.rejected.length, 0);
+});
+
+test("claude warm: a task finishing while idle keeps the process busy until the CLI's own step starts", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  (harness.state as any).selfResumeExpectedUntil = 0;
+  harness.send({ type: "system", subtype: "task_started", task_id: "t1", description: "agent", is_backgrounded: true });
+  harness.send({ type: "system", subtype: "task_notification", task_id: "t1", status: "completed" });
+  assert.ok((harness.state as any).selfResumeExpectedUntil > Date.now(), "the CLI is about to start a step");
+  harness.state.onSelfResumedTurn = (turn: any) => { void turn.attach({}); };
+  harness.send({ type: "system", subtype: "init" });
+  assert.equal((harness.state as any).selfResumeExpectedUntil, 0);
+});
+
+test("claude warm: Stop while a message waits for the member's busy process to apply changed settings leaves that process alone", async () => {
+  const runner = makeRunner() as any;
+  const closed: unknown[] = [];
+  runner.closeWarmAgent = async (entry: unknown) => { closed.push(entry); };
+  let providerStarted = false;
+  runner.providerExecutableForRun = async () => { providerStarted = true; return "/nonexistent/claude"; };
+  const busy = {
+    key: "old-settings",
+    scopeKey: "conversation-settings:claude-settings",
+    closed: false,
+    process: { exitCode: null },
+    isIdle: () => false,
+    whenIdle: (signal?: AbortSignal) => new Promise<void>((_resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    })
+  };
+  runner.warmAgents.set(busy.key, busy);
+  const outputs: Array<{ text: string; activityStatus?: string }> = [];
+  const controller = new AbortController();
+  const participant = { id: "claude-settings", kind: "claude-code", label: "Claude" };
+  const running = runner.runClaudeWarmOrOneShot(participant, "Hello", undefined, "chat", controller.signal, {
+    warm: { conversationId: "conversation-settings", participantId: participant.id, contextKey: "new-settings", idleTimeoutMs: 60_000 },
+    onOutput: (event: { text: string; activityStatus?: string }) => outputs.push(event)
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(outputs.some((event) => /before applying the changed settings/.test(event.text) && event.activityStatus === "started"));
+  controller.abort(new Error("Stopped by user."));
+  const result = await running;
+  assert.equal(result.ok, false);
+  assert.deepEqual(closed, [], "the busy process and its background work survive the Stop");
+  assert.equal(providerStarted, false);
+  assert.ok(runner.warmAgents.has("old-settings"));
+  runner.warmAgents.clear();
+});
+
+test("claude warm: a reply is told when the CLI hands its message to a step", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  let started = 0;
+  harness.addReply();
+  harness.addReply({ onStarted: () => { started += 1; } });
+  harness.send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  harness.send({ type: "system", subtype: "init" });
+  harness.send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "queued" });
+  assert.equal(started, 0, "queued is not started");
+  harness.send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "started" });
+  assert.equal(started, 1);
+});
+
+test("claude warm: a message the CLI drops without a Stop fails only that reply", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  harness.addReply();
+  const dropped = harness.addReply();
+  harness.send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  harness.send({ type: "system", subtype: "init" });
+  harness.send({ type: "command_lifecycle", command_uuid: "cmd-2", state: "discarded" });
+  assert.equal(dropped.rejected[0]?.message, "Claude Code dropped this message before working on it.");
+  assert.equal(harness.flags.unusable, false);
+  assert.equal(harness.state.replies.length, 1);
+});
+
+test("claude warm: invalid output fails the running reply and retires the process; idle, it is only logged", () => {
+  const runner = makeRunner() as any;
+  const idle = makeClaudeWarmHarness(runner, { lifecycle: true });
+  runner.handleClaudeWarmLine("not json", idle.participant, undefined, idle.state, idle.hooks);
+  assert.equal(idle.flags.unusable, false);
+
+  const busy = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { rejected } = busy.addReply();
+  busy.send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  busy.send({ type: "system", subtype: "init" });
+  runner.handleClaudeWarmLine("not json", busy.participant, undefined, busy.state, busy.hooks);
+  assert.match(rejected[0]?.message ?? "", /invalid JSON/);
+  assert.equal(busy.flags.unusable, true);
+});
+
+test("claude warm: an error event fails the reply but keeps a process that still carries background work", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  const { resolved, rejected } = harness.addReply();
+  harness.send({ type: "command_lifecycle", command_uuid: "cmd-1", state: "started" });
+  harness.send({ type: "system", subtype: "init" });
+  harness.send({ type: "system", subtype: "task_started", task_id: "t1", description: "agent", is_backgrounded: true });
+  harness.send({ type: "error", error: { message: "Overloaded" } });
+  assert.equal(rejected.length, 0);
+  assert.equal(resolved[0]?.ok, false);
+  assert.match(String(resolved[0]?.error), /Overloaded/);
+  assert.equal(harness.flags.unusable, false);
+  // The rest of that step is dropped with the settled reply, not given to another.
+  harness.send({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "late" }] } });
+  harness.send({ type: "result", subtype: "success", result: "late" });
+  assert.equal(resolved.length, 1);
+});
+
+test("claude warm: an error outside any reply retires the process before the next message", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: true });
+  harness.send({ type: "error", error: "provider failed" });
+  assert.equal(harness.flags.unusable, true);
+});
+
+test("claude warm: without the CLI's command lifecycle, the oldest written message takes the next step", () => {
+  const runner = makeRunner() as any;
+  const harness = makeClaudeWarmHarness(runner, { lifecycle: false });
+  const { send } = harness;
+  const first = harness.addReply();
+  send({ type: "system", subtype: "init" });
+  send({ type: "result", subtype: "success", result: "One." });
+  assert.equal(first.resolved[0]?.content, "One.");
+  const turns: any[] = [];
+  harness.state.onSelfResumedTurn = (turn: any) => turns.push(turn);
+  send({ type: "system", subtype: "init" });
+  assert.equal(turns.length, 1, "with nothing written, a step the CLI starts is its own");
+});
+
+test("host admission waits count as busy and a Stop during the wait never starts the provider", async () => {
+  const runner = makeRunner();
+  const participant = { id: "host-admission", kind: "codex-cli" as const, label: "Codex" };
+  let admit!: (value: { admitted: true }) => void;
+  runner.setHostAdmission(() => new Promise(resolve => { admit = resolve; }));
+  let executions = 0;
+  (runner as unknown as { runCodex(): Promise<unknown> }).runCodex = async () => { executions++; throw new Error("must not execute"); };
+  const abort = new AbortController();
+  const running = runner.run(participant, "held", undefined, undefined, "chat", abort.signal);
+  assert.equal(runner.hasActiveNativeWork(), true);
+  assert.equal(runner.fenceIdleNativeAdmissions(), undefined);
+  abort.abort();
+  admit({ admitted: true });
+  const result = await running;
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /cancelled before native execution/);
+  assert.equal(executions, 0);
+  assert.equal(runner.hasActiveNativeWork(), false);
+  runner.setHostAdmission(async () => { throw new Error("coordination disk unavailable"); });
+  assert.match((await runner.run(participant, "refused", undefined, undefined, "chat")).error ?? "", /coordination disk unavailable/);
+  assert.equal(executions, 0);
+});
+
+
+test("shutdown waits for pre-spawn preparation and refuses its late provider creation", async () => {
+  for (const kind of ["codex-cli", "claude-code"] as const) {
+    const runner = makeRunner() as any;
+    let release!: () => void;
+    const preparing = new Promise<void>(resolve => { release = resolve; });
+    runner.closeStaleWarmAgents = () => preparing;
+    runner.codexExecutableForRun = async () => process.execPath;
+    runner.providerExecutableForRun = async () => process.execPath;
+    let constructed = 0;
+    runner.constructCodexAppServerWarmAgent = async () => { constructed++; throw new Error("must not spawn"); };
+    runner.constructClaudeWarmAgent = async () => { constructed++; throw new Error("must not spawn"); };
+    const method = kind === "codex-cli" ? "runCodexAppServerWarmOrOneShot" : "runClaudeWarmOrOneShot";
+    const args = [{ id: "held", label: "Held", kind }, "message", undefined,
+      ...(kind === "codex-cli" ? [undefined] : []), "chat", undefined,
+      { warm: { conversationId: "preparing", participantId: "held", contextKey: "test", idleTimeoutMs: 1000 } }];
+    const running = runner[method](...args);
+    assert.equal(runner.hasActiveNativeWork(), true);
+    let closed = false;
+    const closing = runner.shutdownWarmAgents().then(() => { closed = true; });
+    await Promise.resolve();
+    assert.equal(closed, false, "shutdown waits even though no provider creation has begun");
+    release();
+    const result = await running;
+    await closing;
+    assert.equal(result.ok, false);
+    assert.equal(constructed, 0);
+    assert.equal(runner.hasActiveNativeWork(), false);
+  }
+});
+
+test("a host admission completing after shutdown cannot start its earlier command or compaction", async () => {
+  for (const compact of [false, true]) {
+    const runner = makeRunner() as any;
+    let admit!: (value: { admitted: true }) => void;
+    runner.setHostAdmission(() => new Promise(resolve => { admit = resolve; }));
+    let executions = 0;
+    runner.runCodex = runner.compactCodexSession = async () => { executions++; throw new Error("must not execute"); };
+    const method = compact ? "compactSession" : "run";
+    const participant = { id: "late", label: "Codex", kind: "codex-cli" };
+    const pending = compact
+      ? runner[method](participant, undefined, undefined, "chat", undefined, { sessionId: "session" })
+      : runner[method](participant, "held", undefined, undefined, "chat");
+    await runner.shutdownWarmAgents();
+    admit({ admitted: true });
+    const result = await pending;
+    assert.equal(result.ok, false); assert.match(result.error, /shut down while/);
+    assert.equal(executions, 0); assert.equal(runner.hasActiveNativeWork(), false);
+  }
 });

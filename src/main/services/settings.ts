@@ -1,7 +1,16 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { cloudRunSelection } from "../../shared/cloudRunPreparation";
+import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { app, safeStorage } from "electron";
+import { hostPlatform, userDataPath } from "../platform";
+import type { MachineRecord, MachineSettingsSnapshot } from "../../shared/machineLink";
+import { isTrustedDeviceRecord, trustedDeviceIdMatchesKey, type TrustedDeviceRecord } from "../../shared/machineTrust";
+import { machineProfileVariables, type MachineInstallRecord } from "../../shared/machineInstall";
+import { assertAwsMachinePowerConfig, type AwsMachinePowerConfig } from "../../shared/machinePower";
+import { normalizeMachinePowerHandoffRecords, type MachinePowerHandoffRecord } from "../../shared/machinePowerHandoff";
+import type { MobilePairingPackage } from "../../shared/mobilePairing";
+import { assertRecoverableMachineEnrollment } from "../../shared/machineEnrollmentRecovery";
+import { isDeepStrictEqual } from "node:util";
 import type {
   AppSettings,
   AgentHealth,
@@ -14,6 +23,7 @@ import type {
   ChatAgentPermissions,
   ChatAppToolCapability,
   AwsWorkerHandleInfo,
+  AwsSetupStep,
   AwsWorkerOperationSnapshot,
   AwsWorkerSpec,
   AwsWorkerVolumeExpansion,
@@ -38,9 +48,9 @@ import type {
   ProviderKind,
   ProviderSettings,
   ProviderSettingsUpdate,
+  RepoFileExternalOpenAction,
   RepoFileOpenAction,
   RemoteParticipantSessionHandle,
-  RemoteSessionCleanupTombstone,
   SaveAgentEnvironmentVariableRequest
 } from "../../shared/types";
 import {
@@ -60,6 +70,13 @@ import {
   normalizeChatParticipantRequestMaxDepth,
   normalizeChatParticipantRequestPromptMaxChars
 } from "../../shared/chatParticipantRequests";
+import type {
+  AvatarImageMediaType,
+  CustomAvatarSummary,
+  ReadCustomAvatarResult,
+  SaveCustomAvatarRequest
+} from "../../shared/avatarStudio";
+import { avatarImageExtension } from "../../shared/avatarStudio";
 import { normalizeChatAutoWatchWakeLimit } from "../../shared/chatAutoWatch";
 import { normalizeChatPromptContextSettings } from "../../shared/chatPromptContext";
 import { normalizeCliAgentRunTimeoutMs } from "../../shared/cliAgentRunSettings";
@@ -81,6 +98,7 @@ import {
   isValidChatSavedPromptTrigger,
   normalizeChatSavedPromptTrigger
 } from "../../shared/chatSavedPrompts";
+import { mobileControlSettingsFromEnvironment } from "../../shared/mobilePairing";
 import { normalizeChatReasoningEffort } from "../../shared/reasoningEffort";
 import {
   cliProviderHostDefaultModel,
@@ -92,6 +110,9 @@ import {
 import { CLI_PROVIDER_SETUP, preferredReadyAssistantProviderKind } from "../../shared/cliReadiness";
 import { normalizeCloudRunWorkerSettings } from "./cloudRunWorkers";
 import type { AwsWorkerCredentials } from "./awsWorkerProvisioning";
+import { readCrashReportsChoice, writeCrashReportsChoice } from "./crashReportPreferences";
+import { HUB_PHONE_INVITE_MAX_LIFETIME_MS, isAcceptableHubUrl } from "../../shared/hubProtocol";
+import { isHubServerAddress, type HubLinkConfig } from "../../shared/hubSetup";
 
 type StoredProviderSettings = ProviderSettings & {
   encryptedApiKey?: string;
@@ -120,6 +141,53 @@ interface StoredAgentEnvironmentSettings {
   variables?: StoredAgentEnvironmentVariable[];
 }
 
+/** Which instance the app removed by itself, and when: only that it
+ *  happened is shown, the instance id is kept for the debug trail. */
+export interface AwsWorkerGoneNotice {
+  instanceId: string;
+  at: string;
+}
+
+/** A machine whose instance can never come back, recorded before it is
+ *  removed so that a removal cut short is finished later, also after a restart. */
+export interface LeavingMachine {
+  machineId: string;
+  instanceId: string;
+  at: string;
+  /** Its instance could not be checked, because AWS refused the keys it was
+   *  made with or this computer can no longer read them: never removed by
+   *  the app, only shown. */
+  unverified?: "refused" | "unreadable";
+  /** Where to look at its instance again, and the AWS account it belongs to
+   *  when known: only that account's keys prove by "no such instance" that
+   *  it is gone. */
+  region?: string;
+  accountId?: string;
+}
+
+/** How many leaving machines are kept; one desktop has a handful. */
+const LEAVING_MACHINES_LIMIT = 50;
+
+function normalizeLeavingMachines(value: unknown, limit = LEAVING_MACHINES_LIMIT): LeavingMachine[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const text = (item: unknown): item is string => typeof item === "string" && item.trim().length > 0;
+  const entries = value.filter((item): item is LeavingMachine => Boolean(item) && typeof item === "object"
+    && text((item as LeavingMachine).machineId) && text((item as LeavingMachine).instanceId) && text((item as LeavingMachine).at))
+    .map((item) => ({ machineId: item.machineId, instanceId: item.instanceId, at: item.at,
+      ...(item.unverified === "refused" || item.unverified === "unreadable" ? { unverified: item.unverified } : {}),
+      ...(text(item.region) ? { region: item.region } : {}),
+      ...(typeof item.accountId === "string" && /^\d{12}$/.test(item.accountId) ? { accountId: item.accountId } : {}) }));
+  return entries.length ? entries.slice(-limit) : undefined;
+}
+
+function normalizeAwsWorkerGoneNotice(value: unknown): AwsWorkerGoneNotice | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Partial<AwsWorkerGoneNotice>;
+  return typeof record.instanceId === "string" && record.instanceId.trim() && typeof record.at === "string" && record.at
+    ? { instanceId: record.instanceId.trim(), at: record.at }
+    : undefined;
+}
+
 interface StoredSettings {
   settingsVersion?: number;
   roundLimitDefault: number;
@@ -142,26 +210,125 @@ interface StoredSettings {
     desired: AwsWorkerSpec;
   };
   awsWorkerVolumeExpansion?: AwsWorkerVolumeExpansion;
+  /** The app removed its instance by itself because AWS no longer has it;
+   *  the AWS page says so until another instance is connected. */
+  awsWorkerGoneNotice?: AwsWorkerGoneNotice;
+  /** Machines on an instance that can never come back, not removed yet. */
+  leavingMachines?: LeavingMachine[];
   agentEnvironment?: StoredAgentEnvironmentSettings;
   cliProviderHosts?: StoredCliProviderHost[];
   assistantProviderKind?: ChatProviderKind;
   lastSuccessfulChatProviderKind?: ChatProviderKind;
   lastRepoPath?: string;
   repoFileOpenAction?: RepoFileOpenAction;
+  /** What the file panel's "Open in…" button does; the User's OS choice from before the panel existed. */
+  repoFileExternalOpenAction?: RepoFileExternalOpenAction;
+  /** Set once the file panel became the default click (2026-10-30), so the switch happens once. */
+  repoFileOpenPanelMigrated?: boolean;
   providers: StoredProviderSettings[];
   chatRoleConfigs?: ChatRoleConfig[];
   chatBehaviorRules?: ChatBehaviorRuleConfig[];
   chatSavedPrompts?: ChatSavedPromptConfig[];
   chatParticipantConfigs?: ChatParticipantConfig[];
+  chatCustomAvatars?: CustomAvatarSummary[];
   chatParticipantSeedState?: ChatParticipantSeedState;
-  remoteSessionCleanupTombstones?: RemoteSessionCleanupTombstone[];
+  /** Enrolled machines (machines transport). The pairing packages carry the
+   *  key each machine's first hello is sealed with, and are stored sealed,
+   *  keyed by MachineRecord.pairingKey. */
+  machines?: MachineRecord[];
+  encryptedMachinePairings?: string;
+  /** This host's power key is never part of participant settings replication. */
+  encryptedMachinePower?: string;
+  /** The power key `encryptedMachinePower` replaced ("none" when there was
+   *  none), so a handover the runtime did not come back from can put it back.
+   *  Consumed by that revert; absent, there is nothing to revert. */
+  encryptedMachinePowerPrevious?: string;
+  /** The User's automatic-stop switch. Unset reads as on, so a stop key set
+   *  up before the switch existed keeps working. Shared with machines in the
+   *  settings snapshot: the machine's runtime is what decides to stop. */
+  machineAutoStopEnabled?: boolean;
+  /** When the User last changed the switch: a machine's report older than
+   *  this predates the change and says nothing about whether it arrived. */
+  machineAutoStopChangedAt?: string;
+  /** The User's own server (hub), once it is set up. */
+  hub?: HubLinkConfig;
+  /** Who holds a copy of the phone's start key. Records only, never the
+   *  secret, and never sent to a machine: they name the User's devices. */
+  machinePowerHandoffs?: MachinePowerHandoffRecord[];
+  /** How each machine was installed from THIS desktop (SSH access, install
+   *  root, service, installed version). Never travels to a machine: it carries
+   *  this desktop's way in. */
+  machineInstalls?: MachineInstallRecord[];
+  /** Devices the User has said may use this desktop's machines. Their public
+   *  keys are what a machine checks a command's signature against; there is
+   *  nothing secret in them. */
+  trustedDevices?: TrustedDeviceRecord[];
+  /** Phone invites this desktop made for its server, and what became of
+   *  each: a phone enrolled with it, or it was revoked. */
+  hubPhoneInvites?: StoredHubPhoneInvite[];
+  machineDeviceRevocations?: Record<string, string>;
+  /** When the records set up through the shared relay were taken off this
+   *  desktop, and what they were: its presence means the removal ran. */
+  relayRemoval?: RelayRemovalRecord;
+  /** What the removal found before it took anything off (a start that stops
+   *  half way): kept, so the record still names everything. */
+  relayRemovalPending?: RelayRemovalPending;
+  /** Relay machines whose removal failed at the last start; each is tried
+   *  again at every start until it goes. */
+  relayRemovalFailures?: RelayRemovalFailure[];
+  /** When this desktop last asked about machines that stopped being used. */
+  machineInactivityCheckAt?: string;
 }
 
-function isRemoteSessionCleanupReason(value: unknown): value is RemoteSessionCleanupTombstone["reason"] {
-  return value === "participant-removed" ||
-    value === "chat-archived" ||
-    value === "chat-deleted" ||
-    value === "app-quit";
+/** What was set up through the shared relay and taken off this desktop when
+ *  the relay went away (names only); its presence means the removal ran. */
+export interface RelayRemovalRecord {
+  removedAt: string;
+  machines: string[];
+  phones: string[];
+  /** A phone paired through the relay was handed the key that starts the AWS
+   *  machine; it keeps its copy until the key is replaced in AWS. */
+  startKeyHanded: boolean;
+  /** Kept from versions that showed the removal in Settings; unused. */
+  dismissedAt?: string;
+}
+
+function isRelayRemovalRecord(value: unknown): value is RelayRemovalRecord {
+  const record = value as Partial<RelayRemovalRecord> | undefined;
+  return Boolean(record) && typeof record!.removedAt === "string" && Array.isArray(record!.machines) && Array.isArray(record!.phones)
+    && record!.machines.every((name) => typeof name === "string") && record!.phones.every((name) => typeof name === "string")
+    && typeof record!.startKeyHanded === "boolean" && (record!.dismissedAt === undefined || typeof record!.dismissedAt === "string");
+}
+
+/** A relay removal that has not finished: the machines it found. */
+export interface RelayRemovalPending {
+  machines: Array<{ id: string; name: string }>;
+  startKeyHanded: boolean;
+}
+
+function isRelayRemovalPending(value: unknown): value is RelayRemovalPending {
+  const pending = value as { machines?: unknown; startKeyHanded?: unknown } | undefined;
+  return Boolean(pending) && Array.isArray(pending!.machines)
+    && pending!.machines.every((machine) => typeof machine?.id === "string" && typeof machine?.name === "string")
+    && typeof pending!.startKeyHanded === "boolean";
+}
+
+/** A relay machine whose removal failed at the last start, and why. */
+export interface RelayRemovalFailure {
+  machineId: string;
+  machine: string;
+  message: string;
+  /** When this machine first failed for this reason. */
+  at: string;
+  /** Kept from versions that showed the failure in Settings; unused. */
+  dismissedMessages?: string[];
+}
+
+function isRelayRemovalFailure(value: unknown): value is RelayRemovalFailure {
+  const failure = value as Partial<RelayRemovalFailure> | undefined;
+  return Boolean(failure) && typeof failure!.machineId === "string" && typeof failure!.machine === "string"
+    && typeof failure!.message === "string" && typeof failure!.at === "string"
+    && (failure!.dismissedMessages === undefined || (Array.isArray(failure!.dismissedMessages) && failure!.dismissedMessages.every((message) => typeof message === "string")));
 }
 
 const DEFAULT_PROVIDERS: ProviderSettings[] = [
@@ -226,6 +393,7 @@ const DEFAULT_ADMINISTRATOR_INSTRUCTIONS = [
   "2. **Use app MCP tools for member changes**",
   "   - Use `app_roles_request_change` to create roles, edit custom roles, or delete unused custom roles with `archive_role`.",
   "   - Use `app_participants_request_change` to add a new member to the current chat or add an existing saved member preset.",
+  "   - When User asks to take a member out of this chat, use `app_participants_request_change` with `remove_participant_from_chat` and that member's `participantId` or `handle`; it can go in the same request as additions. It follows the same member-management policy as an addition and takes effect after your turn ends. The Chat Assistant (you) and the last member cannot be removed.",
   "   - If you create a role for a new member, use the `draftRoleRef` returned by `app_roles_request_change` as the member `roleConfigId` in the following `app_participants_request_change` call.",
   "   - If adding a new member should make it reusable later, set `saveAsPreset` to true unless User says this is one-off.",
   "   - Do not claim roles or members were changed until the app reports that the request was approved.",
@@ -826,6 +994,8 @@ const DEFAULT_SOFTWARE_ENGINEER_INSTRUCTIONS = [
   "You are a Senior Software Engineer. Your job is to turn technical questions, product requirements, plans, and code context into practical implementation guidance.",
   "",
   "Stay hands-on. Prefer concrete changes, named files or modules, explicit data flow, failure modes, and verification steps over broad commentary.",
+  "",
+  "Follow the 'Verify the affected lifecycle' rule in the global AGENTS.md / CLAUDE.md; use the concrete lifecycle checks in implement-change and review when those skills are available.",
   "",
   "## Core Responsibilities",
   "",
@@ -1576,14 +1746,14 @@ const DEFAULT_CHAT_ROLES: ChatRoleConfig[] = [
     id: "administrator",
     label: "Chat Assistant",
     instructions: DEFAULT_ADMINISTRATOR_INSTRUCTIONS,
-    version: 12,
+    version: 14,
     builtIn: true,
     appToolCapabilities: ["participants.manage"] satisfies ChatAppToolCapability[],
     participantDefaults: {
       ...DEFAULT_ROLE_PARTICIPANT_DEFAULTS,
       manageRolesParticipants: "ask"
     } satisfies ChatRoleParticipantDefaults,
-    updatedAt: "2026-07-06T00:00:00.000Z"
+    updatedAt: "2026-10-30T00:00:00.000Z"
   },
   {
     id: GENERIC_PARTICIPANT_ROLE_ID,
@@ -1613,9 +1783,9 @@ const DEFAULT_CHAT_ROLES: ChatRoleConfig[] = [
     id: "software-engineer",
     label: "Software Engineer",
     instructions: DEFAULT_SOFTWARE_ENGINEER_INSTRUCTIONS,
-    version: 5,
+    version: 6,
     builtIn: true,
-    updatedAt: "2026-05-10T00:00:00.000Z"
+    updatedAt: "2026-09-06T00:00:00.000Z"
   },
   {
     id: "product-strategist",
@@ -1756,18 +1926,47 @@ const DEFAULT_CHAT_ROLES: ChatRoleConfig[] = [
   ...role
 }));
 
+/** `encryptedMachinePowerPrevious` when the key a save replaced was none. */
+const NO_MACHINE_POWER = "none";
+
+function hubSettingField(value: unknown): { hub?: HubLinkConfig } {
+  const hub = normalizeHubSetting(value);
+  return hub ? { hub } : {};
+}
+
+/** The hub this desktop syncs with, as read back from disk. */
+function normalizeHubSetting(value: unknown): HubLinkConfig | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const hub = value as { url?: unknown; hubId?: unknown; hubKey?: unknown; server?: unknown };
+  if (typeof hub.url !== "string" || !isAcceptableHubUrl(hub.url)) return undefined;
+  let server: import("../../shared/hubSetup").HubServerRecord | undefined;
+  if (hub.server && typeof hub.server === "object") {
+    const record = hub.server as Record<string, unknown>;
+    // Only a record setup could have written: its fields go into SSH commands.
+    if (isHubServerAddress(record)) {
+      server = {
+        version: 1, region: record.region as string, instanceName: record.instanceName as string, ip: record.ip as string, user: record.user as string,
+        ...(typeof record.installedAt === "string" ? { installedAt: record.installedAt } : {}),
+        ...(typeof record.installedVersion === "string" ? { installedVersion: record.installedVersion } : {})
+      };
+    }
+  }
+  return { url: hub.url, ...(typeof hub.hubId === "string" && hub.hubId ? { hubId: hub.hubId } : {}),
+    ...(typeof hub.hubKey === "string" && hub.hubKey ? { hubKey: hub.hubKey } : {}), ...(server ? { server } : {}) };
+}
+
 export class SettingsService {
   private readonly settingsPath: string;
-  private readonly remoteSessionCleanupPath: string;
-  private remoteSessionCleanupMutation: Promise<void> = Promise.resolve();
   private storedState: StoredSettings | undefined;
+  private storedReadError?: unknown;
   private storedLoad: Promise<StoredSettings> | undefined;
   private storedWriteQueue: Promise<void> = Promise.resolve();
   private assistantProviderMutation: Promise<void> = Promise.resolve();
 
-  constructor() {
-    this.settingsPath = path.join(app.getPath("userData"), "settings.json");
-    this.remoteSessionCleanupPath = path.join(app.getPath("userData"), "remote-session-cleanup.json");
+  private readonly storedChangeListeners = new Set<() => void>();
+
+  constructor(private readonly options: { profileHome?: string } = {}) {
+    this.settingsPath = path.join(userDataPath(), "settings.json");
   }
 
   async getPublicSettings(): Promise<AppSettings> {
@@ -1775,20 +1974,24 @@ export class SettingsService {
     return {
       roundLimitDefault: stored.roundLimitDefault,
       betaUpdates: this.normalizeBetaUpdates(stored.betaUpdates),
+      crashReports: readCrashReportsChoice(userDataPath()),
       cliAgentRunTimeoutMs: this.normalizeCliAgentRunTimeoutMs(stored.cliAgentRunTimeoutMs),
       chatParticipantRequestMaxDepth: this.normalizeChatParticipantRequestMaxDepth(stored.chatParticipantRequestMaxDepth),
       chatParticipantRequestPromptMaxChars: this.normalizeChatParticipantRequestPromptMaxChars(stored.chatParticipantRequestPromptMaxChars),
       chatAutoWatchWakeLimit: this.normalizeChatAutoWatchWakeLimit(stored.chatAutoWatchWakeLimit),
       chatPromptContext: this.normalizeChatPromptContextSettings(stored.chatPromptContext),
       cloudRuns: this.normalizeCloudRunsSettings(stored),
+      mobileControl: mobileControlSettingsFromEnvironment(process.env),
       assistantProviderKind: this.normalizeChatProviderKind(stored.assistantProviderKind),
       lastSuccessfulChatProviderKind: this.normalizeChatProviderKind(stored.lastSuccessfulChatProviderKind),
       lastRepoPath: stored.lastRepoPath,
       repoFileOpenAction: stored.repoFileOpenAction,
+      repoFileExternalOpenAction: stored.repoFileExternalOpenAction,
       chatRoleConfigs: stored.chatRoleConfigs ?? DEFAULT_CHAT_ROLES,
       chatBehaviorRules: stored.chatBehaviorRules ?? [],
       chatSavedPrompts: stored.chatSavedPrompts ?? [],
       chatParticipantConfigs: stored.chatParticipantConfigs ?? [],
+      chatCustomAvatars: this.normalizeCustomAvatars(stored.chatCustomAvatars),
       chatParticipantSeedState: stored.chatParticipantSeedState,
       cliProviderHosts: this.publicCliProviderHosts(stored),
       providers: stored.providers.map((provider) => ({
@@ -1800,57 +2003,71 @@ export class SettingsService {
     };
   }
 
-  async listRemoteSessionCleanupTombstones(): Promise<RemoteSessionCleanupTombstone[]> {
-    return this.withRemoteSessionCleanupMutation(async () => this.readRemoteSessionCleanupTombstones());
+  // Generated avatars are stored as files next to the settings file: a base64 PNG
+  // inside settings.json would be read on every getSettings and grow it without limit.
+  private customAvatarDir(): string {
+    // userDataPath, not electron's app: this service also runs on a machine,
+    // where there is no Electron to ask.
+    return path.join(userDataPath(), "avatars");
   }
 
-  async enqueueRemoteSessionCleanup(
-    handle: RemoteParticipantSessionHandle,
-    reason: RemoteSessionCleanupTombstone["reason"],
-    details: Pick<RemoteSessionCleanupTombstone,
-      "conversationId" | "participantId" | "runIds" | "providerSessionIds" | "removeArtifacts"> = {}
-  ): Promise<RemoteSessionCleanupTombstone> {
-    return this.withRemoteSessionCleanupMutation(async () => {
-      const current = await this.readRemoteSessionCleanupTombstones();
-      const existing = current.find((item) =>
-        item.handle.sessionKey === handle.sessionKey && item.handle.sessionDir === handle.sessionDir
-      );
-      if (existing) {
-        const merged: RemoteSessionCleanupTombstone = {
-          ...existing,
-          ...details,
-          reason,
-          runIds: this.normalizedStringList([...(existing.runIds ?? []), ...(details.runIds ?? [])]),
-          providerSessionIds: this.normalizedStringList([
-            ...(existing.providerSessionIds ?? []),
-            ...(details.providerSessionIds ?? [])
-          ]),
-          removeArtifacts: existing.removeArtifacts === true || details.removeArtifacts === true
-        };
-        await this.writeRemoteSessionCleanupTombstones(
-          current.map((item) => item.id === existing.id ? merged : item)
-        );
-        return merged;
+  private customAvatarPath(id: string, mediaType: AvatarImageMediaType): string {
+    return path.join(this.customAvatarDir(), `${id}.${avatarImageExtension(mediaType)}`);
+  }
+
+  private normalizeCustomAvatars(value: unknown): CustomAvatarSummary[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    return value.flatMap((entry) => {
+      if (!entry || typeof entry !== "object") {
+        return [];
       }
-      const tombstone: RemoteSessionCleanupTombstone = {
-        id: randomUUID(),
-        handle,
-        reason,
-        createdAt: new Date().toISOString(),
-        ...details,
-        runIds: this.normalizedStringList(details.runIds),
-        providerSessionIds: this.normalizedStringList(details.providerSessionIds)
-      };
-      await this.writeRemoteSessionCleanupTombstones([...current, tombstone]);
-      return tombstone;
+      const record = entry as Record<string, unknown>;
+      const id = typeof record.id === "string" ? record.id.trim() : "";
+      const mediaType = record.mediaType === "image/png" || record.mediaType === "image/svg+xml"
+        ? record.mediaType
+        : undefined;
+      if (!id || !mediaType) {
+        return [];
+      }
+      return [{
+        id,
+        mediaType,
+        label: typeof record.label === "string" && record.label.trim() ? record.label.trim() : "Custom avatar",
+        createdAt: typeof record.createdAt === "string" ? record.createdAt : new Date().toISOString()
+      }];
     });
   }
 
-  async removeRemoteSessionCleanupTombstone(id: string): Promise<void> {
-    await this.withRemoteSessionCleanupMutation(async () => {
-      const current = await this.readRemoteSessionCleanupTombstones();
-      await this.writeRemoteSessionCleanupTombstones(current.filter((item) => item.id !== id));
-    });
+  async saveCustomAvatar(request: SaveCustomAvatarRequest): Promise<AppSettings> {
+    const bytes = Buffer.from(request.dataBase64, "base64");
+    if (bytes.length === 0) {
+      throw new Error("Empty picture.");
+    }
+    const id = randomUUID();
+    await mkdir(this.customAvatarDir(), { recursive: true });
+    await writeFile(this.customAvatarPath(id, request.mediaType), bytes);
+    const summary: CustomAvatarSummary = {
+      id,
+      mediaType: request.mediaType,
+      label: request.label.trim() || "Custom avatar",
+      createdAt: new Date().toISOString()
+    };
+    const stored = await this.readStored();
+    stored.chatCustomAvatars = [...this.normalizeCustomAvatars(stored.chatCustomAvatars), summary];
+    await this.writeStored(stored);
+    return this.getPublicSettings();
+  }
+
+  async readCustomAvatar(id: string): Promise<ReadCustomAvatarResult> {
+    const stored = await this.readStored();
+    const summary = this.normalizeCustomAvatars(stored.chatCustomAvatars).find((entry) => entry.id === id);
+    if (!summary) {
+      throw new Error("Avatar not found.");
+    }
+    const bytes = await readFile(this.customAvatarPath(id, summary.mediaType));
+    return { id, mediaType: summary.mediaType, dataBase64: bytes.toString("base64") };
   }
 
   async updateProvider(update: ProviderSettingsUpdate): Promise<AppSettings> {
@@ -2365,6 +2582,8 @@ export class SettingsService {
       agentMode: normalizeChatAgentMode(update.agentMode),
       permissions: normalizeChatAgentPermissions(update.permissions),
       remoteExecution: this.normalizeConcreteRemoteExecutionMode(update.remoteExecution),
+      homeMachineId: typeof update.homeMachineId === "string" && update.homeMachineId.trim() ? update.homeMachineId.trim() : undefined,
+      cloudRun: cloudRunSelection(update.cloudRun),
       skipToolchainPreflight: update.skipToolchainPreflight === true,
       autoWatchEnabled: this.autoWatchEnabledForRole(role, update.autoWatchEnabled),
       updatedAt: now
@@ -2473,6 +2692,16 @@ export class SettingsService {
     return this.getPublicSettings();
   }
 
+  async getMachineInactivityCheckAt(): Promise<string | undefined> {
+    return (await this.readStored()).machineInactivityCheckAt;
+  }
+
+  async saveMachineInactivityCheckAt(at: string): Promise<void> {
+    const stored = await this.readStored();
+    stored.machineInactivityCheckAt = at;
+    await this.writeStored(stored);
+  }
+
   async updateLastRepoPath(repoPath: string): Promise<AppSettings> {
     const stored = await this.readStored();
     const normalized = repoPath.trim();
@@ -2489,6 +2718,23 @@ export class SettingsService {
   async setRepoFileOpenAction(action: RepoFileOpenAction | null): Promise<AppSettings> {
     const stored = await this.readStored();
     stored.repoFileOpenAction = this.normalizeRepoFileOpenAction(action);
+    stored.repoFileOpenPanelMigrated = true;
+    await this.writeStored(stored);
+    return this.getPublicSettings();
+  }
+
+  /** Undefined until the User chose (or had chosen before the panel): files the panel does not show then ask. */
+  async getRepoFileExternalOpenAction(): Promise<RepoFileExternalOpenAction | undefined> {
+    const stored = await this.readStored();
+    return stored.repoFileExternalOpenAction;
+  }
+
+  async setRepoFileExternalOpenAction(action: unknown): Promise<AppSettings> {
+    const normalized = this.normalizeRepoFileExternalOpenAction(action);
+    if (!normalized && action !== null) throw new Error("Choose IntelliJ IDEA, the default app, or to be asked.");
+    const stored = await this.readStored();
+    stored.repoFileExternalOpenAction = normalized;
+    stored.repoFileOpenPanelMigrated = true;
     await this.writeStored(stored);
     return this.getPublicSettings();
   }
@@ -2502,6 +2748,13 @@ export class SettingsService {
     const stored = await this.readStored();
     stored.betaUpdates = this.normalizeBetaUpdates(enabled);
     await this.writeStored(stored);
+    return this.getPublicSettings();
+  }
+
+  /** Kept in a marker file next to settings.json, not in it; see
+   *  CRASH_REPORTS_OFF_MARKER. */
+  async setCrashReports(enabled: boolean): Promise<AppSettings> {
+    writeCrashReportsChoice(userDataPath(), enabled);
     return this.getPublicSettings();
   }
 
@@ -2597,26 +2850,36 @@ export class SettingsService {
 
   async getManualAgentEnvironment(): Promise<{ env: NodeJS.ProcessEnv; version: string }> {
     const stored = await this.readStored();
+    return this.readManualAgentEnvironment(stored);
+  }
+
+  private readManualAgentEnvironment(stored: StoredSettings, requireComplete = false): { env: NodeJS.ProcessEnv; version: string } {
     const env: NodeJS.ProcessEnv = {};
     for (const variable of stored.agentEnvironment?.variables ?? []) {
       if (variable.enabled === false) {
         continue;
       }
       if (normalizeAgentEnvironmentKey(variable.key) !== variable.key) {
+        if (requireComplete) throw new Error("Machine environment contains an invalid key; no settings were sent.");
         continue;
       }
       try {
         assertAgentEnvironmentKeyAllowed(variable.key);
       } catch {
+        if (requireComplete) throw new Error("Machine environment contains a forbidden key; no settings were sent.");
         continue;
       }
       const value = this.decodeAgentEnvironmentValue(variable);
       if (value === undefined) {
+        if (requireComplete) throw new Error(`The configured environment value ${variable.key} could not be read; no machine settings were sent.`);
         continue;
       }
       env[variable.key] = value;
     }
-    const filtered = filterAllowedAgentEnvironment(env);
+    // Native directories belong to the machine, even if the source laptop
+    // explicitly configured CODEX_HOME / CLAUDE_CONFIG_DIR in Settings.
+    const filtered = filterAllowedAgentEnvironment({ ...env,
+      ...(this.options?.profileHome ? machineProfileVariables(this.options.profileHome) : {}) });
     return { env: filtered, version: this.agentEnvironmentVersion(filtered) };
   }
 
@@ -2671,6 +2934,9 @@ export class SettingsService {
         try {
           const raw = await readFile(this.settingsPath, "utf8");
           const parsed = JSON.parse(raw) as StoredSettings;
+          if (Object.hasOwn(parsed, "encryptedMachinePower") && (typeof parsed.encryptedMachinePower !== "string" || !parsed.encryptedMachinePower.trim())) {
+            throw new Error("The stored machine power key has an invalid format.");
+          }
           const merged = this.mergeDefaults(parsed);
           this.storedState = merged;
           if (this.hasLegacyProviderData(parsed)) {
@@ -2681,7 +2947,8 @@ export class SettingsService {
             });
           }
           return merged;
-        } catch {
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.storedReadError = error;
           const fallback = this.mergeDefaults({ settingsVersion: 1, roundLimitDefault: 1, providers: DEFAULT_PROVIDERS });
           this.storedState = fallback;
           return fallback;
@@ -2695,15 +2962,43 @@ export class SettingsService {
     }
   }
 
-  private async writeStored(settings: StoredSettings): Promise<void> {
+  /** Called after every settings write that reached the disk. */
+  onStoredChange(listener: () => void): () => void {
+    this.storedChangeListeners.add(listener);
+    return () => { this.storedChangeListeners.delete(listener); };
+  }
+
+  private async writeStored(settings: StoredSettings, durable = false): Promise<void> {
+    const previous = this.storedState;
     this.storedState = settings;
     const serialized = `${JSON.stringify(settings, null, 2)}\n`;
     const write = this.storedWriteQueue.then(async () => {
       await mkdir(path.dirname(this.settingsPath), { recursive: true });
-      await writeFile(this.settingsPath, serialized, "utf8");
+      const temporary = `${this.settingsPath}.${randomUUID()}.tmp`;
+      try {
+        if (durable) {
+          const file = await open(temporary, "wx", 0o600);
+          try { await file.writeFile(serialized, "utf8"); await file.sync(); }
+          finally { await file.close(); }
+        } else await writeFile(temporary, serialized, { encoding: "utf8", mode: 0o600 });
+        await rename(temporary, this.settingsPath);
+        if (durable && process.platform !== "win32") {
+          const directory = await open(path.dirname(this.settingsPath), "r");
+          try { await directory.sync(); } finally { await directory.close(); }
+        }
+      } finally {
+        await rm(temporary, { force: true }).catch(() => undefined);
+      }
     });
     this.storedWriteQueue = write.catch(() => undefined);
-    await write;
+    try { await write; }
+    catch (error) {
+      if (durable && this.storedState === settings) this.storedState = previous;
+      throw error;
+    }
+    for (const listener of this.storedChangeListeners) {
+      try { listener(); } catch { /* a listener's failure is not the write's */ }
+    }
   }
 
   private mergeDefaults(settings: StoredSettings): StoredSettings {
@@ -2741,6 +3036,8 @@ export class SettingsService {
         : undefined,
       awsWorkerSpecAcceptance: this.normalizeAwsWorkerSpecAcceptance(settings.awsWorkerSpecAcceptance),
       awsWorkerVolumeExpansion: this.normalizeAwsWorkerVolumeExpansion(settings.awsWorkerVolumeExpansion),
+      awsWorkerGoneNotice: normalizeAwsWorkerGoneNotice(settings.awsWorkerGoneNotice),
+      leavingMachines: normalizeLeavingMachines(settings.leavingMachines),
       agentEnvironment: {
         variables: this.normalizeAgentEnvironmentVariables(settings.agentEnvironment?.variables)
       },
@@ -2748,7 +3045,7 @@ export class SettingsService {
       assistantProviderKind: this.normalizeChatProviderKind(settings.assistantProviderKind),
       lastSuccessfulChatProviderKind: this.normalizeChatProviderKind(settings.lastSuccessfulChatProviderKind),
       lastRepoPath: typeof settings.lastRepoPath === "string" ? settings.lastRepoPath.trim() || undefined : undefined,
-      repoFileOpenAction: this.normalizeRepoFileOpenAction(settings.repoFileOpenAction),
+      ...this.mergeRepoFileOpenSettings(settings),
       providers,
       chatRoleConfigs,
       chatBehaviorRules: this.normalizeBehaviorRules(settings.chatBehaviorRules),
@@ -2758,11 +3055,91 @@ export class SettingsService {
         chatRoleConfigs,
         { migrateWorkflowManagerParticipantManagement }
       ),
+      chatCustomAvatars: this.normalizeCustomAvatars(settings.chatCustomAvatars),
       chatParticipantSeedState: this.normalizeSeedState(settings.chatParticipantSeedState),
-      remoteSessionCleanupTombstones: this.normalizeRemoteSessionCleanupTombstones(
-        settings.remoteSessionCleanupTombstones
-      )
+      machines: this.normalizeMachines(settings.machines),
+      machineInstalls: this.normalizeMachineInstalls(settings.machineInstalls),
+      encryptedMachinePower: typeof settings.encryptedMachinePower === "string" && settings.encryptedMachinePower.trim()
+        ? settings.encryptedMachinePower : undefined,
+      encryptedMachinePowerPrevious: typeof settings.encryptedMachinePowerPrevious === "string" && settings.encryptedMachinePowerPrevious.trim()
+        ? settings.encryptedMachinePowerPrevious : undefined,
+      ...(typeof settings.machineAutoStopEnabled === "boolean" ? { machineAutoStopEnabled: settings.machineAutoStopEnabled } : {}),
+      ...(typeof settings.machineAutoStopChangedAt === "string" ? { machineAutoStopChangedAt: settings.machineAutoStopChangedAt } : {}),
+      ...hubSettingField(settings.hub),
+      machinePowerHandoffs: normalizeMachinePowerHandoffRecords(settings.machinePowerHandoffs).length
+        ? normalizeMachinePowerHandoffRecords(settings.machinePowerHandoffs)
+        : undefined,
+      encryptedMachinePairings: typeof settings.encryptedMachinePairings === "string" && settings.encryptedMachinePairings.trim()
+        ? settings.encryptedMachinePairings
+        : undefined,
+      // Read back, not rebuilt. This function returns an explicit object, so a
+      // field missing from it is dropped every time settings are read from
+      // disk -- and these four were. The roster was written and then forgotten
+      // on the next start: every device the owner trusted stopped being
+      // trusted, machines were handed an empty roster, and a revocation the
+      // owner made was forgotten just as completely.
+      trustedDevices: (settings.trustedDevices ?? []).filter(isTrustedDeviceRecord).map(record => ({ ...record })),
+      hubPhoneInvites: Array.isArray(settings.hubPhoneInvites)
+        ? settings.hubPhoneInvites.filter(isStoredHubPhoneInvite).map((invite) => ({ ...invite }))
+        : undefined,
+      machineDeviceRevocations: settings.machineDeviceRevocations && typeof settings.machineDeviceRevocations === "object"
+        ? { ...settings.machineDeviceRevocations } : undefined,
+      relayRemoval: isRelayRemovalRecord(settings.relayRemoval) ? { ...settings.relayRemoval } : undefined,
+      relayRemovalPending: isRelayRemovalPending(settings.relayRemovalPending)
+        ? { machines: settings.relayRemovalPending.machines.map((machine) => ({ id: machine.id, name: machine.name })), startKeyHanded: settings.relayRemovalPending.startKeyHanded } : undefined,
+      relayRemovalFailures: Array.isArray(settings.relayRemovalFailures)
+        ? settings.relayRemovalFailures.filter(isRelayRemovalFailure).map((failure) => ({
+          ...failure, ...(failure.dismissedMessages ? { dismissedMessages: [...failure.dismissedMessages] } : {})
+        })) : undefined,
+      // Read back too: dropped here, the 10-day rhythm of the question about
+      // unused machines restarted with every launch.
+      machineInactivityCheckAt: typeof settings.machineInactivityCheckAt === "string" ? settings.machineInactivityCheckAt : undefined
     };
+  }
+
+  private normalizeMachineInstalls(value: unknown): MachineInstallRecord[] | undefined {
+    if (!Array.isArray(value)) {
+      return undefined;
+    }
+    const records = value.flatMap((entry): MachineInstallRecord[] => {
+      if (!entry || typeof entry !== "object") {
+        return [];
+      }
+      const record = entry as Partial<MachineInstallRecord>;
+      const host = record.target && typeof record.target === "object" ? record.target.host : undefined;
+      if (typeof record.machineId !== "string" || !record.machineId.trim() || typeof host !== "string" || !host.trim()) {
+        return [];
+      }
+      return [{ ...record, machineId: record.machineId.trim() } as MachineInstallRecord];
+    });
+    return records.length > 0 ? records : undefined;
+  }
+
+  private normalizeMachines(value: unknown): MachineRecord[] | undefined {
+    if (!Array.isArray(value)) {
+      return undefined;
+    }
+    const machines = value.flatMap((entry): MachineRecord[] => {
+      if (!entry || typeof entry !== "object") {
+        return [];
+      }
+      const record = entry as Partial<MachineRecord>;
+      if (typeof record.id !== "string" || !record.id.trim() || typeof record.name !== "string" || typeof record.pairingKey !== "string" || !record.pairingKey.trim()) {
+        return [];
+      }
+      return [{
+        id: record.id.trim(),
+        name: record.name.trim() || "Machine",
+        ...(typeof record.awsInstanceId === "string" && /^i-[a-f0-9]+$/.test(record.awsInstanceId) ? { awsInstanceId: record.awsInstanceId } : {}),
+        deviceId: typeof record.deviceId === "string" ? record.deviceId : "",
+        pairingKey: record.pairingKey.trim(),
+        createdAt: typeof record.createdAt === "string" ? record.createdAt : new Date(0).toISOString(),
+        ...(typeof record.lastSeenAt === "string" ? { lastSeenAt: record.lastSeenAt } : {}),
+        ...(record.lastHello && typeof record.lastHello === "object" ? { lastHello: record.lastHello } : {}),
+        ...(typeof record.devicePublicKeyDerBase64 === "string" && record.devicePublicKeyDerBase64 ? { devicePublicKeyDerBase64: record.devicePublicKeyDerBase64 } : {})
+      }];
+    });
+    return machines.length > 0 ? machines : undefined;
   }
 
   private normalizeChatProviderKind(value: unknown): ChatProviderKind | undefined {
@@ -2871,7 +3248,29 @@ export class SettingsService {
   }
 
   private normalizeRepoFileOpenAction(action: unknown): RepoFileOpenAction | undefined {
-    return action === "open" || action === "reveal" || action === "intellij-idea" ? action : undefined;
+    return action === "open" || action === "reveal" || action === "intellij-idea" || action === "panel" ? action : undefined;
+  }
+
+  private normalizeRepoFileExternalOpenAction(action: unknown): RepoFileExternalOpenAction | undefined {
+    return action === "open" || action === "intellij-idea" ? action : undefined;
+  }
+
+  /**
+   * The file panel became the default click on 2026-10-30. The first read after
+   * that moves the User's earlier choice to the panel's "Open in…" button and
+   * makes the click open the panel, once: the flag is read back here, so a later
+   * choice is never overwritten.
+   */
+  private mergeRepoFileOpenSettings(settings: StoredSettings): Pick<StoredSettings, "repoFileOpenAction" | "repoFileExternalOpenAction" | "repoFileOpenPanelMigrated"> {
+    const action = this.normalizeRepoFileOpenAction(settings.repoFileOpenAction);
+    const external = this.normalizeRepoFileExternalOpenAction(settings.repoFileExternalOpenAction);
+    if (settings.repoFileOpenPanelMigrated === true) {
+      return { repoFileOpenAction: action, repoFileExternalOpenAction: external, repoFileOpenPanelMigrated: true };
+    }
+    // Only an explicit earlier choice is carried over. Without one, a file the
+    // panel does not show (an installer, an archive) still asks, as before.
+    const carried = action === "intellij-idea" || action === "open" ? action : undefined;
+    return { repoFileOpenAction: "panel", repoFileExternalOpenAction: carried ?? external, repoFileOpenPanelMigrated: true };
   }
 
   private normalizeBetaUpdates(value: unknown): boolean {
@@ -2917,7 +3316,7 @@ export class SettingsService {
   private encodeAgentEnvironmentValue(value: string): { encryptedValue: string; protection: AgentEnvironmentValueProtection } {
     if (this.safeStorageEncryptionAvailable()) {
       return {
-        encryptedValue: safeStorage.encryptString(value).toString("base64"),
+        encryptedValue: hostPlatform().secrets.encryptString(value).toString("base64"),
         protection: "os-encrypted"
       };
     }
@@ -2934,7 +3333,7 @@ export class SettingsService {
         if (!this.safeStorageEncryptionAvailable()) {
           return undefined;
         }
-        return safeStorage.decryptString(buffer);
+        return hostPlatform().secrets.decryptString(buffer);
       }
       return buffer.toString("utf8");
     } catch {
@@ -2954,43 +3353,7 @@ export class SettingsService {
   }
 
   private safeStorageEncryptionAvailable(): boolean {
-    return Boolean(safeStorage?.isEncryptionAvailable?.());
-  }
-
-  private async withRemoteSessionCleanupMutation<T>(action: () => Promise<T>): Promise<T> {
-    const previous = this.remoteSessionCleanupMutation ?? Promise.resolve();
-    let release!: () => void;
-    const step = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.remoteSessionCleanupMutation = previous.catch(() => undefined).then(() => step);
-    await previous.catch(() => undefined);
-    try {
-      return await action();
-    } finally {
-      release();
-    }
-  }
-
-  private async readRemoteSessionCleanupTombstones(): Promise<RemoteSessionCleanupTombstone[]> {
-    try {
-      const raw = await readFile(this.remoteSessionCleanupPath, "utf8");
-      return this.normalizeRemoteSessionCleanupTombstones(JSON.parse(raw));
-    } catch {
-      const stored = await this.readStored();
-      const migrated = this.normalizeRemoteSessionCleanupTombstones(stored.remoteSessionCleanupTombstones);
-      if (migrated.length > 0) {
-        await this.writeRemoteSessionCleanupTombstones(migrated);
-      }
-      return migrated;
-    }
-  }
-
-  private async writeRemoteSessionCleanupTombstones(items: RemoteSessionCleanupTombstone[]): Promise<void> {
-    await mkdir(path.dirname(this.remoteSessionCleanupPath), { recursive: true });
-    const temporaryPath = `${this.remoteSessionCleanupPath}.${randomUUID()}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify(items, null, 2)}\n`, "utf8");
-    await rename(temporaryPath, this.remoteSessionCleanupPath);
+    return hostPlatform().secrets.isEncryptionAvailable();
   }
 
   private normalizedStringList(value: unknown): string[] {
@@ -3000,56 +3363,6 @@ export class SettingsService {
     return [...new Set(value.flatMap((item) =>
       typeof item === "string" && item.trim() ? [item.trim()] : []
     ))];
-  }
-
-  private normalizeRemoteSessionCleanupTombstones(value: unknown): RemoteSessionCleanupTombstone[] {
-    if (!Array.isArray(value)) {
-      return [];
-    }
-    const normalized: RemoteSessionCleanupTombstone[] = [];
-    for (const item of value) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) {
-        continue;
-      }
-      const record = item as Partial<RemoteSessionCleanupTombstone>;
-      const handle = record.handle;
-      if (!handle || typeof handle !== "object" || Array.isArray(handle)) {
-        continue;
-      }
-      const worker = normalizeCloudRunWorkerSettings(handle.worker);
-      if (
-        typeof record.id !== "string" || !record.id.trim() ||
-        typeof record.createdAt !== "string" ||
-        typeof handle.sessionKey !== "string" || !handle.sessionKey.trim() ||
-        typeof handle.sessionDir !== "string" || !handle.sessionDir.trim() ||
-        typeof handle.runtimeFingerprint !== "string" || !handle.runtimeFingerprint.trim() ||
-        typeof handle.protocolVersion !== "number" || !Number.isFinite(handle.protocolVersion) ||
-        typeof handle.updatedAt !== "string" ||
-        !worker.host ||
-        !isRemoteSessionCleanupReason(record.reason)
-      ) {
-        continue;
-      }
-      normalized.push({
-        id: record.id,
-        reason: record.reason,
-        createdAt: record.createdAt,
-        conversationId: typeof record.conversationId === "string" ? record.conversationId.trim() || undefined : undefined,
-        participantId: typeof record.participantId === "string" ? record.participantId.trim() || undefined : undefined,
-        runIds: this.normalizedStringList(record.runIds),
-        providerSessionIds: this.normalizedStringList(record.providerSessionIds),
-        removeArtifacts: record.removeArtifacts === true,
-        handle: {
-          sessionKey: handle.sessionKey,
-          sessionDir: handle.sessionDir,
-          worker,
-          protocolVersion: Math.max(1, Math.floor(handle.protocolVersion)),
-          runtimeFingerprint: handle.runtimeFingerprint,
-          updatedAt: handle.updatedAt
-        }
-      });
-    }
-    return normalized;
   }
 
   private normalizeCloudRunsSettings(stored: StoredSettings): CloudRunsSettings {
@@ -3082,8 +3395,8 @@ export class SettingsService {
   async saveAwsWorkerCredentials(credentials: AwsWorkerCredentials): Promise<void> {
     const stored = await this.readStored();
     const json = JSON.stringify(credentials);
-    stored.encryptedAwsCredentials = safeStorage.isEncryptionAvailable()
-      ? safeStorage.encryptString(json).toString("base64")
+    stored.encryptedAwsCredentials = hostPlatform().secrets.isEncryptionAvailable()
+      ? hostPlatform().secrets.encryptString(json).toString("base64")
       : Buffer.from(json, "utf8").toString("base64");
     stored.awsWorkerRegion = credentials.region;
     stored.cloudRunsMode = "aws";
@@ -3097,8 +3410,8 @@ export class SettingsService {
     }
     try {
       const buffer = Buffer.from(stored.encryptedAwsCredentials, "base64");
-      const json = safeStorage.isEncryptionAvailable()
-        ? safeStorage.decryptString(buffer)
+      const json = hostPlatform().secrets.isEncryptionAvailable()
+        ? hostPlatform().secrets.decryptString(buffer)
         : buffer.toString("utf8");
       const parsed = JSON.parse(json) as Partial<AwsWorkerCredentials>;
       if (parsed.accessKeyId && parsed.secretAccessKey && parsed.region) {
@@ -3119,13 +3432,638 @@ export class SettingsService {
   async saveAwsWorkerConnection(credentials: AwsWorkerCredentials, handle: AwsWorkerHandleInfo): Promise<void> {
     const stored = await this.readStored();
     const json = JSON.stringify(credentials);
-    stored.encryptedAwsCredentials = safeStorage.isEncryptionAvailable()
-      ? safeStorage.encryptString(json).toString("base64")
+    stored.encryptedAwsCredentials = hostPlatform().secrets.isEncryptionAvailable()
+      ? hostPlatform().secrets.encryptString(json).toString("base64")
       : Buffer.from(json, "utf8").toString("base64");
     stored.awsWorkerRegion = credentials.region;
     stored.awsWorkerHandle = handle;
     stored.cloudRunsMode = "aws";
+    // Another instance is connected: the old one's removal is no longer news.
+    stored.awsWorkerGoneNotice = undefined;
     await this.writeStored(stored);
+  }
+
+  // Machines transport: enrolled machines and their sealed pairing packages.
+  async listMachines(): Promise<MachineRecord[]> {
+    const stored = await this.readStored();
+    return (stored.machines ?? []).map((machine) => ({ ...machine }));
+  }
+
+  async saveMachine(record: MachineRecord, pairing?: MobilePairingPackage): Promise<MachineRecord[]> {
+    const stored = await this.readStored();
+    const machines = (stored.machines ?? []).filter((machine) => machine.id !== record.id);
+    machines.push({ ...record });
+    stored.machines = machines;
+    if (pairing) {
+      const pairings = this.readMachinePairings(stored);
+      pairings[record.pairingKey] = pairing;
+      stored.encryptedMachinePairings = this.sealJson(JSON.stringify(pairings));
+    }
+    await this.writeStored(stored);
+    return machines.map((machine) => ({ ...machine }));
+  }
+
+  private enrollmentRecovery: Promise<unknown> = Promise.resolve();
+
+  restoreMachineEnrollment(id: string, requested: MobilePairingPackage, installed: MobilePairingPackage, installedMachineId = id): Promise<MachineRecord> {
+    const expected = structuredClone(requested), existing = structuredClone(installed);
+    const task = this.enrollmentRecovery.then(() => this.commitMachineEnrollment(id, expected, existing, installedMachineId));
+    this.enrollmentRecovery = task.catch(() => undefined);
+    return task;
+  }
+
+  private async commitMachineEnrollment(id: string, requested: MobilePairingPackage, installed: MobilePairingPackage, installedMachineId: string): Promise<MachineRecord> {
+    assertRecoverableMachineEnrollment(requested, installed);
+    if (!installedMachineId.trim() || installedMachineId.length > 256) throw new Error("The saved machine identity is invalid.");
+    const stored = await this.readStored();
+    if (this.storedReadError) throw new Error("Settings could not be read; the saved connection was left untouched.");
+    const record = stored.machines?.find(machine => machine.id === id);
+    const pairings = this.readMachinePairings(stored);
+    if (!record) {
+      const restored = stored.machines?.find(machine => machine.id === installedMachineId);
+      if (restored?.pairingKey === installed.rendezvousId && isDeepStrictEqual(pairings[restored.pairingKey], installed)) return { ...restored };
+      throw new Error("Machine not found.");
+    }
+    if (record.id === installedMachineId && record.pairingKey === installed.rendezvousId && isDeepStrictEqual(pairings[record.pairingKey], installed)) return { ...record };
+    if (record.lastHello?.activeRunIds?.length) {
+      throw new Error("The machine has pending actions. Finish them before restoring its connection.");
+    }
+    if (record.pairingKey !== requested.rendezvousId || !isDeepStrictEqual(pairings[record.pairingKey], requested)) {
+      throw new Error("The machine connection changed during setup. Try again.");
+    }
+    if (installedMachineId !== id && (record.deviceId || stored.machines?.some(machine => machine.id === installedMachineId))) {
+      throw new Error("A connected machine identity cannot be replaced. The saved connection was kept.");
+    }
+    if (stored.machines?.some(machine => machine.id !== id && machine.pairingKey === installed.rendezvousId)) {
+      throw new Error("This installation is already connected as another machine on this desktop.");
+    }
+    const restored = { ...record, id: installedMachineId, pairingKey: installed.rendezvousId };
+    pairings[installed.rendezvousId] = installed;
+    // Commit the route and its sealed capability together, before reconnecting.
+    // Do not mutate readStored's object: a failed write must retain the old route.
+    await this.writeStored({ ...stored,
+      machines: stored.machines!.map(machine => machine.id === id ? restored : machine),
+      machineInstalls: stored.machineInstalls?.map(install => install.machineId === id ? { ...install, machineId: installedMachineId,
+        lastOperation: install.lastOperation ? { ...install.lastOperation, machineId: installedMachineId } : undefined } : install),
+      encryptedMachinePairings: this.sealJson(JSON.stringify(pairings))
+    }, true);
+    return restored;
+  }
+
+  async removeMachine(id: string): Promise<MachineRecord[]> {
+    const stored = await this.readStored();
+    const removed = (stored.machines ?? []).find((machine) => machine.id === id);
+    stored.machines = (stored.machines ?? []).filter((machine) => machine.id !== id);
+    // A removed machine must not leave this desktop's way into it behind.
+    const installs = (stored.machineInstalls ?? []).filter((record) => record.machineId !== id);
+    stored.machineInstalls = installs.length ? installs : undefined;
+    if (removed) {
+      const pairings = this.readMachinePairings(stored);
+      delete pairings[removed.pairingKey];
+      stored.encryptedMachinePairings = this.sealJson(JSON.stringify(pairings));
+    }
+    await this.writeStored(stored);
+    return (stored.machines ?? []).map((machine) => ({ ...machine }));
+  }
+
+  /** Machine install records (machines transport, install/upgrade). Kept next
+   *  to the machine records but deliberately outside the settings snapshot a
+   *  machine receives. */
+  /** The devices the User trusts with their machines. */
+  async listTrustedDevices(): Promise<TrustedDeviceRecord[]> {
+    const stored = await this.readStored();
+    if (this.storedReadError) throw new Error("Trusted devices could not be read; the stored list was left untouched.");
+    return (stored.trustedDevices ?? []).filter(isTrustedDeviceRecord).map(({ channelSealKeyBase64: _legacyKey, ...record }) => record);
+  }
+
+  /**
+   * Adds or replaces a trusted device.
+   *
+   * The id has to be the one its key produces: a device is identified by its
+   * signing key, and accepting a mismatched pair would trust a name rather
+   * than a key.
+   */
+  private trustedDeviceQueue?: Promise<void>;
+
+  private serializeDeviceTrust<T>(work: () => Promise<T>): Promise<T> {
+    const next = (this.trustedDeviceQueue ?? Promise.resolve()).then(work);
+    this.trustedDeviceQueue = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  saveTrustedDevice(record: TrustedDeviceRecord): Promise<TrustedDeviceRecord[]> {
+    return this.serializeDeviceTrust(async () => {
+      if (!isTrustedDeviceRecord(record) || !trustedDeviceIdMatchesKey(record, bytes => createHash("sha256").update(bytes).digest("hex"))) {
+        throw new Error("The trusted device identity does not match its signing key.");
+      }
+      const stored = await this.readStored();
+      if (this.storedReadError) throw new Error("Trusted devices could not be read; the stored list was left untouched.");
+      const records = (stored.trustedDevices ?? []).filter(entry => entry.deviceId !== record.deviceId);
+      const { channelSealKeyBase64: _legacyKey, ...publicRecord } = record;
+      records.push(publicRecord);
+      stored.trustedDevices = records;
+      await this.writeStored(stored, true);
+      return records.map(entry => ({ ...entry }));
+    });
+  }
+
+  private removeDeviceTrust(stored: StoredSettings, deviceId: string): void {
+    stored.trustedDevices = (stored.trustedDevices ?? []).filter(entry => entry.deviceId !== deviceId);
+    stored.machineDeviceRevocations = { ...stored.machineDeviceRevocations, [deviceId]: new Date().toISOString() };
+  }
+
+  removeTrustedDevice(deviceId: string): Promise<TrustedDeviceRecord[]> {
+    return this.serializeDeviceTrust(async () => {
+      const stored = await this.readStored();
+      if (this.storedReadError) throw new Error("Trusted devices could not be read; the stored list was left untouched.");
+      this.removeDeviceTrust(stored, deviceId);
+      // The invite it enrolled with is settled as revoked: it can never bring
+      // the phone back, on the server or on a machine.
+      stored.hubPhoneInvites = (stored.hubPhoneInvites ?? []).map((invite) =>
+        invite.deviceId === deviceId ? { ...invite, state: "revoked" as const, settledAt: new Date().toISOString() } : invite);
+      await this.writeStored(stored, true);
+      return (stored.trustedDevices ?? []).map(entry => ({ ...entry }));
+    });
+  }
+
+  /** A phone invite this desktop just registered with its server. */
+  savePhoneInvite(invite: Omit<StoredHubPhoneInvite, "state">): Promise<void> {
+    return this.serializeDeviceTrust(async () => {
+      const stored = await this.readStored();
+      if (this.storedReadError) throw new Error("Settings could not be read; nothing was changed.");
+      const kept = (stored.hubPhoneInvites ?? []).filter((entry) => entry.inviteId !== invite.inviteId);
+      kept.push({ ...invite, state: "pending" });
+      // The settled ones are what the server and the machines are told; an
+      // unused one that expired is of no use to anyone.
+      const now = Date.now();
+      stored.hubPhoneInvites = keptPhoneInvites(kept
+        .filter((entry) => entry.state !== "pending" || Date.parse(entry.expiresAt) > now - HUB_PHONE_INVITE_MAX_LIFETIME_MS));
+      await this.writeStored(stored, true);
+    });
+  }
+
+  /**
+   * A phone that enrolled with one of this desktop's invites (its certificate
+   * already checked against this desktop's key). Trusted unless the invite
+   * was revoked: then it stays out, whatever it shows again.
+   */
+  admitInvitedPhone(record: TrustedDeviceRecord & { inviteId: string }): Promise<boolean> {
+    return this.serializeDeviceTrust(async () => {
+      if (!isTrustedDeviceRecord(record) || !trustedDeviceIdMatchesKey(record, bytes => createHash("sha256").update(bytes).digest("hex"))) {
+        throw new Error("The phone's identity does not match its signing key.");
+      }
+      const stored = await this.readStored();
+      if (this.storedReadError) throw new Error("Trusted devices could not be read; the stored list was left untouched.");
+      const invites = stored.hubPhoneInvites ?? [];
+      const invite = invites.find((entry) => entry.inviteId === record.inviteId);
+      if (invite?.state === "revoked") return false;
+      // A phone removed here comes back only through an invite this desktop
+      // knows; an old certificate it no longer has a record of does not.
+      if (!invite && stored.machineDeviceRevocations?.[record.deviceId]) return false;
+      if (invite?.state === "enrolled" && invite.deviceId && invite.deviceId !== record.deviceId) return false;
+      const settledAt = new Date().toISOString();
+      const next: StoredHubPhoneInvite = invite
+        ? { ...invite, state: "enrolled", deviceId: record.deviceId, settledAt }
+        : { inviteId: record.inviteId, issuedAt: record.addedAt, expiresAt: record.addedAt, state: "enrolled", deviceId: record.deviceId, settledAt };
+      // A phone paired again replaces its own old entry: the code it paired
+      // with before is settled, and no longer names it, so revoking that old
+      // code later cannot take the phone off.
+      const others = invites.filter((entry) => entry.inviteId !== record.inviteId).map((entry): StoredHubPhoneInvite => {
+        if (entry.deviceId !== record.deviceId) return entry;
+        const { deviceId: _replaced, ...rest } = entry;
+        return { ...rest, state: "revoked", settledAt };
+      });
+      stored.hubPhoneInvites = keptPhoneInvites([...others, next]);
+      const records = (stored.trustedDevices ?? []).filter((entry) => entry.deviceId !== record.deviceId);
+      records.push({ ...record });
+      stored.trustedDevices = records;
+      // A device removed before is trusted again only through a new invite,
+      // which this is.
+      if (stored.machineDeviceRevocations?.[record.deviceId]) {
+        const { [record.deviceId]: _removed, ...rest } = stored.machineDeviceRevocations;
+        stored.machineDeviceRevocations = rest;
+      }
+      await this.writeStored(stored, true);
+      return true;
+    });
+  }
+
+  /** Revokes an invite: unused, it can no longer be used; used, its phone
+   *  is removed. Returns the phone removed, if any. */
+  revokePhoneInvite(inviteId: string): Promise<string | undefined> {
+    return this.serializeDeviceTrust(async () => {
+      const stored = await this.readStored();
+      if (this.storedReadError) throw new Error("Settings could not be read; nothing was changed.");
+      const invite = (stored.hubPhoneInvites ?? []).find((entry) => entry.inviteId === inviteId);
+      if (!invite) return undefined;
+      const deviceId = invite.deviceId;
+      if (deviceId) this.removeDeviceTrust(stored, deviceId);
+      stored.hubPhoneInvites = (stored.hubPhoneInvites ?? []).map((entry) =>
+        entry.inviteId === inviteId ? { ...entry, state: "revoked" as const, settledAt: new Date().toISOString() } : entry);
+      await this.writeStored(stored, true);
+      return deviceId;
+    });
+  }
+
+  async listPhoneInvites(): Promise<StoredHubPhoneInvite[]> {
+    const stored = await this.readStored();
+    if (this.storedReadError) throw new Error("Settings could not be read.");
+    return (stored.hubPhoneInvites ?? []).map((invite) => ({ ...invite }));
+  }
+
+  /** The invites the server and the machines are told are settled. */
+  async resolvedPhoneInviteIds(): Promise<string[]> {
+    return (await this.listPhoneInvites()).filter((invite) => invite.state !== "pending").map((invite) => invite.inviteId);
+  }
+
+  /**
+   * The machines that were enrolled with the shared relay: their enrollment
+   * names no server of the User's, so they can never connect again. Every
+   * machine set up since names the server, so this empties as they go.
+   */
+  async relayEraMachines(): Promise<MachineRecord[]> {
+    const stored = await this.readStored();
+    if (this.storedReadError) throw new Error("Settings could not be read; nothing was changed.");
+    const pairings = this.readMachinePairings(stored);
+    return (stored.machines ?? []).filter((machine) => {
+      const pairing = pairings[machine.pairingKey];
+      return Boolean(pairing) && !pairing.hubUrl;
+    }).map((machine) => ({ ...machine }));
+  }
+
+  /** What a removal found before it takes anything off, merged with what an
+   *  earlier, unfinished one found: the record names all of it. */
+  beginRelayRemoval(found: { machines: Array<{ id: string; name: string }>; startKeyHanded: boolean }): Promise<void> {
+    return this.serializeDeviceTrust(async () => {
+      const stored = await this.readStored();
+      if (this.storedReadError) throw new Error("Settings could not be read; nothing was changed.");
+      if (stored.relayRemoval) return;
+      const before = stored.relayRemovalPending;
+      stored.relayRemovalPending = {
+        machines: [...(before?.machines ?? []), ...found.machines.filter((machine) => !before?.machines.some((known) => known.id === machine.id))]
+          .map((machine) => ({ id: machine.id, name: machine.name })),
+        startKeyHanded: Boolean(before?.startKeyHanded) || found.startKeyHanded
+      };
+      await this.writeStored(stored, true);
+    });
+  }
+
+  /**
+   * Takes what was set up through the shared relay off this desktop, once:
+   * the phones paired through it (a phone paired with the User's server has
+   * the invite it enrolled with), and the files the relay's pairings kept.
+   * The machines went first, through the usual removal (relayEraMachines);
+   * what was found is recorded, but for the machines whose ids
+   * are in `notRemoved` (their removal failed; tried again at each start).
+   * Returns the record, or undefined when this was done before.
+   */
+  finishRelayRemoval(notRemoved: string[] = []): Promise<RelayRemovalRecord | undefined> {
+    return this.serializeDeviceTrust(async () => {
+      const stored = await this.readStored();
+      if (this.storedReadError) throw new Error("Settings could not be read; nothing was changed.");
+      if (stored.relayRemoval) return undefined;
+      const phones = (stored.trustedDevices ?? []).filter((device) => device.role === "phone" && !device.inviteId);
+      stored.trustedDevices = (stored.trustedDevices ?? []).filter((device) => !phones.includes(device));
+      // The files only the relay's phone pairings used; they hold its keys.
+      for (const name of ["mobile-paired-devices.json", "pending-mailbox-revocations.json"]) {
+        await rm(path.join(userDataPath(), name), { force: true });
+      }
+      stored.relayRemoval = {
+        removedAt: new Date().toISOString(),
+        machines: (stored.relayRemovalPending?.machines ?? []).filter((machine) => !notRemoved.includes(machine.id)).map((machine) => machine.name),
+        phones: phones.map((phone) => phone.name),
+        startKeyHanded: stored.relayRemovalPending?.startKeyHanded ?? false
+      };
+      delete stored.relayRemovalPending;
+      await this.writeStored(stored, true);
+      return { ...stored.relayRemoval };
+    });
+  }
+
+  /** Relay machines a later start removed (after failing before): added to
+   *  the record. */
+  noteRelayMachinesRemoved(names: string[]): Promise<void> {
+    return this.serializeDeviceTrust(async () => {
+      if (names.length === 0) return;
+      const stored = await this.readStored();
+      if (this.storedReadError) throw new Error("Settings could not be read; nothing was changed.");
+      if (!stored.relayRemoval) return;
+      stored.relayRemoval = { ...stored.relayRemoval, machines: [...stored.relayRemoval.machines, ...names] };
+      await this.writeStored(stored, true);
+    });
+  }
+
+  /** The relay machines whose removal failed at this start, replacing the
+   *  last start's; one removed (or gone) is dropped. */
+  noteRelayRemovalFailures(failures: Array<{ machineId: string; machine: string; message: string }>): Promise<void> {
+    return this.serializeDeviceTrust(async () => {
+      const stored = await this.readStored();
+      if (this.storedReadError) throw new Error("Settings could not be read; nothing was changed.");
+      const before = stored.relayRemovalFailures ?? [];
+      if (failures.length === 0 && before.length === 0) return;
+      const at = new Date().toISOString();
+      const next = failures.map((failure): RelayRemovalFailure => {
+        const earlier = before.find((entry) => entry.machineId === failure.machineId);
+        return {
+          ...failure,
+          at: earlier && earlier.message === failure.message ? earlier.at : at
+        };
+      });
+      if (JSON.stringify(next) === JSON.stringify(before)) return;
+      if (next.length) stored.relayRemovalFailures = next;
+      else delete stored.relayRemovalFailures;
+      await this.writeStored(stored, true);
+    });
+  }
+
+  async relayRemovalFailures(): Promise<RelayRemovalFailure[]> {
+    const stored = await this.readStored();
+    return (stored.relayRemovalFailures ?? []).map((failure) => ({ ...failure }));
+  }
+
+  async relayRemoval(): Promise<RelayRemovalRecord | undefined> {
+    const stored = await this.readStored();
+    return stored.relayRemoval ? { ...stored.relayRemoval } : undefined;
+  }
+
+  async listMachineInstalls(): Promise<MachineInstallRecord[]> {
+    const stored = await this.readStored();
+    return (stored.machineInstalls ?? []).map((record) => ({ ...record }));
+  }
+
+  async getMachineInstall(machineId: string): Promise<MachineInstallRecord | undefined> {
+    const stored = await this.readStored();
+    const found = (stored.machineInstalls ?? []).find((record) => record.machineId === machineId);
+    return found ? { ...found } : undefined;
+  }
+
+  async saveMachineInstall(record: MachineInstallRecord): Promise<void> {
+    const stored = await this.readStored();
+    const records = (stored.machineInstalls ?? []).filter((entry) => entry.machineId !== record.machineId);
+    records.push({ ...record });
+    stored.machineInstalls = records;
+    await this.writeStored(stored);
+  }
+
+  async removeMachineInstall(machineId: string): Promise<void> {
+    const stored = await this.readStored();
+    const records = (stored.machineInstalls ?? []).filter((entry) => entry.machineId !== machineId);
+    stored.machineInstalls = records.length ? records : undefined;
+    await this.writeStored(stored);
+  }
+
+  async getMachinePairing(pairingKey: string): Promise<MobilePairingPackage | undefined> {
+    const stored = await this.readStored();
+    return this.readMachinePairings(stored)[pairingKey];
+  }
+
+  /** The hub this desktop syncs with. `ACCORDAGENTS_HUB_URL` points a local
+   *  run at a test hub. An address that is neither HTTPS nor on this
+   *  computer is not used. */
+  async getHubConfig(): Promise<HubLinkConfig | undefined> {
+    const override = process.env.ACCORDAGENTS_HUB_URL?.trim();
+    if (override) return isAcceptableHubUrl(override) ? { url: override } : undefined;
+    const stored = (await this.readStored()).hub;
+    return stored && typeof stored.url === "string" && isAcceptableHubUrl(stored.url) ? stored : undefined;
+  }
+
+  /** Setup writes this once the User's hub answers (the hub setup flow). */
+  async saveHubConfig(config: HubLinkConfig | undefined): Promise<void> {
+    if (config && !isAcceptableHubUrl(config.url)) throw new Error("A hub is reached over HTTPS.");
+    const stored = await this.readStored();
+    if (this.storedReadError) throw new Error("Settings could not be read; nothing was changed.");
+    if (config) stored.hub = { url: config.url, ...(config.hubId ? { hubId: config.hubId } : {}), ...(config.hubKey ? { hubKey: config.hubKey } : {}), ...(config.server ? { server: config.server } : {}) };
+    else delete stored.hub;
+    await this.writeStored(stored, true);
+  }
+
+  /** Whether the User left automatic stop on; the stop key is separate. */
+  async getMachineAutoStopEnabled(): Promise<boolean> {
+    const stored = await this.readStored();
+    // An unreadable file is not a switch left on: the machine must not stop
+    // the instance on defaults the User never chose.
+    if (this.storedReadError) throw new Error("Settings could not be read; automatic stop waits until they can.");
+    return stored.machineAutoStopEnabled !== false;
+  }
+
+  async getMachineAutoStopChangedAt(): Promise<string | undefined> {
+    return (await this.readStored()).machineAutoStopChangedAt;
+  }
+
+  async setMachineAutoStopEnabled(enabled: boolean): Promise<void> {
+    const stored = await this.readStored();
+    if (this.storedReadError) throw new Error("Settings could not be read; nothing was changed.");
+    stored.machineAutoStopEnabled = enabled === true;
+    stored.machineAutoStopChangedAt = new Date().toISOString();
+    await this.writeStored(stored, true);
+  }
+
+  async getMachinePower(): Promise<AwsMachinePowerConfig | undefined> {
+    const stored = await this.readStored();
+    if (this.storedReadError) throw new Error("Machine power settings could not be read; an unreadable file is not an absent power key.");
+    if (!stored.encryptedMachinePower) return undefined;
+    const config: unknown = JSON.parse(this.openJson(stored.encryptedMachinePower));
+    assertAwsMachinePowerConfig(config);
+    return config;
+  }
+
+  /** Start-key handoffs to devices (Rule 3). Records only; the key itself is
+   *  the phone's start key in the AWS credentials, and reaches a device only
+   *  inside its pairing link. */
+  async listMachinePowerHandoffs(): Promise<MachinePowerHandoffRecord[]> {
+    const stored = await this.readStored();
+    return (stored.machinePowerHandoffs ?? []).map((record) => ({ ...record }));
+  }
+
+  async saveMachinePowerHandoffs(records: MachinePowerHandoffRecord[]): Promise<void> {
+    const stored = await this.readStored();
+    await this.writeStored({ ...stored, machinePowerHandoffs: records.length ? records.map((r) => ({ ...r })) : undefined }, true);
+  }
+
+  /** Puts back the power key the last save replaced (none, if there was
+   *  none): the runtime did not come back after a handover, and the key it
+   *  ran with before is the one known to work. */
+  async revertMachinePower(): Promise<void> {
+    const stored = await this.readStored();
+    if (this.storedReadError) throw new Error("Machine power settings could not be read; the existing file was left untouched.");
+    const previous = stored.encryptedMachinePowerPrevious;
+    if (!previous) return;
+    await this.writeStored({ ...stored, encryptedMachinePower: previous === NO_MACHINE_POWER ? undefined : previous, encryptedMachinePowerPrevious: undefined }, true);
+  }
+
+  async saveMachinePower(config: AwsMachinePowerConfig): Promise<void> {
+    assertAwsMachinePowerConfig(config);
+    const stored = await this.readStored();
+    if (this.storedReadError) throw new Error("Machine power settings could not be read; the existing file was left untouched.");
+    await this.writeStored({
+      ...stored,
+      encryptedMachinePower: this.sealJson(JSON.stringify(config)),
+      encryptedMachinePowerPrevious: stored.encryptedMachinePower ?? NO_MACHINE_POWER
+    }, true);
+  }
+
+  /** What a machine needs to run participants exactly like this desktop:
+   *  roles, rules, saved prompts, participant presets, prompt-context and
+   *  limit settings, and the manually configured agent environment values.
+   *  Dedicated provider/AWS credentials and machine records are excluded;
+   *  secrets explicitly configured in agent environment variables travel. */
+  async exportMachineSettingsSnapshot(): Promise<MachineSettingsSnapshot> {
+    const stored = await this.readStored();
+    const {
+      providers: _providers,
+      encryptedAwsCredentials: _aws,
+      awsWorkerHandle: _handle,
+      awsWorkerRegion: _region,
+      awsWorkerOperation: _operation,
+      awsWorkerProvisioningToken: _token,
+      awsWorkerSpecAcceptance: _spec,
+      awsWorkerVolumeExpansion: _volume,
+      awsWorkerGoneNotice: _goneNotice,
+      leavingMachines: _leavingMachines,
+      cloudRuns: _cloudRuns,
+      cloudRunsMode: _cloudRunsMode,
+      cloudRunsDeviceId: _cloudRunsDeviceId,
+      agentEnvironment: _agentEnvironment,
+      machines: _machines,
+      machineInstalls: _machineInstalls,
+      encryptedMachinePairings: _pairings,
+      encryptedMachinePower: _power,
+      encryptedMachinePowerPrevious: _previousPower,
+      machinePowerHandoffs: _powerHandoffs,
+      trustedDevices: _trustedDevices,
+      hubPhoneInvites: _hubPhoneInvites,
+      machineDeviceRevocations: _machineDeviceRevocations,
+      relayRemoval: _relayRemoval,
+      relayRemovalPending: _relayRemovalPending,
+      relayRemovalFailures: _relayRemovalFailures,
+      machineInactivityCheckAt: _machineInactivityCheckAt,
+      lastRepoPath: _lastRepoPath,
+      ...shareable
+    } = stored;
+    // A partial export would remove the unreadable variable on the receiver.
+    // Read the same snapshot and fail before publishing anything instead.
+    const environment = this.readManualAgentEnvironment(stored, true);
+    return {
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      settingsJson: JSON.stringify(shareable),
+      agentEnvironment: Object.entries(environment.env)
+        .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+        .map(([key, value]) => ({ key, value }))
+    };
+  }
+
+  /** Applies a desktop snapshot on a machine: shareable settings replace the
+   *  machine's copy, environment values are stored with the machine's own
+   *  secret store, and everything the machine owns (its records, providers)
+   *  is kept. */
+  async importMachineSettingsSnapshot(snapshot: MachineSettingsSnapshot): Promise<void> {
+    if (!snapshot || snapshot.version !== 1 || typeof snapshot.settingsJson !== "string") {
+      throw new Error("Machine settings snapshot is invalid.");
+    }
+    const incoming = JSON.parse(snapshot.settingsJson) as Partial<StoredSettings>;
+    if (!incoming || typeof incoming !== "object" || Array.isArray(incoming) || !Array.isArray(snapshot.agentEnvironment)) {
+      throw new Error("Machine settings snapshot is invalid.");
+    }
+    if (snapshot.agentEnvironment.length && !hostPlatform().secrets.isEncryptionAvailable()) {
+      throw new Error("Machine environment requires the machine's secret store.");
+    }
+    const now = new Date().toISOString();
+    const seen = new Set<string>();
+    const variables = snapshot.agentEnvironment.map((entry): StoredAgentEnvironmentVariable => {
+      if (!entry || typeof entry.value !== "string") throw new Error("Machine environment contains an invalid value.");
+      const key = assertAgentEnvironmentKeyAllowed(entry.key);
+      if (seen.has(key)) throw new Error("Machine environment contains a duplicate key.");
+      seen.add(key);
+      return { key, ...this.encodeAgentEnvironmentValue(entry.value), enabled: true, updatedAt: now };
+    });
+    const stored = await this.readStored();
+    const next: StoredSettings = {
+      ...stored,
+      ...incoming,
+      providers: stored.providers,
+      encryptedAwsCredentials: stored.encryptedAwsCredentials,
+      awsWorkerHandle: stored.awsWorkerHandle,
+      awsWorkerRegion: stored.awsWorkerRegion,
+      awsWorkerOperation: stored.awsWorkerOperation,
+      awsWorkerProvisioningToken: stored.awsWorkerProvisioningToken,
+      awsWorkerSpecAcceptance: stored.awsWorkerSpecAcceptance,
+      awsWorkerVolumeExpansion: stored.awsWorkerVolumeExpansion,
+      awsWorkerGoneNotice: stored.awsWorkerGoneNotice,
+      leavingMachines: stored.leavingMachines,
+      cloudRuns: stored.cloudRuns,
+      cloudRunsMode: stored.cloudRunsMode,
+      cloudRunsDeviceId: stored.cloudRunsDeviceId,
+      agentEnvironment: { variables },
+      machines: stored.machines,
+      machineInstalls: stored.machineInstalls,
+      encryptedMachinePairings: stored.encryptedMachinePairings,
+      encryptedMachinePower: stored.encryptedMachinePower,
+      encryptedMachinePowerPrevious: stored.encryptedMachinePowerPrevious,
+      machinePowerHandoffs: stored.machinePowerHandoffs,
+      trustedDevices: stored.trustedDevices,
+      hubPhoneInvites: stored.hubPhoneInvites,
+      machineDeviceRevocations: stored.machineDeviceRevocations,
+      relayRemoval: stored.relayRemoval,
+      relayRemovalPending: stored.relayRemovalPending,
+      relayRemovalFailures: stored.relayRemovalFailures,
+      machineInactivityCheckAt: stored.machineInactivityCheckAt,
+      lastRepoPath: stored.lastRepoPath
+    };
+    // One atomic settings write replaces both configuration and environment.
+    // A failed secret operation or disk write must not launch with a partially
+    // applied snapshot, or silently retain an obsolete environment variable.
+    await this.writeStored(next, true);
+  }
+
+  private readMachinePairings(stored: StoredSettings): Record<string, MobilePairingPackage> {
+    if (!stored.encryptedMachinePairings) {
+      return {};
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(this.openJson(stored.encryptedMachinePairings));
+    } catch (error) {
+      // Never treat an unreadable record as empty: a later save would replace
+      // every stored enrollment. The stored blob stays as it is.
+      throw new Error(
+        `Stored machine enrollments could not be read (${error instanceof Error ? error.message : String(error)}). ` +
+        "They were left untouched; if the system secret store changed, remove and re-enroll the machines."
+      );
+    }
+    return parsed && typeof parsed === "object" ? parsed as Record<string, MobilePairingPackage> : {};
+  }
+
+  // Machine pairings carry the key of a machine's first hello, so they are
+  // stored sealed or not at all; the format is marked so a later read never
+  // guesses.
+  private sealJson(json: string): string {
+    const secrets = hostPlatform().secrets;
+    if (!secrets.isEncryptionAvailable()) {
+      throw new Error("Machine enrollments need the system secret store, which is not available on this computer.");
+    }
+    return `sealed:${secrets.encryptString(json).toString("base64")}`;
+  }
+
+  private openJson(stored: string): string {
+    const secrets = hostPlatform().secrets;
+    if (stored.startsWith("sealed:")) {
+      if (!secrets.isEncryptionAvailable()) {
+        throw new Error("Machine enrollments are sealed with the system secret store, which is not available on this computer.");
+      }
+      return secrets.decryptString(Buffer.from(stored.slice("sealed:".length), "base64"));
+    }
+    // Records written before the format marker: sealed when a store existed,
+    // otherwise plain base64.
+    const buffer = Buffer.from(stored, "base64");
+    if (secrets.isEncryptionAvailable()) {
+      try {
+        return secrets.decryptString(buffer);
+      } catch {
+        return buffer.toString("utf8");
+      }
+    }
+    return buffer.toString("utf8");
   }
 
   async getCloudRunsDeviceId(): Promise<string> {
@@ -3171,6 +4109,67 @@ export class SettingsService {
   async getAwsWorkerVolumeExpansion(): Promise<AwsWorkerVolumeExpansion | undefined> {
     const stored = await this.readStored();
     return this.normalizeAwsWorkerVolumeExpansion(stored.awsWorkerVolumeExpansion);
+  }
+
+  /** Forgets the AWS instance `instanceId` in one write, and only while it
+   *  is still the saved one; false when another instance was saved meanwhile.
+   *  Without `keepCredentials` this app's AWS keys go too (Delete). The
+   *  notice, when given, is what the AWS page says about it; otherwise any
+   *  earlier one ends. */
+  async forgetAwsWorkerInstance(instanceId: string, options: {
+    keepCredentials: boolean;
+    notice?: AwsWorkerGoneNotice;
+    mode?: CloudRunWorkerMode;
+  }): Promise<boolean> {
+    const stored = await this.readStored();
+    if (stored.awsWorkerHandle?.instanceId !== instanceId) return false;
+    stored.awsWorkerHandle = undefined;
+    stored.awsWorkerOperation = undefined;
+    stored.awsWorkerSpecAcceptance = undefined;
+    stored.awsWorkerVolumeExpansion = undefined;
+    if (!options.keepCredentials) {
+      stored.encryptedAwsCredentials = undefined;
+      stored.awsWorkerRegion = undefined;
+      stored.awsWorkerProvisioningToken = undefined;
+    }
+    if (options.mode) stored.cloudRunsMode = options.mode;
+    stored.awsWorkerGoneNotice = normalizeAwsWorkerGoneNotice(options.notice);
+    await this.writeStored(stored);
+    return true;
+  }
+
+  async getAwsWorkerGoneNotice(): Promise<AwsWorkerGoneNotice | undefined> {
+    return normalizeAwsWorkerGoneNotice((await this.readStored()).awsWorkerGoneNotice);
+  }
+
+  /** Records machines that leave with their instance, before any is
+   *  removed. Returns the oldest entries the limit dropped, if any. */
+  async addLeavingMachines(entries: LeavingMachine[]): Promise<LeavingMachine[]> {
+    if (!entries.length) return [];
+    const stored = await this.readStored();
+    // An entry already waiting for removal (its instance was seen gone) is
+    // never turned into one the app may not remove.
+    const waiting = new Set((stored.leavingMachines ?? []).filter((entry) => !entry.unverified).map((entry) => entry.machineId));
+    const incoming = entries.filter((entry) => !(entry.unverified && waiting.has(entry.machineId)));
+    const ids = new Set(incoming.map((entry) => entry.machineId));
+    const all = normalizeLeavingMachines([...(stored.leavingMachines ?? []).filter((entry) => !ids.has(entry.machineId)),
+      ...incoming.map((entry) => structuredClone(entry))], Number.MAX_SAFE_INTEGER) ?? [];
+    const kept = all.slice(-LEAVING_MACHINES_LIMIT);
+    // A new object: a write that fails leaves the settings in memory as the
+    // disk has them.
+    await this.writeStored({ ...stored, leavingMachines: kept.length ? kept : undefined }, true);
+    return all.slice(0, all.length - kept.length);
+  }
+
+  async listLeavingMachines(): Promise<LeavingMachine[]> {
+    return (normalizeLeavingMachines((await this.readStored()).leavingMachines) ?? []).map((entry) => ({ ...entry }));
+  }
+
+  async clearLeavingMachine(machineId: string): Promise<void> {
+    const stored = await this.readStored();
+    if (!stored.leavingMachines?.some((entry) => entry.machineId === machineId)) return;
+    stored.leavingMachines = normalizeLeavingMachines(stored.leavingMachines.filter((entry) => entry.machineId !== machineId));
+    await this.writeStored(stored);
   }
 
   async saveAwsWorkerSpecAcceptance(instanceId: string, desired: AwsWorkerSpec): Promise<void> {
@@ -3236,6 +4235,7 @@ export class SettingsService {
       ...(typeof record.vCpu === "number" && record.vCpu > 0 ? { vCpu: Math.floor(record.vCpu) } : {}),
       ...(typeof record.memoryMiB === "number" && record.memoryMiB > 0 ? { memoryMiB: Math.floor(record.memoryMiB) } : {}),
       ...(typeof record.adopted === "boolean" ? { adopted: record.adopted } : {}),
+      ...(typeof record.lastKnownHost === "string" && record.lastKnownHost.trim() ? { lastKnownHost: record.lastKnownHost.trim() } : {}),
       createdAt: typeof record.createdAt === "string" && record.createdAt ? record.createdAt : new Date().toISOString()
     };
   }
@@ -3251,9 +4251,17 @@ export class SettingsService {
       || typeof record.message !== "string" || typeof record.updatedAt !== "string") {
       return undefined;
     }
+    // The page reads the steps as they are: anything else is dropped.
+    const stepIds = new Set(["instance", "tools", "sign-in-codex", "sign-in-claude", "program"]);
+    const stepStates = new Set(["pending", "current", "done", "skipped", "failed"]);
+    const setupSteps = Array.isArray(record.setupSteps) ? record.setupSteps.filter((step): step is AwsSetupStep => Boolean(step)
+      && typeof step === "object" && stepIds.has(step.id) && stepStates.has(step.state)
+      && (step.detail === undefined || typeof step.detail === "string") && (step.startedAt === undefined || typeof step.startedAt === "string")) : undefined;
+    const { setupSteps: _stored, ...rest } = record;
     return {
-      ...record,
+      ...rest,
       operationId: record.operationId.trim(),
+      ...(setupSteps?.length ? { setupSteps } : {}),
       ...(typeof record.clientToken === "string" && record.clientToken.trim()
         ? { clientToken: record.clientToken.trim().slice(0, 64) }
         : {})
@@ -3397,6 +4405,11 @@ export class SettingsService {
             ? { ...permissions, manageRolesParticipants: "allow" as const }
             : permissions,
           remoteExecution: this.normalizeRemoteExecutionMode((participant as { remoteExecution?: unknown }).remoteExecution),
+          cloudRun: cloudRunSelection((participant as { cloudRun?: unknown }).cloudRun),
+          homeMachineId: typeof (participant as { homeMachineId?: unknown }).homeMachineId === "string" &&
+            ((participant as { homeMachineId?: string }).homeMachineId ?? "").trim()
+            ? ((participant as { homeMachineId?: string }).homeMachineId ?? "").trim()
+            : undefined,
           skipToolchainPreflight: (participant as { skipToolchainPreflight?: unknown }).skipToolchainPreflight === true,
           autoWatchEnabled: this.autoWatchEnabledForRole(
             roleById.get(participant.roleConfigId) ?? { id: participant.roleConfigId },
@@ -3720,4 +4733,33 @@ export class SettingsService {
   private normalizeChatPromptContextSettings(value: unknown): ChatPromptContextSettings {
     return normalizeChatPromptContextSettings(value);
   }
+}
+
+/** A phone invite this desktop made, and what became of it. */
+export interface StoredHubPhoneInvite {
+  inviteId: string;
+  issuedAt: string;
+  expiresAt: string;
+  state: "pending" | "enrolled" | "revoked";
+  /** The phone that enrolled with it. */
+  deviceId?: string;
+  settledAt?: string;
+}
+
+/** Settled invites this desktop remembers (the newest). */
+const HUB_PHONE_INVITES_KEPT = 200;
+
+/** The phone invites kept: every revoked one (each keeps its phone out for
+ *  good), and the newest others. */
+function keptPhoneInvites(invites: StoredHubPhoneInvite[]): StoredHubPhoneInvite[] {
+  const revoked = invites.filter((invite) => invite.state === "revoked");
+  const others = invites.filter((invite) => invite.state !== "revoked").slice(-HUB_PHONE_INVITES_KEPT);
+  return [...revoked, ...others];
+}
+
+function isStoredHubPhoneInvite(value: unknown): value is StoredHubPhoneInvite {
+  const invite = value as Partial<StoredHubPhoneInvite> | undefined;
+  return Boolean(invite && typeof invite.inviteId === "string" && invite.inviteId && typeof invite.issuedAt === "string" &&
+    typeof invite.expiresAt === "string" && (invite.state === "pending" || invite.state === "enrolled" || invite.state === "revoked") &&
+    (invite.deviceId === undefined || typeof invite.deviceId === "string"));
 }

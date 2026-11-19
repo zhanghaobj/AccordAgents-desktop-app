@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { X } from "lucide-react";
 
 import type {
@@ -18,6 +19,7 @@ import type {
 import { Avatar } from "../avatar/avatar";
 import { MentionDirectoryContext, type ParticipantCompactHandler } from "../content/participant-hover-card";
 import { IconButton } from "../primitives";
+import { FilePanelOriginContext } from "../files/file-panel-context";
 import { avatarForChatParticipant } from "./chat-avatars";
 import { ChatComposer } from "./chat-composer";
 import {
@@ -34,6 +36,8 @@ export function ChatThreadPanel(props: {
   activityDisclosure: ChatActivityDisclosureState;
   rootMessage: Conversation["messages"][number];
   replies: Conversation["messages"][number][];
+  /** The replies the thread's count names (not a turn-finished note). */
+  replyCount: number;
   participants: ChatParticipant[];
   participantStatusById: ReadonlyMap<string, ChatParticipantRosterStatus>;
   conversationId?: string;
@@ -57,6 +61,7 @@ export function ChatThreadPanel(props: {
   onRejectMentions: (sourceMessageId: string, targetParticipantIds: string[]) => void;
   onRespondToChoice: (sourceMessageId: string, choiceId: string, response: ChatChoiceResponse) => void | Promise<void>;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  onDismissTurnFinishedNote?: (messageId: string) => void;
   onCompactParticipant: ParticipantCompactHandler;
   onStopRun?: (runId: string) => void;
   continuedMentionRequestIds: Set<string>;
@@ -72,17 +77,19 @@ export function ChatThreadPanel(props: {
   ) => Promise<void>;
 }): JSX.Element {
   const mentionDirectory = chatMentionDirectory(props.participants, props.settings.chatRoleConfigs, props.sessionsByParticipant, props.contextUsageByParticipant);
-  const replyLabel = `${props.replies.length} ${props.replies.length === 1 ? "reply" : "replies"}`;
+  const replyLabel = `${props.replyCount} ${props.replyCount === 1 ? "reply" : "replies"}`;
+  // Stable, so file links and images in the thread do not re-render on every chat update.
+  const origin = useMemo(() => ({ threadRootId: props.rootMessage.id }), [props.rootMessage.id]);
   return (
     <MentionDirectoryContext.Provider value={mentionDirectory}>
+    <FilePanelOriginContext.Provider value={origin}>
     <section className="chat-thread-panel" aria-label="Chat thread" data-testid="chat-thread-panel">
-      <header className="thread-panel-head chat-thread-head">
+      <header className="thread-panel-head chat-thread-head" data-titlebar>
         <div>
           <h2>Thread</h2>
-          <span>{replyLabel}</span>
         </div>
         <div className="thread-panel-actions">
-          <IconButton size="sm" icon={X} label="Close thread" tooltip="Close thread" onClick={props.onClose} />
+          <IconButton icon={X} label="Close thread" tooltip="Close thread" onClick={props.onClose} />
         </div>
       </header>
       <div className="chat-thread-body">
@@ -108,6 +115,7 @@ export function ChatThreadPanel(props: {
           onRejectMentions={props.onRejectMentions}
           onRespondToChoice={props.onRespondToChoice}
           onToggleReaction={props.onToggleReaction}
+          onDismissTurnFinishedNote={props.onDismissTurnFinishedNote}
           onCompactParticipant={props.onCompactParticipant}
           onStopRun={props.onStopRun}
           onRespondToAppToolApproval={props.onRespondToAppToolApproval}
@@ -140,6 +148,7 @@ export function ChatThreadPanel(props: {
                 onRejectMentions={props.onRejectMentions}
                 onRespondToChoice={props.onRespondToChoice}
                 onToggleReaction={props.onToggleReaction}
+                onDismissTurnFinishedNote={props.onDismissTurnFinishedNote}
                 onCompactParticipant={props.onCompactParticipant}
                 onStopRun={props.onStopRun}
                 onRespondToAppToolApproval={props.onRespondToAppToolApproval}
@@ -154,6 +163,7 @@ export function ChatThreadPanel(props: {
         participants={props.participants}
         savedPrompts={props.settings.chatSavedPrompts}
         conversationId={props.conversationId}
+        dictationSession={`${props.conversationId}:${props.rootMessage.id}`}
         repoPath={props.repoPath}
         draft={props.draft}
         onDraftChange={props.onDraftChange}
@@ -165,6 +175,7 @@ export function ChatThreadPanel(props: {
         participantRoleLabel={(participant) => chatRoleLabel(props.settings.chatRoleConfigs, participant)}
       />
     </section>
+    </FilePanelOriginContext.Provider>
     </MentionDirectoryContext.Provider>
   );
 }

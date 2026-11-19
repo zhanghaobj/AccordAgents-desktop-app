@@ -18,7 +18,9 @@ import {
   ChatParticipantSpecRow
 } from "../chat/chat-participant-config-panel";
 import type { ChatParticipantDraft } from "../chat/chat-participant-drafts";
-import { CHAT_AGENT_MODE_OPTIONS, CHAT_RUN_LOCATION_OPTIONS, WORKFLOW_MANAGER_ROLE_ID, chatAgentModeLabel, chatConfigProviderLabel, chatParticipantHost, chatProviderOptionId, chatProviderOptionPatch, chatProviderOptions, normalizeChatRunLocation, normalizedChatDrafts, sameParticipantDraft, updateChatParticipantDraft, validateChatCliAgents, validateChatParticipantDrafts } from "../chat/chat-participant-drafts";
+import { ParticipantRunLocation } from "../chat/participant-run-location";
+import { chatParticipantHomeIsUnassigned } from "../../../shared/chatParticipantHome";
+import { CHAT_AGENT_MODE_OPTIONS, WORKFLOW_MANAGER_ROLE_ID, chatAgentModeLabel, chatConfigProviderLabel, chatParticipantHost, chatProviderOptionId, chatProviderOptionPatch, chatProviderOptions, chatProviderSupportsCloudRun, normalizedChatDrafts, sameParticipantDraft, updateChatParticipantDraft, validateChatCliAgents, validateChatParticipantDrafts } from "../chat/chat-participant-drafts";
 import { DeleteConfirmationDialog } from "./delete-confirmation-dialog";
 import {
   ParticipantEditorHandleField,
@@ -26,6 +28,7 @@ import {
   initialDraft,
   type ParticipantEditorState
 } from "./participant-settings-utils";
+import { IconButton } from "../primitives";
 
 type ChatParticipantDraftPatch = Parameters<typeof updateChatParticipantDraft>[2];
 const AUTO_WATCH_GENERIC_DESCRIPTION = "Let this member watch new chat messages and decide whether to act.";
@@ -166,6 +169,9 @@ export function ParticipantEditorDialog(props: {
               kind={draft.kind}
               handle={editorHandle}
               avatarId={draft.avatarId}
+              roleLabel={roleLabel}
+              settings={props.settings}
+              agents={props.agents}
               onSelect={(avatarId) => patchDraft({ avatarId })}
             />
             <span className="participants-editor-title-block">
@@ -173,9 +179,7 @@ export function ParticipantEditorDialog(props: {
               <DialogDescription>{roleLabel || "Saved member preset"}</DialogDescription>
             </span>
             <DialogClose asChild>
-              <button type="button" className="participants-editor-close" aria-label="Close member editor">
-                <X size={15} aria-hidden />
-              </button>
+              <IconButton label="Close member editor" icon={X} />
             </DialogClose>
           </div>
         </DialogHeader>
@@ -204,14 +208,12 @@ export function ParticipantEditorDialog(props: {
               options={providerOptions}
               onSelect={(value) => patchDraft(chatProviderOptionPatch(value, draft, hosts))}
             />
-            {draft.kind === "codex-cli" && (
-              <ChatParticipantInlineSelectRow
-                label="Run location"
-                value={normalizeChatRunLocation(draft.remoteExecution) === "remote" ? "Remote" : "Local"}
-                current={normalizeChatRunLocation(draft.remoteExecution)}
-                options={CHAT_RUN_LOCATION_OPTIONS}
-                onSelect={(value) => patchDraft({ remoteExecution: normalizeChatRunLocation(value) })}
-              />
+            {chatProviderSupportsCloudRun(draft.kind) && (
+              <ChatParticipantSpecRow label="Run on">
+                <ParticipantRunLocation kind={draft.kind} homeMachineId={draft.homeMachineId} cloudRun={draft.cloudRun} hideLabel
+                  unassigned={chatParticipantHomeIsUnassigned(draft)} disabled={saving}
+                  onChange={patchDraft} />
+              </ChatParticipantSpecRow>
             )}
             <ChatParticipantInlineModelRow
               kind={draft.kind}

@@ -7,6 +7,7 @@ import type {
   ChatSkillMention,
   Conversation,
   RepoFileMention,
+  RepoFileExternalOpenAction,
   RepoFileOpenAction,
   ReviewProgress
 } from "../../../shared/types";
@@ -14,6 +15,7 @@ import type { ParticipantCompactHandler } from "../content/participant-hover-car
 import type { ArtifactsState } from "../artifacts/use-artifacts";
 import type { ChatChoiceResponse } from "./chat-message-item";
 import type { ChatParticipantRosterStatus } from "./chat-participant-menu";
+import type { ChatComposerPicks } from "./chat-composer";
 
 export interface ChatMessageFocusRequest {
   conversationId?: string;
@@ -34,6 +36,8 @@ export interface ChatConversationViewProps {
   hasOlderMessages: boolean;
   olderMessagesLoading: boolean;
   draft: string;
+  /** The main composer's picks for the draft, kept per chat by the owner. */
+  composerPicks?: ChatComposerPicks;
   onDraftChange: (value: string) => void;
   onLoadOlderMessages: () => void;
   onLoadMessagePageForMessage: (messageId: string) => Promise<boolean>;
@@ -58,6 +62,8 @@ export interface ChatConversationViewProps {
   onRejectMentions: (sourceMessageId: string, targetParticipantIds: string[]) => void;
   onRespondToChoice: (sourceMessageId: string, choiceId: string, response: ChatChoiceResponse) => void | Promise<void>;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  /** Takes a turn-finished note away. */
+  onDismissTurnFinishedNote?: (messageId: string) => void;
   onRespondToAppToolApproval: (
     approvalId: string,
     approve: boolean,
@@ -66,6 +72,7 @@ export interface ChatConversationViewProps {
     codexDecisionId?: string
   ) => Promise<void>;
   setRepoFileOpenPreference: (action: RepoFileOpenAction | null) => Promise<void>;
+  setRepoFileExternalOpenPreference: (action: RepoFileExternalOpenAction | null) => Promise<void>;
   onCompactParticipant: ParticipantCompactHandler;
   onStopRun?: (runId: string) => void;
   onJumpToParticipantLastMessage: (participantId: string) => void;

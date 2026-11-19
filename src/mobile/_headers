@@ -1,0 +1,31 @@
+# W-E: the mobile origin holds the phone's signing key for the User's server
+# (in IndexedDB), so the cost of any injected script here is the whole
+# pairing. The policy below is strict everywhere it can be without
+# foreclosing a designed capability.
+#
+# connect-src deliberately does NOT name a single server: each User runs her
+# own, at an address her pairing code carries, so pinning one would make
+# every other unreachable from this origin. CSP grammar cannot express "any
+# host, but only the server this pairing names"; that policing lives where it
+# already is — the app connects only to the server its pairing names. A
+# deployment wanting a stricter pin ships its own _headers.
+#
+# The phone opens no WebSocket: everything it reads and writes is a signed
+# HTTPS request to the server, so https: is the only scheme it needs.
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https:; img-src 'self' data:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Permissions-Policy: camera=(self), microphone=(), geolocation=(), payment=(), usb=()
+
+/
+  Cache-Control: public, max-age=0, must-revalidate
+
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+/service-worker.js
+  Cache-Control: public, max-age=0, must-revalidate
+
+/mobile-app.js
+  Cache-Control: public, max-age=0, must-revalidate

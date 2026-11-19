@@ -14,6 +14,8 @@ import {
 } from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { verifyRuntimeArchive, verifyUpdaterZip } from "./packaging-boundary.mjs";
+import { verifyPackagedNativeProcess } from "./verify-packaged-native-process.mjs";
 
 const rootDir = process.cwd();
 const envPath = path.join(rootDir, ".env.local");
@@ -345,6 +347,7 @@ function createSignedZip() {
     fail(`Expected signed ZIP was not created: ${signedZipPath}`);
   }
 
+  verifyUpdaterZip(signedZipPath);
   const checksumPath = writeChecksum(signedZipPath);
   return { signedZipPath, checksumPath };
 }
@@ -363,13 +366,30 @@ log("Running TypeScript checks");
 run("npm", ["run", "typecheck"]);
 
 log("Building macOS arm64 distributables with Electron Forge");
+// A release never ships without the speech-to-text engine: its build fails
+// instead of skipping when cmake is missing or the source cannot be fetched.
+process.env.ACCORDAGENTS_REQUIRE_WHISPER = "1";
 run("npm", ["run", "make", "--", "--platform=darwin", "--arch=arm64"]);
 
 log("Verifying signed and notarized app bundle");
+verifyRuntimeArchive(path.join(appPath, "Contents", "Resources", "app.asar"));
 verifySignedApp();
+await verifyPackagedNativeProcess(appPath);
 
 log("Creating signed ZIP for macOS auto-updates");
 const { signedZipPath, checksumPath: zipChecksumPath } = createSignedZip();
+
+// After the ZIP and DMG exist, so nothing the running app does can reach the
+// shipped bundles.
+log("Launching the signed app with a throwaway profile");
+run(process.execPath, [
+  path.join(rootDir, "scripts", "smoke-launch-packaged-app.mjs"),
+  appPath,
+  "--screenshot",
+  path.join(outDir, "launch", "signed.png"),
+  "--log",
+  path.join(outDir, "launch", "signed.log")
+]);
 
 const dmgPath = findDmg();
 

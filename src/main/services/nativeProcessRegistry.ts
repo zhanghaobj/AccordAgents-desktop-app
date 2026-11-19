@@ -1,0 +1,164 @@
+import { execFile } from "node:child_process";
+import path from "node:path";
+import { hasLiveCapturedPosixProcesses, type CapturedPosixProcess, type PosixProcessRow } from "./processTermination";
+import type { NativeHostIdentity } from "./nativeHostIdentity";
+
+const initializing = new Map<string, Promise<void>>();
+/** Each deployment keeps its registry under this name in its user-data
+ *  directory; other deployments on the host find it there. */
+export const NATIVE_PROCESS_REGISTRY_FILE = "native-processes.sqlite3";
+
+/** Windows runs providers without the registry: its supervisor is a POSIX
+ *  shell, and there is no POSIX process table to check leases against. */
+export function usesNativeProcessRegistry(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== "win32";
+}
+
+class NativeRegistryError extends Error {
+  constructor(message: string, readonly busy: boolean) { super(message); }
+}
+
+export interface NativeProcessLease {
+  scope: string;
+  generation: number;
+  token: string;
+  supervisor: CapturedPosixProcess;
+  parent: CapturedPosixProcess;
+  phase: "launching" | "running" | "closed";
+  provider?: CapturedPosixProcess;
+  descendants: CapturedPosixProcess[];
+  host?: NativeHostIdentity;
+  /** A shell gate cannot exec the provider before the running receipt commits. */
+  launchGate?: 1;
+  shutdownReason?: "processes-gone" | "host-rebooted" | "never-started";
+}
+
+/**
+ * Whether every process a lease recorded is gone: its supervisor, its provider
+ * and each descendant the supervisor captured while it ran.
+ *
+ * Without the supervisor this is the same proof the supervisor writes as
+ * `processes-gone` when it closes a lease itself. With it, it is the proof
+ * for a supervisor that was killed before it could write that receipt (a
+ * crashed runtime under systemd takes its whole service with it). The pids
+ * mean something only on the boot that recorded them, so a lease from an
+ * unknown or another boot is never proven gone here.
+ */
+export function leaseProcessesGone(lease: NativeProcessLease, host: NativeHostIdentity, rows: Map<number, PosixProcessRow>): boolean {
+  if (!lease.host || lease.host.machine !== host.machine || lease.host.boot !== host.boot) return false;
+  if (hasLiveCapturedPosixProcesses([lease.supervisor, ...(lease.provider ? [lease.provider] : []), ...lease.descendants], () => rows)) return false;
+  // A detached provider owns its process group while any member exists, so a
+  // child started after the last capture is still found, as the supervisor
+  // itself finds it. A group whose leader's pid was reused is not followed.
+  const provider = lease.provider;
+  if (provider && (!rows.has(provider.pid) || rows.get(provider.pid)?.startedAt === provider.startedAt)) {
+    for (const row of rows.values()) {
+      if (row.pgid === provider.pid && row.pid !== provider.pid && !row.state?.startsWith("Z")) return false;
+    }
+  }
+  return true;
+}
+
+/** A process receipt contains identities only, never CLI arguments, environment,
+ * prompts or output. SQLite arbitrates competing processes; timeouts never
+ * release ownership. The supervisor is responsible for proving termination. */
+export class NativeProcessRegistry {
+  /** `readOnly` with a `timeoutMs` reads another deployment's registry:
+   *  nothing is written to it, and a stalled file cannot hold the reader. */
+  constructor(readonly dbPath: string, readonly sqliteExecutable = "sqlite3",
+    private readonly access: { readOnly?: boolean; timeoutMs?: number } = {}) {}
+
+  init(): Promise<void> {
+    const key = JSON.stringify([path.resolve(this.dbPath), this.sqliteExecutable]);
+    const pending = initializing.get(key);
+    if (pending) return pending;
+    const work = this.initializeDatabase().finally(() => { if (initializing.get(key) === work) initializing.delete(key); });
+    initializing.set(key, work);
+    return work;
+  }
+
+  private async initializeDatabase(): Promise<void> {
+    const deadline = performance.now() + 5000;
+    for (;;) {
+      try {
+        await this.query(`pragma journal_mode = wal;
+          create table if not exists native_provider_processes (
+            scope text primary key, generation integer not null, token text not null,
+            phase text not null check(phase in ('launching','running','closed')), receipt text not null
+          );`, "initialization");
+        return;
+      } catch (error) {
+        // WAL mode changes can return BUSY immediately despite busy_timeout.
+        // Only this idempotent schema setup is retried, in a fresh connection;
+        // ownership acquisition and external execution are never replayed.
+        if (!(error instanceof NativeRegistryError) || !error.busy || performance.now() >= deadline) throw error;
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    }
+  }
+
+  async get(scope: string): Promise<NativeProcessLease | undefined> {
+    const rows = await this.query<{ receipt: string }>(`select receipt from native_provider_processes where scope = ${quote(scope)};`);
+    return rows[0] ? readLease(rows[0].receipt) : undefined;
+  }
+
+  async openLeases(afterScope = ""): Promise<NativeProcessLease[]> {
+    const rows = await this.query<{ receipt: string }>(`select receipt from native_provider_processes
+      where phase!='closed' and scope>${quote(afterScope)} order by scope limit 100;`);
+    return rows.map(row => readLease(row.receipt));
+  }
+
+  async acquire(input: Omit<NativeProcessLease, "generation" | "phase" | "descendants" | "provider">): Promise<NativeProcessLease | undefined> {
+    const receipt = JSON.stringify({ ...input, phase: "launching", descendants: [] });
+    const rows = await this.query<{ receipt: string }>(`begin immediate;
+      insert into native_provider_processes(scope,generation,token,phase,receipt)
+      values (${quote(input.scope)},1,${quote(input.token)},'launching',json_set(${quote(receipt)},'$.generation',1))
+      on conflict(scope) do update set generation = generation + 1, token = excluded.token,
+        phase = excluded.phase, receipt = json_set(excluded.receipt,'$.generation',generation + 1)
+        where phase = 'closed'
+      returning receipt;
+      commit;`);
+    return rows[0] ? readLease(rows[0].receipt) : undefined;
+  }
+
+  async update(lease: NativeProcessLease): Promise<void> {
+    const rows = await this.query<{ scope: string }>(`update native_provider_processes
+      set phase = ${quote(lease.phase)}, receipt = ${quote(JSON.stringify(lease))}
+      where scope = ${quote(lease.scope)} and token = ${quote(lease.token)} and generation = ${lease.generation}
+        and phase != 'closed' returning scope;`);
+    if (!rows.length) throw new Error("The native process lease changed before its receipt could be stored.");
+  }
+
+  private query<T>(sql: string, operation = "query"): Promise<T[]> {
+    return new Promise((resolve, reject) => {
+      const child = execFile(this.sqliteExecutable, ["-batch", "-bail", "-json", ...(this.access.readOnly ? ["-readonly"] : []), "-cmd", ".timeout 5000", this.dbPath],
+        { encoding: "utf8", maxBuffer: 2 * 1024 * 1024, ...(this.access.timeoutMs ? { timeout: this.access.timeoutMs } : {}) }, (error, stdout, stderr) => {
+          if (error) { reject(new NativeRegistryError(`The native process receipt ${operation} failed: ${error.message}`, /(?:database is (?:locked|busy)|database table is locked).*\([56]\)/.test(stderr))); return; }
+          try { resolve(stdout.trim() ? JSON.parse(stdout) as T[] : []); } catch { reject(new Error("The native process receipt query returned invalid data.")); }
+        });
+      child.stdin?.on("error", reject);
+      child.stdin?.end(`pragma synchronous = full; pragma fullfsync = on; ${sql}`);
+    });
+  }
+}
+
+function readLease(json: string): NativeProcessLease {
+  const value = JSON.parse(json) as NativeProcessLease;
+  const identity = (item: CapturedPosixProcess | undefined): boolean => Boolean(item && Number.isSafeInteger(item.pid) && item.pid > 0 && typeof item.startedAt === "string" && item.startedAt);
+  if (!value || typeof value.scope !== "string" || typeof value.token !== "string" || !value.token ||
+      !Number.isSafeInteger(value.generation) || value.generation < 1 || !identity(value.supervisor) || !identity(value.parent) ||
+      !["launching", "running", "closed"].includes(value.phase) || !Array.isArray(value.descendants) || !value.descendants.every(identity) ||
+      (value.provider !== undefined && !identity(value.provider)) || (value.phase === "running" && !value.provider)) {
+    throw new Error("The native process receipt is corrupt; ownership cannot be inferred.");
+  }
+  if (value.host && (!/^[a-f0-9]{64}$/.test(value.host.machine) || !/^[a-f0-9-]{32,36}$/.test(value.host.boot))) {
+    throw new Error("The native process host identity is corrupt.");
+  }
+  if ((value.launchGate !== undefined && value.launchGate !== 1) || (value.shutdownReason !== undefined &&
+      !["processes-gone", "host-rebooted", "never-started"].includes(value.shutdownReason))) {
+    throw new Error("The native process shutdown receipt is corrupt.");
+  }
+  return value;
+}
+
+function quote(value: string): string { return `'${value.replace(/'/g, "''")}'`; }

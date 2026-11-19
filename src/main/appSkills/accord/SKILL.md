@@ -24,7 +24,9 @@ first.
 
 Before anyone sees another participant's proposal, every Accord author must submit
 one frozen, attributable draft to the same collecting artifact. You (the
-facilitator) submit first, before requesting participants. Each selected
+facilitator) write your draft at the same time as the participants: request them
+first, then write and submit your own in that same turn. The app does not show
+you any participant draft until your own is submitted. Each selected
 participant submits independently. Draft bodies are not chat content: User can
 always read every draft; you can read every participant draft because each
 participant explicitly includes you in its audience; peers cannot read one
@@ -41,6 +43,10 @@ version — you have signed it too, and no selected participant has an open
 objection against that version. Approval is signature identity on the current
 version, never reply prose: a reply can raise a concern but is not a second
 approval step, and a concern raised in a reply without signing is a non-approval.
+A signature is the signer's binding statement that the resolution is correct and
+complete and that they request no changes — nothing less. Signing while
+requesting any change is a protocol violation by the signer: reply with the
+changes and withhold the signature instead.
 
 **Signature/version semantics (stated once):** `app_artifact_revise` creates a new
 version that starts **unsigned**; signatures on earlier versions stay in history
@@ -49,9 +55,10 @@ sign round — the artifact tracks "who approved the current version" for you.
 
 ## State machine
 
-classify → select → create collection → facilitator draft → blind participant
-drafts → synthesize/publish v1 → sign → verify (→ resume if interrupted). Match
-the resolution's size to the decision; never skip independent draft submission.
+classify → select → create collection → request blind participant drafts, then
+write your facilitator draft while they work → synthesize/publish v1 → sign →
+verify (→ resume if interrupted). Match the resolution's size to the decision;
+never skip independent draft submission.
 
 1. **Classify.** Decide how much analysis and how many correction rounds the
    question needs. Concrete/bounded decisions may produce short drafts, but they
@@ -69,20 +76,29 @@ the resolution's size to the decision; never skip independent draft submission.
    explicit readers, and every selected participant's allowed and required reader
    lists contain exactly you. If any selected participant can read another
    participant's draft, stop and correct the roster policy first.
-4. **Submit your facilitator draft first.** Before asking any participant,
-   formulate your own concrete independent resolution. Save it with no explicit
+4. **Request blind participant drafts.** Once the audience check in Step 3
+   passes, request each selected participant using the Independent Draft Prompt.
+   Each participant must save and submit one proposal whose only explicit reader
+   is you. Keep the default `resumeRequester: true`: the call returns at once
+   and their replies come back in a fresh turn. Do not wait for their replies:
+   go straight to Step 5 in this same turn. A turn can hold only one open request,
+   so with more than four participants request the first four now and the rest
+   when their replies bring you back.
+5. **Submit your facilitator draft in the same turn.** As soon as the request
+   call returns, whatever its status, formulate your own concrete independent
+   resolution while the participants write theirs.
+   Do not read participant drafts or replies first; the app refuses to show you a
+   participant draft until your own draft is submitted. Save it with no explicit
    readers, then submit/freeze it. Use stable operation ids derived from the root,
    such as `accord:<chatThreadRootId>:draft:<facilitator>:save:1` and
    `accord:<chatThreadRootId>:draft:<facilitator>:submit`. Verify your draft is
-   `submitted`. Never paste or summarize its body in chat.
-5. **Collect blind participant drafts.** Only after Step 4 is durable, request
-   each selected participant using the Independent Draft Prompt. Each participant
-   must save and submit one proposal whose only explicit reader is you. A response
-   containing prose without a frozen draft is incomplete. After replies, read the
-   artifact's durable draft state and verify one current submitted draft for every
-   required author. Do not treat chat replies as proposal storage. Do not publish
-   early.
-6. **Synthesize and publish v1.** Read all submitted drafts through the artifact
+   `submitted`. Never paste or summarize its body in chat. Then end the turn as
+   Tool Rules describe; participant replies bring you back.
+6. **Synthesize and publish v1.** When the replies are in, read the artifact's
+   durable draft state and verify one current submitted draft for every required
+   author. A response containing prose without a frozen draft is incomplete. Do
+   not treat chat replies as proposal storage. Do not publish early. Read all
+   submitted drafts through the artifact
    service. Merge your facilitator input and the participant proposals into one
    candidate; keep every substantive concern until it is
    incorporated, or reframed/rejected/User-resolved with visible reasoning (see
@@ -95,6 +111,12 @@ the resolution's size to the decision; never skip independent draft submission.
    signer set and starts a new unsigned version. Never recreate it and never
    restart independent draft collection merely because a signing concern caused
    a revision.
+
+   Give v1 and every later revision a `note` that states the resolution itself
+   for the User in one to three plain sentences: the decision and the condition
+   it rests on, not what changed. The Accord's card in the chat shows the current
+   version's note as the Accord's outcome, so a reader who never opens the
+   document still knows what was decided.
 
    Before publishing, inspect every current submitted draft and assert its actual
    `effectiveReaders` set: your facilitator draft is readable by exactly User and
@@ -115,9 +137,14 @@ the resolution's size to the decision; never skip independent draft submission.
    to read the published artifact and sign it (see Approval Prompt).
 8. **Verify.** `app_artifact_read` and confirm `approval.state === "approved"` and
    `signedCurrent` covers you and every selected participant (identity, not count).
-   Also read replies: address any concern raised without a signature before
-   claiming consensus. If a reply corrects the resolution, do not re-ask for a
-   signature on that version — revise and run a fresh sign round.
+   Then read every reply from the sign round: if any reply requests changes to
+   the resolution's text — corrections, additions, new open questions — the
+   round is not complete regardless of signatures. A signer who requested
+   changes violated the signing rule; do not claim consensus over known
+   requested changes. Revise (folding accepted findings into the body and
+   rejected ones into Reasoning / Dispositions) and run a fresh sign round.
+   Consensus is reached only when the current version is fully signed and no
+   reply from its sign round requested changes.
 
 ## Participant Selection
 
@@ -146,6 +173,11 @@ impact. A participant's signature approves both the resolution and its
 dispositions. Never present a version for signing with an unresolved objection in
 it; reframing or rejecting a concern is not unilateral — it must be visible and
 signed off.
+
+Review findings follow the same rule as drafts: they live in the artifact, never
+only in chat. A finding accepted during a sign round is folded into the body; a
+finding rejected or reframed is recorded here with reasoning. A finding that
+exists only in a chat reply is an unfinished round, not a footnote.
 
 ## User-Owned Decisions
 
@@ -200,9 +232,24 @@ only version under approval.
 
 Stay skeptical — do not accept the reasoning by default. Read the artifact, check
 the Reasoning / Dispositions, and whether your concerns were preserved or
-correctly resolved. If you approve it as complete, sign the current version.
-Otherwise do not sign — reply with the concrete concern or disputed disposition.
-Your reply reaches everyone; do not repost it separately.
+correctly resolved.
+
+Answer three questions explicitly in your reply before deciding:
+1. Would you add to or change anything in the document's text — including
+   additions to open-questions lists, factual corrections, or implementation
+   constraints?
+2. Did you check the document's factual claims, and did any fail or resist
+   verification?
+3. Do you dispute any commitment or disposition?
+
+Then exactly one outcome:
+- Approve — all three answers are clean: sign the current version.
+- Amend — something belongs in the document: do not sign; reply with the exact
+  text-level changes.
+- Dispute — a commitment or disposition is wrong: do not sign; name it.
+
+Sign only if you request no changes: a signature states the resolution is correct
+and complete. Your reply reaches everyone; do not repost it separately.
 ```
 
 ## Resume
@@ -213,9 +260,17 @@ publish, or re-request. Read the original/request threads and request status, th
 read the resolution artifact:
 
 - `collecting_drafts`: roster, current submitted drafts, and missing required
-  authors are the source of truth. Resume from the first incomplete author. A
-  submitted facilitator draft means participant requests may begin. Stable
-  operation ids make lost responses safe to retry.
+  authors are the source of truth. Check two things independently: whether every
+  participant without a submitted draft still has a request running or awaiting
+  approval (request threads and status), and whether your own facilitator draft
+  is submitted. Request again every participant whose request was never sent or
+  ended failed or interrupted without a submitted draft, but re-request a
+  participant at most once; if it fails again, stop and tell User who is
+  blocked and why. If User denied a request or stopped a participant (its
+  request item is `denied` or `interrupted`), that is User's decision: ask User
+  how to proceed instead of re-requesting. Then finish your
+  own draft before reading participant drafts; then wait for the remaining
+  authors. Stable operation ids make lost responses safe to retry.
 - `published`: v1 and its source manifest are the source of truth that synthesis
   completed. `signedCurrent` is the source of truth for current approvals; the
   request thread carries unresolved signing replies.
@@ -254,6 +309,8 @@ Blocking issue / Remaining objection (per participant) / User decision needed.
 - Reach participants only through the participant-request flow: do not rely on
   plain `@mentions`, and put no `@handle` in any accord message (it can trigger an
   unintended extra run) — refer to participants by plain name.
-- If a request returns `pending_approval`, end with exactly:
-  `Participant request is awaiting User approval.` If it returns `running`, end
-  with one short waiting status. Do not poll request status repeatedly in a turn.
+- After the draft request, finish Step 5 before ending the turn; after any other
+  request, end the turn right away. If the request returned `pending_approval`,
+  end with exactly: `Participant request is awaiting User approval.` If it
+  returned `running`, end with one short waiting status. Do not poll request
+  status repeatedly in a turn.

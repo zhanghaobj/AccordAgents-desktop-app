@@ -1,70 +1,199 @@
-import { ChevronDown } from "lucide-react";
+import type { ReactNode } from "react";
+import { BadgeCheck, Check, ChevronRight, History } from "lucide-react";
+import { DropdownMenu } from "radix-ui";
 
 import type { ArtifactDraftView, ArtifactVersionMeta } from "../../../shared/types";
 import { artifactMemberLabel } from "../../../shared/artifacts";
 
-function draftOptionLabel(draft: ArtifactDraftView): string {
-  const timestamp = Date.parse(draft.submittedAt ?? draft.updatedAt);
-  const date = Number.isFinite(timestamp)
-    ? new Date(timestamp).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
-    : draft.submittedAt ?? draft.updatedAt;
-  const state = `${draft.state.charAt(0).toUpperCase()}${draft.state.slice(1)}`;
-  return `Draft by ${artifactMemberLabel(draft.author)} · ${state} · ${date}`;
+export interface ArtifactPickerEntry {
+  value: string;
+  title: string;
+  meta: string;
+  note?: string;
+  signed?: { count: number; required: number };
 }
 
-export function ArtifactVersionSelector(props: {
+export interface ArtifactSubtitleParts {
+  prefix: string;
+  strong: string;
+  suffix: string;
+}
+
+const VERSION_PREFIX = "version:";
+const DRAFT_PREFIX = "draft:";
+
+export function artifactVersionEntryValue(version: number): string {
+  return `${VERSION_PREFIX}${version}`;
+}
+
+export function artifactDraftEntryValue(draftId: string): string {
+  return `${DRAFT_PREFIX}${draftId}`;
+}
+
+function formatWhen(value: string): string {
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp)
+    ? new Date(timestamp).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+    : value;
+}
+
+export function artifactDraftLabel(draft: ArtifactDraftView): string {
+  return `Draft by ${artifactMemberLabel(draft.author)}`;
+}
+
+function draftStateLabel(draft: ArtifactDraftView): string {
+  return `${draft.state.charAt(0).toUpperCase()}${draft.state.slice(1)}`;
+}
+
+// Rows of the header's version picker: every version (newest first) and every draft.
+export function artifactPickerEntries(props: {
+  history: ArtifactVersionMeta[];
+  drafts: ArtifactDraftView[];
+  headVersion?: number;
+  requiredSigners?: string[];
+}): { versions: ArtifactPickerEntry[]; drafts: ArtifactPickerEntry[] } {
+  const required = props.requiredSigners ?? [];
+  const versions = [...props.history].sort((left, right) => right.version - left.version).map((version) => ({
+    value: artifactVersionEntryValue(version.version),
+    title: `v${version.version}${version.version === props.headVersion ? " · Current" : ""}`,
+    meta: `${artifactMemberLabel(version.author)} · ${formatWhen(version.createdAt)}`,
+    note: version.note,
+    signed: required.length > 0
+      ? { count: version.signatures.filter((signature) => required.includes(signature.signer)).length, required: required.length }
+      : undefined
+  }));
+  const drafts = props.drafts.map((draft) => ({
+    value: artifactDraftEntryValue(draft.id),
+    title: artifactDraftLabel(draft),
+    meta: `${draftStateLabel(draft)} · ${formatWhen(draft.submittedAt ?? draft.updatedAt)}`
+  }));
+  return { versions, drafts };
+}
+
+export function selectArtifactPickerEntry(
+  value: string,
+  onShowVersion: (version: number) => void,
+  onShowDraft: (draftId: string) => void
+): void {
+  if (value.startsWith(VERSION_PREFIX)) {
+    const version = Number(value.slice(VERSION_PREFIX.length));
+    if (Number.isFinite(version)) {
+      onShowVersion(version);
+    }
+    return;
+  }
+  if (value.startsWith(DRAFT_PREFIX)) {
+    const draftId = value.slice(DRAFT_PREFIX.length);
+    if (draftId) {
+      onShowDraft(draftId);
+    }
+  }
+}
+
+// The version line: shown in the title menu's Version entry.
+export function artifactSubtitleParts(input: {
+  lifecycle: "published" | "collecting_drafts";
+  archived: boolean;
+  version?: { version: number; author: string };
+  draft?: ArtifactDraftView;
+  submittedDraftCount: number;
+  requiredDraftCount: number;
+  updatedLabel: string;
+}): ArtifactSubtitleParts {
+  const archived = input.archived ? "Archived · " : "";
+  const draftLabel = input.draft ? artifactDraftLabel(input.draft) : "";
+  if (input.lifecycle === "collecting_drafts") {
+    const progress = `Collecting drafts ${input.submittedDraftCount}/${input.requiredDraftCount}`;
+    return {
+      prefix: `${archived}${progress}${draftLabel ? " · " : ""}`,
+      strong: draftLabel,
+      // Without the state a withdrawn or superseded draft reads as the live one.
+      suffix: input.draft ? ` · ${draftStateLabel(input.draft)}` : ""
+    };
+  }
+  if (input.draft) {
+    return { prefix: archived, strong: draftLabel, suffix: ` · ${draftStateLabel(input.draft)}` };
+  }
+  const version = input.version;
+  return {
+    prefix: archived,
+    strong: version ? `v${version.version}` : "",
+    suffix: version ? ` by ${artifactMemberLabel(version.author)} · ${input.updatedLabel}` : input.updatedLabel
+  };
+}
+
+// The "Version" entry of the artifact's title menu: every version and draft,
+// with the one on screen checked. The line it shows is the old header
+// subtitle ("v2 by @drew · Updated 5d ago").
+export function ArtifactVersionSubmenu(props: {
+  label: ReactNode;
   selectedVersion?: number;
   headVersion?: number;
   history: ArtifactVersionMeta[];
   drafts: ArtifactDraftView[];
   selectedDraftId?: string;
+  requiredSigners?: string[];
+  disabled?: boolean;
   onShowVersion: (version: number) => void;
   onShowDraft: (draftId: string) => void;
 }): JSX.Element {
   const selectedEntry = props.selectedDraftId
-    ? `draft:${props.selectedDraftId}`
-    : props.selectedVersion !== undefined ? `version:${props.selectedVersion}` : "";
-  const versions = [...props.history].sort((left, right) => right.version - left.version);
-
-  function selectEntry(value: string): void {
-    if (value.startsWith("version:")) {
-      props.onShowVersion(Number(value.slice("version:".length)));
-      return;
-    }
-    if (value.startsWith("draft:")) {
-      props.onShowDraft(value.slice("draft:".length));
-    }
-  }
+    ? artifactDraftEntryValue(props.selectedDraftId)
+    : props.selectedVersion !== undefined ? artifactVersionEntryValue(props.selectedVersion) : "";
+  const entries = artifactPickerEntries(props);
+  const isEmpty = entries.versions.length === 0 && entries.drafts.length === 0;
+  const selectEntry = (value: string): void => selectArtifactPickerEntry(value, props.onShowVersion, props.onShowDraft);
 
   return (
-    <label className="artifact-version-selector">
-      <span className="artifact-version-selector-label">Version or draft</span>
-      <span className="artifact-version-selector-control">
-        <select
-          value={selectedEntry}
-          aria-label="Artifact versions and drafts"
-          data-testid="artifact-version-selector"
-          onChange={(event) => selectEntry(event.currentTarget.value)}
-        >
-          {versions.length > 0 && (
-            <optgroup label="Versions">
-              {versions.map((version) => (
-                <option key={version.version} value={`version:${version.version}`}>
-                  v{version.version} · {artifactMemberLabel(version.author)}{version.version === props.headVersion ? " · Current" : ""}
-                </option>
-              ))}
-            </optgroup>
+    <DropdownMenu.Sub>
+      <DropdownMenu.SubTrigger className="artifact-menu-item artifact-version-subtrigger" disabled={props.disabled} data-testid="artifact-version-selector">
+        <History aria-hidden />
+        <span className="artifact-menu-item-label">
+          <span>Version</span>
+          <span className="artifact-version-subtrigger-meta">{props.label}</span>
+        </span>
+        <ChevronRight className="artifact-menu-chevron" aria-hidden />
+      </DropdownMenu.SubTrigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.SubContent className="artifact-menu artifact-version-menu" sideOffset={6} collisionPadding={12}>
+          {isEmpty && (
+            <DropdownMenu.Item className="artifact-menu-item" disabled>
+              <span className="artifact-menu-item-label">No versions or drafts yet</span>
+            </DropdownMenu.Item>
           )}
-          {props.drafts.length > 0 && (
-            <optgroup label="Drafts">
-              {props.drafts.map((draft) => (
-                <option key={draft.id} value={`draft:${draft.id}`}>{draftOptionLabel(draft)}</option>
-              ))}
-            </optgroup>
-          )}
-        </select>
-        <ChevronDown size={16} aria-hidden />
+          <DropdownMenu.RadioGroup value={selectedEntry} onValueChange={selectEntry}>
+            {entries.versions.length > 0 && <DropdownMenu.Label className="artifact-menu-label">Versions</DropdownMenu.Label>}
+            {entries.versions.map((entry) => <ArtifactPickerRow key={entry.value} entry={entry} />)}
+            {entries.versions.length > 0 && entries.drafts.length > 0 && <DropdownMenu.Separator className="artifact-menu-separator" />}
+            {entries.drafts.length > 0 && <DropdownMenu.Label className="artifact-menu-label">Drafts</DropdownMenu.Label>}
+            {entries.drafts.map((entry) => <ArtifactPickerRow key={entry.value} entry={entry} />)}
+          </DropdownMenu.RadioGroup>
+        </DropdownMenu.SubContent>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Sub>
+  );
+}
+
+function ArtifactPickerRow({ entry }: { entry: ArtifactPickerEntry }): JSX.Element {
+  const complete = Boolean(entry.signed && entry.signed.count >= entry.signed.required);
+  return (
+    <DropdownMenu.RadioItem value={entry.value} className="artifact-menu-item artifact-version-item">
+      <span className="artifact-menu-check">
+        <DropdownMenu.ItemIndicator><Check size={15} aria-hidden /></DropdownMenu.ItemIndicator>
       </span>
-    </label>
+      <span className="artifact-version-row">
+        <span className="artifact-version-row-title">
+          <span>{entry.title}</span>
+          {entry.signed ? (
+            <span className={`artifact-version-signed${complete ? " is-complete" : ""}`}>
+              {complete ? <BadgeCheck size={13} aria-hidden /> : null}
+              Signed {entry.signed.count}/{entry.signed.required}
+            </span>
+          ) : null}
+        </span>
+        <span className="artifact-version-row-meta">{entry.meta}</span>
+        {entry.note ? <span className="artifact-version-row-note">{entry.note}</span> : null}
+      </span>
+    </DropdownMenu.RadioItem>
   );
 }

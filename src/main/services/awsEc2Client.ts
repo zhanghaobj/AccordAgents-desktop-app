@@ -2,7 +2,7 @@
 // from awsWorkerLifecycle.ts so the lifecycle state machine stays SDK-free and
 // unit-testable; this module is the thin adapter over @aws-sdk/client-ec2 and
 // the local key/IP tooling.
-import { app } from "electron";
+import { userDataPath } from "../platform";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import {
   EC2Client,
@@ -87,6 +87,29 @@ export function isAwsAuthorizationError(error: unknown): boolean {
   return /not authorized to perform|no identity-based policy allows/i.test(message);
 }
 
+export interface AwsAuthorizationErrorDetails {
+  missingActions: string[];
+  principalArn?: string;
+  principalUserName?: string;
+}
+
+export function awsAuthorizationErrorDetails(error: unknown): AwsAuthorizationErrorDetails {
+  const record = error && typeof error === "object"
+    ? error as { message?: unknown }
+    : undefined;
+  const message = error instanceof Error
+    ? error.message
+    : typeof record?.message === "string"
+      ? record.message
+      : String(error ?? "");
+  const missingActions = [...new Set([...message.matchAll(/not authorized to perform(?::|\s+this operation\.)?\s*([a-z0-9-]+:[A-Za-z0-9*]+)/gi)]
+    .map((match) => match[1])
+    .filter(Boolean))].sort();
+  const principalArn = message.match(/User:\s*(arn:aws:iam::\d+:user\/[A-Za-z0-9+=,.@_/-]+)/)?.[1];
+  const principalUserName = principalArn?.split("/").at(-1);
+  return { missingActions, principalArn, principalUserName };
+}
+
 export class SdkEc2Client implements Ec2Client {
   constructor(
     private readonly client: EC2Client,
@@ -114,7 +137,7 @@ export class SdkEc2Client implements Ec2Client {
       }));
       for (const reservation of result.Reservations ?? []) {
         for (const instance of reservation.Instances ?? []) {
-          const mapped = await this.mapInstance(instance);
+          const mapped = await this.mapInstance(instance, reservation.OwnerId);
           if (mapped) instances.push(mapped);
         }
       }
@@ -326,8 +349,9 @@ export class SdkEc2Client implements Ec2Client {
   async describeInstance(instanceId: string): Promise<AwsWorkerInstanceInfo | undefined> {
     try {
       const result = await this.client.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
-      const instance = result.Reservations?.[0]?.Instances?.[0];
-      return instance ? this.mapInstance(instance) : undefined;
+      const reservation = result.Reservations?.[0];
+      const instance = reservation?.Instances?.[0];
+      return instance ? this.mapInstance(instance, reservation?.OwnerId) : undefined;
     } catch (error) {
       if (isAwsError(error, "InvalidInstanceID.NotFound")) return undefined;
       throw error;
@@ -381,18 +405,24 @@ export class SdkEc2Client implements Ec2Client {
     }
   }
 
-  private async mapInstance(instance: Instance): Promise<AwsWorkerInstanceInfo | undefined> {
+  private async mapInstance(instance: Instance, ownerId?: string): Promise<AwsWorkerInstanceInfo | undefined> {
     const base = awsWorkerInstanceInfoFromSdkInstance(instance);
     if (!base) return undefined;
+    const described = { ...base, region: this.region, instanceType: instance.InstanceType, keyName: instance.KeyName,
+      launchedAt: instance.LaunchTime?.toISOString(), ...(ownerId ? { ownerId } : {}) };
+    // Nothing of a terminated instance is looked up: its disk and security
+    // group may already be deleted, and asking for them would turn the one
+    // answer that matters, "terminated", into an error.
+    if (base.state === "terminated") return described;
     const rootVolumeId = base.rootVolumeId;
     const groupIds = (instance.SecurityGroups ?? [])
       .map((group) => group.GroupId)
       .filter((groupId): groupId is string => Boolean(groupId));
     const [volumeResult, typeInfo, groupResult] = await Promise.all([
       rootVolumeId
-        ? this.describeVolume(rootVolumeId)
+        ? this.describeVolumeMetadata(rootVolumeId)
         : Promise.resolve(undefined),
-      instance.InstanceType ? this.describeInstanceType(instance.InstanceType) : Promise.resolve(undefined),
+      instance.InstanceType ? this.describeInstanceTypeMetadata(instance.InstanceType) : Promise.resolve(undefined),
       groupIds.length > 0
         ? this.client.send(new DescribeSecurityGroupsCommand({ GroupIds: groupIds }))
         : Promise.resolve(undefined)
@@ -400,17 +430,13 @@ export class SdkEc2Client implements Ec2Client {
     const securityGroupId = groupResult?.SecurityGroups?.find((group) =>
       group.Tags?.some((tag) => tag.Key === AWS_WORKER_TAG_KEY && tag.Value === AWS_WORKER_TAG_VALUE))?.GroupId;
     return {
-      ...base,
-      region: this.region,
+      ...described,
       availabilityZone: instance.Placement?.AvailabilityZone,
-      instanceType: instance.InstanceType,
       vCpu: typeInfo?.vCpu,
       memoryMiB: typeInfo?.memoryMiB,
       rootVolumeId,
       rootVolumeSizeGb: volumeResult?.Volumes?.[0]?.Size,
-      securityGroupId,
-      keyName: instance.KeyName,
-      launchedAt: instance.LaunchTime?.toISOString()
+      securityGroupId
     };
   }
 
@@ -419,6 +445,24 @@ export class SdkEc2Client implements Ec2Client {
       return await this.client.send(new DescribeVolumesCommand({ VolumeIds: [volumeId] }));
     } catch (error) {
       if (isAwsError(error, "InvalidVolume.NotFound")) return undefined;
+      throw error;
+    }
+  }
+
+  private async describeVolumeMetadata(volumeId: string): Promise<DescribeVolumesCommandOutput | undefined> {
+    try {
+      return await this.describeVolume(volumeId);
+    } catch (error) {
+      if (isAwsAuthorizationError(error)) return undefined;
+      throw error;
+    }
+  }
+
+  private async describeInstanceTypeMetadata(instanceType: string): Promise<{ vCpu: number; memoryMiB: number } | undefined> {
+    try {
+      return await this.describeInstanceType(instanceType);
+    } catch (error) {
+      if (isAwsAuthorizationError(error)) return undefined;
       throw error;
     }
   }
@@ -505,17 +549,17 @@ function mapInstanceState(name: string | undefined): AwsWorkerInstanceState {
 // half is imported to EC2, the private half stays local and drives SSH.
 export async function generateAwsWorkerKeyMaterial(options: { rotate?: boolean } = {}): Promise<AwsWorkerKeyMaterial> {
   return generateOrLoadAwsWorkerKeyMaterial({
-    keyDir: awsWorkerKeyDir(app.getPath("userData")),
+    keyDir: awsWorkerKeyDir(userDataPath()),
     rotate: options.rotate
   });
 }
 
 export async function deleteGeneratedAwsWorkerKeyMaterial(keyName: string): Promise<void> {
-  await deleteAwsWorkerKeyMaterial(awsWorkerKeyDir(app.getPath("userData")), keyName);
+  await deleteAwsWorkerKeyMaterial(awsWorkerKeyDir(userDataPath()), keyName);
 }
 
 export function resolveAwsWorkerPrivateKeyPath(keyName: string): string {
-  return awsWorkerPrivateKeyPath(awsWorkerKeyDir(app.getPath("userData")), keyName);
+  return awsWorkerPrivateKeyPath(awsWorkerKeyDir(userDataPath()), keyName);
 }
 
 export async function resolveCurrentPublicIp(): Promise<string> {

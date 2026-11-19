@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
   buildMirrorUpSyncRsyncArgs,
+  computeLocalMirrorFingerprint,
   parseLastRsyncProgressPercent,
   planWorkerMirrorReclaim,
   type WorkerMirrorContainerSnapshot
@@ -62,6 +66,19 @@ test("up-sync rsync argv pairs --delete with the git-state protect filters (P0-2
     destination: "worker:/srv/mirrors/app-1234/repo/"
   });
   assert.ok(args.includes("--delete"), "delete pass must be present for the guarantee to matter");
+  assert.ok(args.includes("--delete-excluded"), "excluded local-only cache dirs must be removed from stale mirrors");
+  for (const exclude of [
+    "--exclude=/.idea/***",
+    "--exclude=/.wrangler/***",
+    "--exclude=/.qa-user-data/***",
+    "--exclude=/.worktrees/***",
+    "--exclude=/signed/***",
+    "--exclude=/screenshots/***"
+  ]) {
+    assert.ok(args.includes(exclude), `missing local-only exclude: ${exclude}`);
+  }
+  assert.ok(args.includes("--include=/.agents/skills/***"));
+  assert.ok(args.includes("--include=/.claude/skills/***"));
   for (const filter of [
     "--filter=P .git/worktrees/***",
     "--filter=P .git/objects/***",
@@ -75,6 +92,40 @@ test("up-sync rsync argv pairs --delete with the git-state protect filters (P0-2
   }
   // The protect filters must sit after --delete so rsync sees them as protection.
   assert.ok(args.indexOf("--delete") < args.indexOf("--filter=P .git/worktrees/***"));
+});
+
+test("repo fingerprint includes dependencies and assets nested inside provider skills", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "accordagents-skill-fingerprint-test-"));
+  try {
+    const dependency = path.join(root, ".agents", "skills", "proof", "node_modules", "tool.js");
+    const environment = path.join(root, ".claude", "skills", "proof", ".venv", "runner");
+    await mkdir(path.dirname(dependency), { recursive: true });
+    await mkdir(path.dirname(environment), { recursive: true });
+    await writeFile(dependency, "first\n");
+    await writeFile(environment, "first\n");
+    const before = await computeLocalMirrorFingerprint(root);
+    await writeFile(dependency, "second and longer\n");
+    await writeFile(environment, "second and longer\n");
+    const after = await computeLocalMirrorFingerprint(root);
+    assert.notEqual(after.digest, before.digest);
+    assert.equal(after.fileCount, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact up-sync preserves skill dependencies that repository mirrors exclude", () => {
+  const args = buildMirrorUpSyncRsyncArgs({
+    progressArgs: [],
+    rshCommand: "ssh",
+    source: "/tmp/portable-setup/",
+    destination: "worker:/srv/agent-setup/bundles/fingerprint/",
+    contentMode: "exact"
+  });
+  assert.ok(args.includes("--delete"));
+  assert.ok(!args.includes("--delete-excluded"));
+  assert.ok(!args.some((arg) => arg.includes("node_modules") || arg.includes(".venv")));
+  assert.ok(!args.some((arg) => arg.startsWith("--filter=P")));
 });
 
 function container(overrides: Partial<WorkerMirrorContainerSnapshot> & { path: string }): WorkerMirrorContainerSnapshot {

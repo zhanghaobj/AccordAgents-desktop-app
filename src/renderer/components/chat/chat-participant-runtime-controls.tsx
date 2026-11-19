@@ -10,7 +10,7 @@ import {
   normalizeOptionalChatParticipantRequestPermission
 } from "../../../shared/agentPermissions";
 import { reasoningEffortOptionsForProvider } from "../../../shared/reasoningEffort";
-import { useProviderModelCatalog } from "./use-provider-model-catalog";
+import { modelDetectionFailureText, useProviderModelCatalog } from "./use-provider-model-catalog";
 import type {
   ChatAgentMode,
   ChatAgentPermissions,
@@ -27,9 +27,10 @@ import {
   CHAT_AGENT_MODE_OPTIONS,
   chatCliProviderLabel,
   chatInheritedCliSettingLabel,
-  chatModelDefaultLabel,
-  normalizeChatRunLocation
+  chatModelDefaultLabel
 } from "./chat-participant-drafts";
+import { chatParticipantHomeIsUnassigned } from "../../../shared/chatParticipantHome";
+import { ParticipantRunLocation } from "./participant-run-location";
 
 const REASONING_DEFAULT_VALUE = "__default__";
 const MODEL_DEFAULT_VALUE = "__default_model__";
@@ -52,14 +53,15 @@ export function ParticipantRuntimeControls(props: {
   autoWatchPausedReason?: ChatParticipantWatcherPausedReason;
   roleParticipantDefaults?: ChatRoleParticipantDefaults;
   runLocationLocked: boolean;
+  /** Changing where it runs moves it with its session. */
+  runLocationMoves?: boolean;
   onUpdate: (
     participantId: string,
-    patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch">
-  ) => void;
+    patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "cloudRun" | "homeMachineId" | "skipToolchainPreflight" | "autoWatch">
+  ) => unknown;
 }): JSX.Element {
   const participant = props.participant;
   const mode = normalizeChatAgentMode(participant.agentMode);
-  const runLocation = normalizeChatRunLocation(participant.remoteExecution);
   const reasoningValue = participant.reasoningEffort ?? REASONING_DEFAULT_VALUE;
   // The member carries a vendor snapshot of its added provider, enough for the
   // model list and labels without a settings lookup.
@@ -73,13 +75,15 @@ export function ParticipantRuntimeControls(props: {
 
   // Build the patch by key presence so an intentional reset (model: "") is forwarded
   // rather than collapsing back to the current value.
-  function update(patch: Partial<Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch">>): void {
-    props.onUpdate(participant.id, {
+  function update(patch: Partial<Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "cloudRun" | "homeMachineId" | "skipToolchainPreflight" | "autoWatch">>): unknown {
+    return props.onUpdate(participant.id, {
       model: "model" in patch ? patch.model : participant.model,
       reasoningEffort: "reasoningEffort" in patch ? patch.reasoningEffort : participant.reasoningEffort,
       agentMode: "agentMode" in patch ? patch.agentMode : participant.agentMode,
       permissions: "permissions" in patch ? patch.permissions : participant.permissions,
       remoteExecution: "remoteExecution" in patch ? patch.remoteExecution : participant.remoteExecution,
+      homeMachineId: "homeMachineId" in patch ? patch.homeMachineId : participant.homeMachineId,
+      cloudRun: "cloudRun" in patch ? patch.cloudRun : participant.cloudRun,
       skipToolchainPreflight: "skipToolchainPreflight" in patch ? patch.skipToolchainPreflight : participant.skipToolchainPreflight,
       autoWatch: "autoWatch" in patch ? patch.autoWatch : participant.autoWatch
     });
@@ -103,28 +107,12 @@ export function ParticipantRuntimeControls(props: {
     ?? autoWatchPausedTooltip
     ?? (autoWatchOn ? "Auto-watch is enabled for this member." : "Let this member watch new chat messages and decide whether to act.");
   const autoWatchDisabled = props.disabled || Boolean(props.autoWatchDisabledReason);
-  const cloudRunOn = runLocation === "remote";
-  const cloudRunDisabled = props.disabled || props.runLocationLocked || participant.kind !== "codex-cli";
-  const cloudRunTooltip = props.runLocationLocked
-    ? `Run location is locked because @${participant.handle} has already run in this chat.`
-    : participant.kind !== "codex-cli"
-    ? "Cloud Runs currently supports Codex members only."
-    : cloudRunOn
-    ? "Run this member on the Cloud Runs worker."
-    : "Run this member locally.";
 
   return (
     <div className="chat-runtime-controls" aria-label={`Runtime controls for ${chatParticipantDisplayName(participant)}`}>
-      <div className="chat-rt-toggleline">
-        <span className="chat-rt-toggle-label">Cloud Run:</span>
-        <PopoverSwitch
-          checked={cloudRunOn}
-          disabled={cloudRunDisabled}
-          ariaLabel="Cloud Run"
-          tooltip={cloudRunTooltip}
-          onChange={(checked) => update({ remoteExecution: checked ? "remote" : "local" })}
-        />
-      </div>
+      <ParticipantRunLocation kind={participant.kind} homeMachineId={participant.homeMachineId} cloudRun={participant.cloudRun}
+        unassigned={chatParticipantHomeIsUnassigned(participant)} disabled={controlsDisabled}
+        locked={props.runLocationLocked} moves={props.runLocationMoves} handle={participant.handle} onChange={update} />
 
       <div className="chat-rt-group">
         <div className="chat-rt-group-title">Model &amp; permissions</div>
@@ -199,7 +187,7 @@ export function ParticipantRuntimeControls(props: {
             value={managePermission}
             prefix="Manage members:"
             displayLabel={managePermissionLabel}
-            tooltip="Controls whether this member can add or change roles and chat members."
+            tooltip="Controls whether this member can add, remove or change roles and chat members."
             muted={managePermission === "deny"}
             disabled={controlsDisabled}
             options={PARTICIPANT_REQUEST_PERMISSION_OPTIONS}
@@ -290,13 +278,12 @@ function GhostSelect(props: {
       </select>
     </span>
   );
-  if (!props.tooltip) {
-    return control;
-  }
+  // Always wrapped: a tooltip that appears later (a failed model lookup) must
+  // not remount the select the user may have open.
   return (
     <Tooltip>
       <TooltipTrigger asChild>{control}</TooltipTrigger>
-      <TooltipContent side="top">{props.tooltip}</TooltipContent>
+      {props.tooltip && <TooltipContent side="top">{props.tooltip}</TooltipContent>}
     </Tooltip>
   );
 }
@@ -337,6 +324,7 @@ function GhostModelSelect(props: {
         muted={!model}
         disabled={props.disabled}
         options={options}
+        tooltip={modelDetectionFailureText(catalog)}
         onChange={(next) => {
           if (next === MODEL_DEFAULT_VALUE) {
             setManual(false);

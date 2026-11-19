@@ -9,6 +9,7 @@ import {
 import { CHAT_AUTO_WATCH_WAKE_LIMIT_DEFAULT } from "../../shared/chatAutoWatch";
 import { DEFAULT_CHAT_PROMPT_CONTEXT } from "../../shared/chatPromptContext";
 import { CLI_AGENT_RUN_TIMEOUT_DEFAULT_MS } from "../../shared/cliAgentRunSettings";
+import { EMPTY_MOBILE_CONTROL_SETTINGS } from "../../shared/mobilePairing";
 
 const ROLE: ChatRoleConfig = {
   id: "custom-engineer",
@@ -57,6 +58,7 @@ function settingsServiceWith(initial: { chatParticipantConfigs?: unknown[]; cliP
   service.getPublicSettings = async (): Promise<AppSettings> => ({
     roundLimitDefault: stored.roundLimitDefault,
     betaUpdates: false,
+    crashReports: true,
     cliAgentRunTimeoutMs: stored.cliAgentRunTimeoutMs,
     chatAutoWatchWakeLimit: stored.chatAutoWatchWakeLimit,
     chatParticipantRequestMaxDepth: stored.chatParticipantRequestMaxDepth,
@@ -69,6 +71,8 @@ function settingsServiceWith(initial: { chatParticipantConfigs?: unknown[]; cliP
     chatSavedPrompts: stored.chatSavedPrompts,
     chatParticipantConfigs: stored.chatParticipantConfigs,
     chatParticipantSeedState: stored.chatParticipantSeedState,
+    mobileControl: EMPTY_MOBILE_CONTROL_SETTINGS,
+    chatCustomAvatars: [],
     cliProviderHosts: service.publicCliProviderHosts(stored)
   });
   return { service, stored: () => stored };

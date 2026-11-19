@@ -57,6 +57,9 @@ export function authorForMessage(message: Conversation["messages"][number], kind
   if (message.role === "user") {
     return "You";
   }
+  if (message.role === "script") {
+    return `⚙ ${message.metadata?.scriptName ?? message.participantLabel ?? "Scheduled task"}`;
+  }
   if (kind === "implementation-plan" && (message.role === "system" || message.role === "summary" || message.participantId?.startsWith("arbiter:"))) {
     return "Planner";
   }

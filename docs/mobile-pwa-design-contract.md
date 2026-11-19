@@ -1,0 +1,328 @@
+# Mobile PWA Design Contract
+
+The mobile PWA must match `design_handoff/Mobile (packed).html` exactly at the component/geometry level. This is not an approximate visual reference.
+
+## V1 Acceptance Scope
+
+For v1, Mobile control is device-level access to the current desktop/app instance:
+
+- the QR flow must use the managed AccordAgents static origin by default and pair the phone with the User's own server (a one-time code from Settings → Device Pairing), with no endpoint setup required from the user; without a server Device Pairing says "Set up your server first";
+- the PWA must show the available chat list and let the user open and work with any existing chat in that app instance;
+- the v1 UI must not present "Invite person", per-chat invite setup, or custom endpoint fields on the managed-default path.
+
+The pairing/package architecture may keep future extension points for scoped chat invites and different participants, but those are not v1 acceptance behavior.
+
+The functional PWA uses the "Chat timeline" screen from the handoff as the paired-conversation default:
+
+- stage background `#eceef2`
+- phone frame `390px x 844px`, `44px` radius, white surface, border `#dcdee5`, and the same two-layer shadow
+- status bar height `52px`, `9:41` typography, signal and battery indicators
+- chat header padding `2px 16px 12px`, `44px` icon buttons, bottom border `#f0f1f4`
+- timeline padding `16px 18px 10px`, `20px` message gap
+- user bubble max width `82%`, background `#eceff3`, radius `18px 18px 6px 18px`, padding `11px 14px`
+- composer height `46px`, pill radius `23px`, input background `#f6f7f8`, border `#e7e9ee`, and circular `46px` send button
+
+Desktop/browser QA may show the phone frame centered. Narrow real-mobile viewports fill the viewport without the outer preview border/shadow, but the interior component geometry and typography stay the same.
+
+## Chats header
+
+Decided by the User on 2026-09-15 (PWA polish round): the handoff's "New chat"
+button is not rendered. The phone cannot create a chat — that needs the desktop's
+member roster and a protocol the phone does not have — and a control that does
+nothing is worse than none. The "Search chats" button stays and filters the list
+the phone already holds (title, last sender, last message) without asking the
+desktop. The header geometry is otherwise the handoff's.
+
+Since 2026-10-29 the phone does start chats (New chat, as the computer's), and
+since 2026-11-01 the header's button is search again: see "Start screen, New
+chat and search" below.
+
+## Start screen, New chat and search (2026-11-01)
+
+Decided by the User on 2026-11-01, after Claude's app:
+
+- A fresh start of the app opens on New chat, not on the chat or tab that was
+  open last. Coming back to the app while it is still running is not a start
+  and keeps its place. A launch that says where to go — a tapped notification,
+  a pairing code — goes there instead. A phone paired for one chat cannot start
+  chats and still opens on that chat.
+- New chat has no bar and no back or cancel control: the round menu button at
+  its top left opens the chats (the Chats tab, leaving any open chat), and the
+  bar is there.
+- The bar's round button beside Chats · Activity · Settings is New chat (it was
+  search). Inside a chat it is there too, under the composer.
+- Search is the icon in the Chats header, so it is reachable only where the
+  chats are listed; it filters what the phone holds, as before. Searching the
+  messages inside chats is a separate, later change.
+- The chat list's rows carry no avatars: the title, the last line and when.
+- Started without a connection (or on a server error), New chat says the
+  server could not be reached and reads the computer's offer again by itself,
+  with growing pauses up to a minute while it is on screen, in front and
+  online, and at once when the phone comes back online or in front. An older
+  server's refusal is not asked again. Left up untouched for more than five
+  minutes, New chat reads the offer again on coming back; once something on
+  it was touched, the offer on screen stays as it was. A phone taken off the
+  server is not held on New chat: the chats screen says it was removed and how
+  to pair again.
+- The installed app's home screen icon is the Mac app's icon (iOS reads
+  `apple-touch-icon`, not the manifest, and drew a grey letter without it). iOS
+  keeps the icon an app was added with: only an app added again shows it.
+
+## Members button in the chat header (2026-11-01)
+
+Decided by the User on 2026-11-01 (option B of the mockup): the chat's title
+opened the members sheet, but nothing on screen said so. The header now ends
+with a button showing people and how many members the chat has; it opens the
+same sheet, and the title still does too. It takes the header spacer's place;
+the send log's button, when there, sits before it.
+
+## Dark appearance
+
+Decided by the User on 2026-09-15 (PWA polish round): the PWA follows the phone's
+own appearance setting. Under `prefers-color-scheme: dark` the stylesheet restates
+its surface variables with the desktop's dark palette (`src/renderer/styles/app-theme.css`,
+`.dark`), so a chat looks the same on both. The light values stay the handoff's;
+component geometry and typography do not change between the two.
+
+## Members' avatars, hidden rows, folded projects (2026-09-18 parity round)
+
+Avatars are the desktop's, by the desktop's own rule. `src/shared/chatAvatarCatalog.ts`
+is the one description of which picture a member shows (catalog id, provider,
+glyph or photo, the hashed default when nothing was chosen, a drawn avatar by
+id, the app mark for the chat assistant); the desktop renderer derives its
+options from it and the phone loads it verbatim as `mobile-shared.js`, with
+every built-in avatar copied under its catalog id by the mobile build. A drawn
+avatar's bytes are asked of the User's server (`/v1/phone/avatar`); initials
+stand in until they arrive, as on the desktop. The phone never guesses a picture
+from a handle. The disc contract is the desktop's too: one frame, a glyph at
+75 % or a photo at 100 %, per-kind disc colours stated once.
+
+What the desktop keeps off its timeline stays off the phone's: internal system
+triggers ("Auto-resumed @x after member request"), control text, waiting
+statuses, inferred request carriers. A hidden member message still travels,
+flagged, because it can be the message that ends a run; the phone settles the
+run's row on it and stores no bubble. Rows stored before the desktop stopped
+sending them are swept once on the first launch of this shell.
+
+Projects in the chat list fold and unfold from their header, with the desktop's
+chevron. Phone-only, because the phone is reopened many times a day: the fold is
+remembered across launches, and a folded header shows how many chats it holds
+and the unread dot when one of them has news. While a search is open the headers
+are plain labels and every match is shown.
+
+The chat list's rows have carried no avatars since 2026-11-01; members' avatars
+are on their messages and in the members sheet.
+
+## Bottom bar, Activity and Settings (2026-09-19)
+
+Decided by the User on 2026-09-19: the phone gets a bottom bar, option B of the
+proposal — a floating capsule with Chats · Activity · Settings and search on its
+own round button beside it, as Slack does it. The bar shows on those three home
+screens of a paired phone, and it steps aside while a choice opened from
+Activity is on screen and while the chat search is open. The Chats header no
+longer carries the search button; the bar's button opens the chat search,
+switching to Chats first when another tab is open.
+
+Since 2026-11-01 the round button is New chat and search is back in the Chats
+header (see "Start screen, New chat and search").
+
+**Inside a chat (2026-09-20).** The 2026-09-19 decision had the bar gone inside
+a chat. The User changed it the next day, pointing at Slack: in a chat the bar
+is there too, below the composer, and it leaves only while the keyboard is up —
+with the keyboard open there is no room for it and it would sit on top of it.
+So inside a chat the bar is in the column under the composer rather than
+floating over the timeline, the composer gives up its own bottom safe-area room
+to the bar, and the bar is hidden exactly while the composer holds focus (the
+same test the height tracker uses for the keyboard, so the two cannot disagree).
+A reader who was at the latest message stays there when the bar comes and goes.
+A tab tapped inside a chat leaves the chat for that screen, the way the back
+button does, and leaves the chat's dialogs closed behind it. (Since 2026-11-01
+the bar's round button there is New chat, which leaves the chat too.) The chat's own dialogs — a
+picture at full size, the members sheet — take the bar with them while they are
+open, as the opened choice does on Activity; the live-reply view does not,
+because it is a screen of the chat rather than a dialog.
+
+The Activity number keeps counting while a chat is open, because in there the
+bar is the only place the User is told that something is waiting. It is the
+number alone that is recomputed, never the lists, and it is recomputed from
+rows already read: a pass over a week of stored rows costs hundreds of
+milliseconds on a phone with a busy week behind it, and inside a chat that
+would be paid again every second or so while a member streams into it. What
+waits for the User is counted from the cards, which are read from storage
+anyway, so a question arriving for another chat is counted at once; what can
+lag behind until the chat is left is the count of finished updates. The number
+is the same one the home screens show, the open chat's own waiting cards
+included — it is one count of what waits, not a count of elsewhere.
+
+Activity is built on the phone from what it has already read from the User's
+server — the timeline rows every `mobile.timeline.events` page stores and the
+cards riding with them (`src/mobile/mobile-activity.js`). Nothing more is asked
+of the server for it. Only chats in the chat list are shown; a page for a chat
+the phone's list does not have yet asks for the list again. Its three lists
+follow the desktop's Activity:
+
+- Running — a member run still in progress, one row per run and member, with a
+  small round stop (44px to tap). A row that reached the phone well before a
+  chat list saying nothing runs in that chat is a run the phone never saw end,
+  and is left out.
+- Pending — a permission or a choice a member is waiting on. A permission is
+  answered in the row (Allow/Deny) and so shows every word of what is being
+  allowed, line breaks kept, with the machine it will run on; one tap answers
+  it and the other option goes dead. A choice shows its question and opens in
+  full: the message it belongs to, then the chat's own card.
+
+Cards a member is waiting on are in the chat itself and scroll with it, as on
+the desktop (the User, 2026-09-24: a strip of their own above the composer cut
+the cards off against the chat and read as a card going under the text). A
+choice stands under the message that asked it and nowhere else: in the thread
+when it was asked in a thread, further up when its message is further up in
+the history (the User, 2026-10-01: a question asked in a thread stood at the
+bottom of the main chat). Only what has no message, a permission, is the
+chat's last item. Activity lists every waiting card wherever it stands.
+
+A choice card is laid out as the desktop's is, in the chat and on Activity
+alike (the User, 2026-09-22): every option a numbered row at full width with
+its description, the member's recommendation marked "Recommended" and picked
+up front, "Write your own answer" last; picking it opens its box under it, for
+the finger to tap, as the note's is (never focused from script). Picking only selects; Submit answers,
+so a tap made while scrolling cannot answer. A picked option can carry a note:
+its box opens right under the picked option, moves with the pick with its text
+kept, and is tapped like the composer (the User, 2026-09-24: folded behind "Add
+a note" and focused from script, it came up behind the iPhone's keyboard, typed
+out of sight; under the whole list it started below the fold). Cancel and
+Submit end the card, after every option, and scroll with it (the User,
+2026-09-24: pinned to the foot of a long choice they lay on top of the options).
+A pick or a note being typed survives the chat being drawn again, and an answer
+sent keeps them until the card is answered or withdrawn. An answer on its way
+folds the card at once to what was answered ("Your answer: …") and fades it, or
+its Activity row, a little, and says nothing about how far it has got; once the
+chat on the server states it answered the card reads "Answered: …" at full strength. A failure, or
+that the answer can be given again, still opens the card and says so (the User,
+2026-09-24). A message of the User's is shown the same way on every device
+(the User, 2026-10-29, replacing the words of agreements Д3 and Д5 of
+2026-10-28): faded until her server accepted it, then as any message, with
+only its time; a member's reply appearing under it is the sign that work
+started. Only a message the server refused says something: "Not taken by
+your server:" and the server's reason, in one line under it. The header does not report sends on their way: it says
+"Synced", or "Not connected" from a send that could reach nothing until a send
+gets through.
+- Finished — finished member messages from the last 7 days, one row per chat
+  and member, with a count badge when the row stands for more than one run
+  (accent while unseen, grey once seen). The message a waiting question belongs
+  to is listed under Pending only.
+
+Every row reads "<chat title> by @handle" on its first line (the handle in the
+plain weight), then the message; the whole row opens its chat, or the thread the
+update is in. A finished update counts as seen once its chat was opened on the
+phone after the update reached the phone — both times on the phone's own clock,
+never compared with a desktop stamp. The list tab is chosen once (Pending when
+something waits, else Running, else Finished) and then kept until the User
+changes it, so rows do not move under a finger; a tap that lands within a
+moment of the list being redrawn is ignored. The Activity tab's number is what
+waits for the User plus the finished updates not seen yet.
+
+**What the phone can vouch for (2026-09-21).** The phone is a replica fed by
+several channels — the live socket, the mailbox, the pages it asks for, a
+machine's own channel — and for a while nothing reconciled that replica with
+the desktop. A card closed on the desktop stayed "waiting" on the phone for
+days (the User's screenshot of 2026-09-20), because the batch that closed it
+was lost, or was never written: a cancelled choice changes no message row, and
+a batch with cards and no rows was dropped before it reached the mailbox.
+Since 2026-10-26 the phone has one source, the User's server: the chat list,
+a chat's pages, its cards and what changed are all read from the server's copy.
+Now:
+
+- The chat list carries, per chat, the cards still waiting there and when the
+  list was built. The phone drops a pending card it holds that the list no
+  longer names, unless the card is younger than the list (it may have missed
+  it). Answered cards are kept: they are the record under their messages.
+- The page a chat is opened with carries the chat's cards, so opening a chat
+  reconciles it too.
+- The cards are the server's own (since 2026-10-28, agreement Д9): raised by
+  the device the member runs on, answered once from any device (a second
+  answer is refused), settled by the raising device. The chat list names each
+  chat's cards that wait for the User; a chat's page carries its cards that
+  wait or were answered and wait to be applied ("Allowed. Waiting for it to be
+  applied.", an approved removal as the desktop words it), and a choice's
+  answer stays under its message as the record. A settled card leaves.
+- An answer sent is a mark the phone keeps across launches, named after the
+  queue entry that carries the answer; while it holds, the card is faded and
+  says nothing more (whether the entry has reached the server yet is not
+  spelled out, the User, 2026-09-24). The mark goes when the chat on the
+  server states the card answered or withdrawn. A mark older than ten minutes
+  with the card still waiting has stopped meaning anything — the answer was lost on its way
+  or refused — so the card unlocks and says "Answer sent, but not applied yet.
+  You can answer again."; an answer the server refused unlocks at once and
+  says the server's reason ("Not taken by your server: … You can answer
+  again."). A second answer
+  replaces the first one still on its way rather than racing it: the earlier queue entry is set aside, never sent. An answer the server
+  has already taken is not lost, only waiting for the member's home (the
+  desktop, or the machine that hosts the member) to apply it: that card stays
+  locked for an hour, because a second answer given meanwhile only raced the
+  first, and the older one won. An hour and not longer, because a home can
+  hold an answer it cannot apply without the phone hearing of it.
+- A choice answer the member's home refuses (an option it does not have, a
+  member no longer in the chat, an archived chat) is kept on the choice, by the
+  operation it was sent under, while the choice still waits; the last few are
+  kept. The card the phone reads names them, and the phone that sent one of
+  them stops waiting at once: the card opens again with the reason and what was
+  picked and typed (the User, 2026-10-01: an own answer refused this way stayed
+  "on its way" for an hour). An own answer goes out under the desktop's
+  own-answer option, `__custom__`.
+- Everything the phone writes is one operation of the server's (`POST
+  /v3/ops`): a message, a Stop, an answer to a card, each kept on the phone
+  under its own id until the server answers it. Accepted (or a repeat of one it
+  took) is sent; rejected is not taken, for good, with the server's reason on
+  the message or the card. Any other failure — no connection, a timeout, an
+  error of the server's own — leaves it waiting, and it is offered again; the
+  server takes an operation once however often it arrives. Two messages with
+  the same words are two messages: the phone matches its own messages with the
+  server's copies by id, never by text.
+- Every failed try to send is written to the send log on the phone (agreement
+  Д12): when, what (a message and a little of its text, a Stop, an answer),
+  its chat, and why. The newest two hundred are kept. The log opens from the
+  chat's header — a warning button takes the place of the header's spacer
+  while something sent has not reached the server, or after a refusal not yet
+  looked at — and from Settings → This phone → Send log.
+- Sending twice in a row works: the second message is queued while the first
+  is still going out, and goes out right behind it. A tap on a row in
+  Activity is dropped only for half a second after rows have actually moved,
+  not after every redraw (the clock, a streaming preview kept every Allow and
+  Stop dead a third of the time while a member streamed).
+- A message opens on its own screen on tap, except a system note: the desktop
+  offers a thread on every message but those, and the phone offers exactly
+  what the desktop does. The way back returns to the place the chat was being
+  read, as Slack's message screen does; the pill says whether anything new
+  waits below. A reply written with a thread open is placed in that thread; a
+  thread root the chat does not hold sends the message to the chat itself,
+  with a warning, rather than into a thread nobody can open.
+- A tapped notification lands on the Activity list it was about: Pending for
+  an approval, Finished for a reply. A batch that carries only cards does not
+  mark its chat unread: the refresh the desktop sends after the phone's own
+  answer said nothing new.
+- A launch that cannot reach the User's server keeps the push subscription it
+  has: the server's key is fetched before the old subscription is given up,
+  and a launch that could not register tries again at the next launch. The
+  server rings the phone itself, desktop or no desktop; a push carries no
+  message text.
+- A change the desktop or a machine cannot apply is held and tried again;
+  after two weeks it is given up, never in silence (Settings → Your server
+  says so; `docs/parity-requirements.md`).
+- The queue is offered to the server for every chat at once on a send, on
+  launch, when the network comes back and on return to the foreground, and
+  while the app is open again two seconds after a try that got no answer,
+  then twice as long each time up to half a minute. One try at a time; one that
+  has not finished in two minutes no longer holds the queue back. Clearing a finished row in
+  Activity names the update under every identity it goes by (its run and its message), so a later copy
+  of the same message from another path cannot bring it back.
+- The timeline store is read by chat, through an index: applying one delivered
+  batch used to scan the whole store per row (2.5 s for forty rows on a store
+  of eight thousand, measured in Chrome), which is why messages arrived in
+  lumps and the live text stood still; it is about 0.1 s now.
+
+Settings holds only what the phone can do about itself: the pairing, message
+alerts (offered while undecided, otherwise described — iOS does not let a web
+app switch its own alerts off, so there is no switch), and waking the cloud
+machine through the User's server when the server holds a start key for it
+(the server also wakes a machine by itself when work waits for it; the phone
+holds no key).

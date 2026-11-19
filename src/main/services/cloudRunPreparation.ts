@@ -1,0 +1,425 @@
+import { createHash, randomUUID } from "node:crypto";
+import type { AwsWorkerStatus, CloudRunWorkerSettings } from "../../shared/types";
+import type { MachineRecord } from "../../shared/machineLink";
+import type { MachineInstallRecord, MachineInstallRequest, MachineInstallResult, MachineInstallSnapshot, MachineMirrorBootstrapResult } from "../../shared/machineInstall";
+import { MACHINE_RECOVERY_OPERATION_PREFIX } from "../../shared/machineInstall";
+import type { CloudRunPreparationProgress, CloudRunPreparationState, PrepareCloudRunRequest, PrepareCloudRunResult } from "../../shared/cloudRunPreparation";
+
+interface Options {
+  onProgress?(snapshot: CloudRunPreparationState): void;
+  configuredInstanceId(): Promise<string | undefined>;
+  appVersion: string;
+  environmentId(): Promise<string>;
+  aws: {
+    status(): Promise<AwsWorkerStatus>;
+    ensureExistingWorkerForRun(instanceId: string, options?: { start?: boolean }): Promise<CloudRunWorkerSettings>;
+  };
+  listMachines(): Promise<MachineRecord[]>;
+  listInstalls(): Promise<MachineInstallRecord[]>;
+  createMachine(name: string, awsInstanceId: string): Promise<MachineRecord>;
+  /** Throws, with what Settings says, when there is no server of the User's
+   *  for a cloud machine to connect through: checked before AWS is touched. */
+  requireServer?(): Promise<void>;
+  install(request: MachineInstallRequest, progress: (snapshot: MachineInstallSnapshot) => void): Promise<MachineInstallResult>;
+  /** A setup or update already running on the machine (the automatic
+   *  upgrade after a desktop update): waited for, so selecting a member does
+   *  not fail on a lock held by a background action. */
+  awaitActiveInstall?: (machineId: string) => Promise<void>;
+  isConnected(machineId: string): boolean;
+  bootstrapProject(machineId: string, localPath: string, signal?: AbortSignal, progress?: (message: string) => void): Promise<MachineMirrorBootstrapResult>;
+  saveInstall(record: MachineInstallRecord): Promise<void>;
+  prepareMachine(worker: CloudRunWorkerSettings, record: MachineInstallRecord): Promise<void>;
+  prepareProvider(worker: CloudRunWorkerSettings, provider: PrepareCloudRunRequest["provider"], record: MachineInstallRecord,
+    progress: (snapshot: Omit<CloudRunPreparationProgress, "operationId">) => void): Promise<void>;
+}
+
+interface PreparedMachine {
+  identity: string;
+  instanceId: string;
+  machine: MachineRecord;
+  worker: CloudRunWorkerSettings;
+  record: MachineInstallRecord;
+  providers: Set<PrepareCloudRunRequest["provider"]>;
+  retryProviders: Set<PrepareCloudRunRequest["provider"]>;
+}
+
+function preparationIdentity(machine: MachineRecord, record: MachineInstallRecord): string {
+  return JSON.stringify([machine.id, machine.awsInstanceId, machine.deviceId, machine.lastHello?.instanceId,
+    machine.lastHello?.instanceStartedAt, machine.lastHello?.instanceSequence, machine.lastHello?.appVersion,
+    record.installRoot, record.userDataDir, record.profileHome, record.serviceName, record.serviceScope,
+    record.target.host, record.target.port, record.target.user, record.target.identityFile, record.target.hostKeyAlias]);
+}
+
+function withoutTrailingSlash(path: string): string {
+  return path.length > 1 ? path.replace(/\/+$/, "") : path;
+}
+
+export function cloudEnvironmentDirectory(environmentId: string): string {
+  if (!environmentId.trim()) throw new Error("This desktop has no environment identity.");
+  return `accordagents-${createHash("sha256").update(environmentId).digest("hex").slice(0, 24)}`;
+}
+
+/** The user's Cloud run selection prepares the existing instance. This never
+ * provisions another server, moves a participant or starts a provider turn. */
+export class CloudRunPreparationService {
+  private active?: Promise<PrepareCloudRunResult>;
+  private activeProvider?: PrepareCloudRunRequest["provider"];
+  private activeInstance?: string;
+  private listeners = new Set<(message: Omit<CloudRunPreparationProgress, "operationId">) => void>();
+  private latest?: Omit<CloudRunPreparationProgress, "operationId">;
+  private projects?: Promise<Map<string, Record<string, string>>>;
+  private projectTasks = new Map<string, Promise<void>>();
+  private recordWrites: Promise<unknown> = Promise.resolve();
+  private states = new Map<string, CloudRunPreparationState>();
+  private prepared?: PreparedMachine;
+
+  constructor(private readonly options: Options) {}
+
+  private key(request: Pick<PrepareCloudRunRequest, "provider" | "instanceId">): string {
+    return `${request.provider}:${request.instanceId ?? "configured"}`;
+  }
+
+  snapshot(request: Pick<PrepareCloudRunRequest, "provider" | "instanceId">): CloudRunPreparationState | undefined {
+    return this.states.get(this.key(request));
+  }
+
+  private publish(request: PrepareCloudRunRequest, phase: CloudRunPreparationState["phase"],
+    snapshot: Omit<CloudRunPreparationProgress, "operationId">, machine?: MachineRecord): void {
+    const state: CloudRunPreparationState = { ...snapshot, operationId: request.operationId,
+      provider: request.provider, instanceId: request.instanceId, phase, ...(machine ? { machine } : {}) };
+    this.states.set(this.key(request), state);
+    this.options.onProgress?.(state);
+  }
+
+  private projectIndex(): Promise<Map<string, Record<string, string>>> {
+    if (!this.projects) {
+      this.projects = this.options.listInstalls().then(records => new Map(records.map(record => [record.machineId, record.projects ?? {}])));
+      void this.projects.catch(() => { this.projects = undefined; });
+    }
+    return this.projects;
+  }
+
+  async repositoryPaths(sourcePath: string): Promise<Record<string, string>> {
+    return Object.fromEntries([...(await this.projectIndex())].flatMap(([id, paths]) =>
+      typeof paths[sourcePath] === "string" ? [[id, paths[sourcePath]]] : []));
+  }
+
+  /** Bootstrap once, outside the chat mutation lock. Existing projects and
+   * participant-created worktrees are reused without another copy. */
+  async prepareProject(machineId: string, localPath: string, signal?: AbortSignal, progress?: (message: string) => void,
+    options: { checkCopy?: boolean } = {}): Promise<void> {
+    signal?.throwIfAborted();
+    progress?.("Preparing the project on your cloud machine…");
+    let started = false;
+    const task = this.inProjectQueue(machineId, async () => {
+      started = true;
+      signal?.throwIfAborted();
+      const index = await this.projectIndex();
+      signal?.throwIfAborted();
+      // `checkCopy` (adding a project in Settings) asks the machine itself
+      // whether the copy is there, so a recorded copy that went is made again.
+      if (!options.checkCopy && index.get(machineId)?.[localPath]) return;
+      const records = await this.options.listInstalls();
+      const record = records.find(item => item.machineId === machineId);
+      if (!record) {
+        if (options.checkCopy) throw new Error("This machine was not set up from this computer.");
+        return; // Manually enrolled machines keep their own path.
+      }
+      signal?.throwIfAborted();
+      const result = await this.options.bootstrapProject(machineId, localPath, signal, progress);
+      signal?.throwIfAborted();
+      // A dirty checkout is already the machine's working copy. Keep every
+      // change and worktree, and run there; never copy over it to make it clean.
+      if (!["clean", "dirty", "directory"].includes(result.inspection.state) || !result.inspection.path.startsWith("/")) {
+        throw new Error(result.message || "The cloud project could not be prepared.");
+      }
+      await this.withRecordLock(async () => {
+        const current = (await this.options.listInstalls()).find(item => item.machineId === machineId);
+        if (!current) throw new Error("The machine was removed during project setup.");
+        const projects = { ...current.projects, [localPath]: result.inspection.path };
+        signal?.throwIfAborted();
+        await this.options.saveInstall({ ...current, projects });
+        index.set(machineId, projects);
+      });
+    });
+    // Cancelling a queued caller must not abort another chat's copy, release
+    // its queue reservation early, or make the caller wait for that copy.
+    let abortQueued: (() => void) | undefined;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abortQueued = () => { if (!started) reject(signal?.reason); };
+      signal?.addEventListener("abort", abortQueued, { once: true });
+    });
+    try { await Promise.race([task, cancelled]); }
+    finally { if (abortQueued) signal?.removeEventListener("abort", abortQueued); }
+  }
+
+  /**
+   * Forgets the project copies the User deleted on the instance (Settings →
+   * AWS), so the next turn in such a project copies it again, as the first
+   * time, instead of starting in a folder that is gone. Returns what was
+   * forgotten.
+   */
+  forgetRemovedCopies(removedPaths: string[]): Promise<Array<{ machineId: string; localPath: string }>> {
+    const roots = removedPaths.map(withoutTrailingSlash).filter((root) => root.startsWith("/") && root !== "/");
+    if (!roots.length) return Promise.resolve([]);
+    // Every record on this computer is checked: a copy recorded for another
+    // machine at the same path is only looked at again on its next turn.
+    return this.forgetCopies((_machineId, _localPath, remotePath) => {
+      const path = withoutTrailingSlash(remotePath);
+      return roots.some((root) => path === root || path.startsWith(`${root}/`));
+    });
+  }
+
+  /** Forgets one machine's copy of a project that turned out to be missing
+   *  there, so the next turn in it copies it again. */
+  async forgetProject(machineId: string, localPath: string): Promise<boolean> {
+    return (await this.forgetCopies((id, path) => id === machineId && path === localPath)).length > 0;
+  }
+
+  /** Drops the recorded copies `gone` names. Only the record's read and
+   *  write are serialized (with a copy's save): a copy still running for
+   *  another project does not hold it up. */
+  forgetCopies(gone: (machineId: string, localPath: string, remotePath: string) => boolean): Promise<Array<{ machineId: string; localPath: string }>> {
+    return this.withRecordLock(async () => {
+      const forgotten: Array<{ machineId: string; localPath: string }> = [];
+      for (const record of await this.options.listInstalls()) {
+        const kept: Record<string, string> = {};
+        const dropped: string[] = [];
+        for (const [localPath, remotePath] of Object.entries(record.projects ?? {})) {
+          if (typeof remotePath === "string" && gone(record.machineId, localPath, remotePath)) dropped.push(localPath);
+          else kept[localPath] = remotePath;
+        }
+        if (!dropped.length) continue;
+        await this.options.saveInstall({ ...record, projects: kept });
+        (await this.projectIndex()).set(record.machineId, kept);
+        forgotten.push(...dropped.map((localPath) => ({ machineId: record.machineId, localPath })));
+      }
+      return forgotten;
+    });
+  }
+
+  /** Install records' projects are read, changed and saved one at a time. */
+  private withRecordLock<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.recordWrites.then(work, work);
+    this.recordWrites = next.catch(() => undefined);
+    return next;
+  }
+
+  /** Runs after every project task already queued for the machine. */
+  private inProjectQueue(machineId: string, work: () => Promise<void>): Promise<void> {
+    const previous = this.projectTasks.get(machineId) ?? Promise.resolve();
+    const task = previous.catch(() => undefined).then(work);
+    this.projectTasks.set(machineId, task);
+    const forget = (): void => { if (this.projectTasks.get(machineId) === task) this.projectTasks.delete(machineId); };
+    void task.then(forget, forget);
+    return task;
+  }
+
+  async prepare(request: PrepareCloudRunRequest, progress: (snapshot: CloudRunPreparationProgress) => void): Promise<PrepareCloudRunResult> {
+    if (typeof request?.operationId !== "string" || !request.operationId.trim() || (request.provider !== "codex-cli" && request.provider !== "claude-code")) {
+      throw new Error("Choose a supported provider before preparing Cloud run.");
+    }
+    request = { ...request };
+    let currentInstance: string | undefined;
+    let prepared: PreparedMachine | undefined;
+    try {
+      currentInstance = await this.options.configuredInstanceId();
+      if (request.instanceId && request.instanceId !== currentInstance) {
+        throw new Error("This machine belongs to a different AWS instance. Select Cloud run to use the instance currently shown in Settings.");
+      }
+      prepared = await this.reusableMachine(currentInstance);
+    }
+    catch (error) {
+      this.publish(request, "error", { message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+    if (prepared?.providers.has(request.provider)) {
+      this.publish(request, "ready", { message: "Cloud run is ready." }, prepared.machine);
+      progress({ operationId: request.operationId, message: "Cloud run is ready." });
+      return { machine: prepared.machine };
+    }
+    // A second provider waits for the same machine, then checks its own login.
+    if (this.active && (this.activeProvider !== request.provider || this.activeInstance !== currentInstance)) {
+      const waiting = { message: "Waiting for the other cloud setup to finish…" };
+      this.publish(request, "preparing", waiting);
+      progress({ ...waiting, operationId: request.operationId });
+      await this.active.catch(() => undefined);
+      return this.prepare(request, progress);
+    }
+    const listener = (snapshot: Omit<CloudRunPreparationProgress, "operationId">): void => {
+      this.publish(request, "preparing", snapshot);
+      progress({ ...snapshot, operationId: request.operationId });
+    };
+    this.listeners.add(listener);
+    if (this.latest) listener(this.latest);
+    if (!this.active) {
+      this.activeProvider = request.provider;
+      this.activeInstance = currentInstance;
+      this.active = this.run(request.provider, currentInstance).catch(error => {
+        // Refresh access when retrying the failed provider, without making
+        // another member repeat a preparation that already succeeded.
+        if (this.prepared && this.prepared.instanceId === currentInstance) this.prepared.retryProviders.add(request.provider);
+        throw error;
+      }).finally(() => this.clearActive());
+    }
+    try {
+      const result = await this.active;
+      this.publish(request, "ready", { message: "Cloud run is ready." }, result.machine);
+      return result;
+    } catch (error) {
+      this.publish(request, "error", { message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+    finally { this.listeners.delete(listener); }
+  }
+
+  private clearActive(): void {
+    this.active = undefined;
+    this.activeProvider = undefined;
+    this.activeInstance = undefined;
+    this.latest = undefined;
+  }
+
+  private report(snapshot: Omit<CloudRunPreparationProgress, "operationId">): void {
+    this.latest = snapshot;
+    for (const listener of this.listeners) listener(snapshot);
+  }
+
+  private async reusableMachine(instanceId?: string): Promise<PreparedMachine | undefined> {
+    const prepared = this.prepared;
+    if (!prepared || prepared.instanceId !== instanceId || !this.options.isConnected(prepared.machine.id)) return;
+    const [machines, installs] = await Promise.all([this.options.listMachines(), this.options.listInstalls()]);
+    const machine = machines.find(item => item.id === prepared.machine.id);
+    const record = installs.find(item => item.machineId === prepared.machine.id);
+    if (!machine || !record || !this.options.isConnected(machine.id) || machine.lastHello?.appVersion !== this.options.appVersion
+      || preparationIdentity(machine, record) !== prepared.identity) return;
+    return { ...prepared, machine, record };
+  }
+
+  private remember(instanceId: string, machine: MachineRecord, record: MachineInstallRecord,
+    worker: CloudRunWorkerSettings): PreparedMachine {
+    const identity = preparationIdentity(machine, record);
+    const providers = new Set(this.prepared?.identity === identity ? this.prepared.providers : undefined);
+    return this.prepared = { instanceId, machine, record, worker, identity, providers, retryProviders: new Set() };
+  }
+
+  /**
+   * Sets the program on the instance's cloud machine up again, without
+   * preparing any provider: what the app does by itself when that program is
+   * not running, and what Settings → AWS offers when it is not set up or
+   * could not take its automatic-stop key. A machine that is
+   * connected and current is left running; a setup already under way is
+   * waited for, not raced. `machineId`: the machine to set up, when the
+   * caller knows which. `agentsChecked`: the caller has just asked the
+   * machine itself over SSH that no agent runs, so what its program last
+   * reported (stale once it is down) does not hold the setup back while it
+   * stays away; a program that is back by the time the setup starts is left
+   * to the automatic update, and one back before the drain is not stopped.
+   * `automatic`: the app's own recovery, which never starts, grows or holds
+   * the instance to its configured size.
+   */
+  async prepareRuntime(options: { agentsChecked?: boolean; machineId?: string; automatic?: boolean;
+    /** Each step of the setup, as it is reached. */
+    progress?: (message: string) => void; } = {}): Promise<void> {
+    while (this.active) await this.active.catch(() => undefined);
+    const listener = options.progress ? (snapshot: Omit<CloudRunPreparationProgress, "operationId">): void => {
+      try { options.progress?.(snapshot.message); } catch { /* A watcher never stops the setup. */ }
+    } : undefined;
+    if (listener) this.listeners.add(listener);
+    // Claimed before anything is awaited, so a second caller waits for this one.
+    this.active = (async () => {
+      const currentInstance = await this.options.configuredInstanceId();
+      this.activeInstance = currentInstance;
+      return this.run(undefined, currentInstance, { agentsChecked: options.agentsChecked, machineId: options.machineId,
+        ...(options.automatic ? { start: false } : {}) });
+    })().finally(() => this.clearActive());
+    try { await this.active; }
+    finally { if (listener) this.listeners.delete(listener); }
+  }
+
+  private async run(provider: PrepareCloudRunRequest["provider"] | undefined, expectedInstanceId?: string,
+    runtime: { agentsChecked?: boolean; machineId?: string; start?: boolean } = {}): Promise<PrepareCloudRunResult> {
+    const prepared = await this.reusableMachine(expectedInstanceId);
+    if (prepared && !provider && (!runtime.machineId || prepared.machine.id === runtime.machineId)) return { machine: prepared.machine };
+    if (prepared && provider && !prepared.retryProviders.has(provider)) {
+      if (!prepared.providers.has(provider)) {
+        await this.options.prepareProvider(prepared.worker, provider, prepared.record, snapshot => this.report(snapshot));
+        prepared.providers.add(provider);
+      }
+      return { machine: prepared.machine };
+    }
+    await this.options.requireServer?.();
+    this.report({ message: "Checking your AWS instance…" });
+    const status = await this.options.aws.status();
+    if (!status.handle || !status.configured || status.state !== "running") {
+      throw new Error(status.message || (!status.configured ? status.notices?.join(" ") : undefined) || "Start your AWS instance in Settings → AWS, then select Cloud run again.");
+    }
+    const instanceId = status.handle.instanceId;
+    if (expectedInstanceId && instanceId !== expectedInstanceId) {
+      throw new Error("This machine belongs to a different AWS instance. Select Cloud run to use the instance currently shown in Settings.");
+    }
+    const machines = await this.options.listMachines();
+    const installs = await this.options.listInstalls();
+    const installed = installs.find(item => item.target.hostKeyAlias === `accordagents-${instanceId}`);
+    let machine = (runtime.machineId ? machines.find(item => item.id === runtime.machineId) : undefined)
+      ?? machines.find(item => item.awsInstanceId === instanceId)
+      ?? machines.find(item => item.id === installed?.machineId);
+    if (machine && this.options.awaitActiveInstall) {
+      await this.options.awaitActiveInstall(machine.id);
+      const refreshed = (await this.options.listMachines()).find(item => item.id === machine?.id);
+      if (refreshed) machine = refreshed;
+    }
+    // The machine said its program was down, and it is back: nothing to set
+    // up here, and a version behind waits for the automatic update, which
+    // waits for the machine to be idle.
+    if (runtime.agentsChecked && machine && this.options.isConnected(machine.id)) return { machine };
+    this.report({ message: "Connecting to your AWS instance…" });
+    const worker = await this.options.aws.ensureExistingWorkerForRun(instanceId, runtime.start === false ? { start: false } : {});
+    if (!worker.host) throw new Error("AWS did not return an address for this instance.");
+    const existing = installs.find(item => item.machineId === machine?.id);
+    if (machine && existing?.installRoot && this.options.isConnected(machine.id) && machine.lastHello?.appVersion === this.options.appVersion) {
+      // Selecting another member must never drain an already running machine.
+      await this.options.prepareMachine(worker, existing);
+      if (provider) await this.options.prepareProvider(worker, provider, existing, snapshot => this.report(snapshot));
+      const remembered = this.remember(instanceId, machine, existing, worker);
+      if (provider) remembered.providers.add(provider);
+      this.report({ message: "Cloud run is ready." });
+      return { machine };
+    }
+    // A program that crashed mid-turn keeps reporting that turn: that may
+    // not keep it down once the machine itself said nothing runs (a turn
+    // asked meanwhile waits on the User's server). A program that came back
+    // meanwhile reports afresh, and that report counts again.
+    const checked = runtime.agentsChecked && !(machine && this.options.isConnected(machine.id));
+    if (!checked && machine?.lastHello?.activeRunIds?.length) {
+      throw new Error("The cloud runtime needs an update. Finish its current runs, then select Cloud run again.");
+    }
+    machine ??= await this.options.createMachine("Cloud run", instanceId);
+    // The AWS instance is shared, its enrollment, data and CLI home are not.
+    // Keep legacy paths on the desktop that already owns them so its provider
+    // sessions and participant-created worktrees are never moved or discarded.
+    const environmentId = await this.options.environmentId();
+    const directory = cloudEnvironmentDirectory(environmentId);
+    const established = existing?.installRoot ? existing : undefined;
+    const result = await this.options.install({
+      // A setup that trusted the SSH check is marked, so the drain refuses a
+      // program that came back while the new release was being staged.
+      machineId: machine.id, operationId: `${runtime.agentsChecked ? MACHINE_RECOVERY_OPERATION_PREFIX : ""}${randomUUID()}`, requiredProvider: provider,
+      installRoot: established?.installRoot || `~/${directory}`,
+      userDataDir: established?.userDataDir || undefined,
+      serviceName: established?.serviceName || undefined,
+      isolatedProfile: established ? established.isolatedProfile ?? Boolean(established.profileHome) : true,
+      target: { host: worker.host, user: worker.user, port: worker.port, identityFile: worker.identityFile, hostKeyAlias: worker.hostKeyAlias }
+    }, snapshot => this.report({ message: snapshot.error || snapshot.message, authUrl: snapshot.authUrl, authCode: snapshot.authCode,
+      authProvider: snapshot.authProvider, authRequestId: snapshot.authRequestId }));
+    if (result.snapshot.phase !== "ready") {
+      throw new Error(result.snapshot.error || result.snapshot.message || "Cloud setup did not finish. Select Cloud run to retry.");
+    }
+    this.report({ message: "Cloud run is ready." });
+    const restored = (await this.options.listMachines()).find(item => item.id === result.record.machineId);
+    if (!restored) throw new Error("The cloud machine was removed during setup. Select Cloud run again.");
+    const remembered = this.remember(instanceId, restored, result.record, worker);
+    if (provider) remembered.providers.add(provider);
+    return { machine: restored };
+  }
+}

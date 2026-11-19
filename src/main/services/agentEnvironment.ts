@@ -3,10 +3,10 @@ import type {
   AgentEnvironmentSnapshot,
   AgentEnvironmentValueProtection
 } from "../../shared/types";
-import { safeStorage } from "electron";
+import { hostPlatform } from "../platform";
 import { filterAllowedAgentEnvironment } from "../../shared/agentEnvironment";
 import { commandEnvironment, ensureLoginShellEnvPrimed } from "./command";
-import { forwardedDesktopEnvironment } from "./remoteRuns";
+import { forwardedDesktopEnvironment } from "./remoteWorkerTarget";
 import type { SettingsService } from "./settings";
 
 export const AGENT_ENVIRONMENT_LOCAL_DISCLOSURE =
@@ -63,6 +63,6 @@ export class AgentEnvironmentService {
   }
 
   private currentValueProtection(): AgentEnvironmentValueProtection {
-    return safeStorage?.isEncryptionAvailable?.() ? "os-encrypted" : "local-obfuscated";
+    return hostPlatform().secrets.isEncryptionAvailable() ? "os-encrypted" : "local-obfuscated";
   }
 }

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { MakerDMG } from "@electron-forge/maker-dmg";
 import { MakerSquirrel } from "@electron-forge/maker-squirrel";
@@ -11,6 +12,15 @@ const iconBasePath = path.join(assetsDir, "icon");
 const iconPath = `${iconBasePath}.icns`;
 const windowsIconPath = `${iconBasePath}.ico`;
 const sqliteResourcePath = path.join(assetsDir, "sqlite");
+// The headless Linux runtime a machine is installed with. It ships as a loose
+// resource, never inside the asar: rsync copies real files to the machine and
+// nothing inside an asar has a real path on disk. `npm run build` produces it.
+const machinePayloadPath = path.resolve(__dirname, "dist", "machine");
+// The User's own server program, installed on it over SSH the same way.
+const hubPayloadPath = path.resolve(__dirname, "dist", "hub");
+// The speech-to-text engine (scripts/build-whisper.mjs): a program the app
+// runs, so it ships as a real file beside the asar. macOS only.
+const whisperPayloadPath = path.resolve(__dirname, "dist", "whisper");
 const dmgBackgroundPath = path.join(assetsDir, "dmg-background.png");
 const entitlementsPath = path.resolve(__dirname, "entitlements.mac.plist");
 const entitlementsInheritPath = path.resolve(__dirname, "entitlements.mac.inherit.plist");
@@ -22,18 +32,6 @@ const hasNotarizeCredentials = Boolean(
   process.env.APPLE_TEAM_ID
 );
 const looseResourceSignSkipPattern = /\.(?:asar|bin|dat|icns|nib|pak)$/i;
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function ignoredRootDirectory(name: string): RegExp {
-  return new RegExp(`^/${escapeRegExp(name)}(?:/|$)`);
-}
-
-function ignoredRootFile(name: string): RegExp {
-  return new RegExp(`^/${escapeRegExp(name)}$`);
-}
 
 function shouldSkipLooseResourceSigning(filePath: string): boolean {
   return looseResourceSignSkipPattern.test(filePath);
@@ -69,54 +67,54 @@ const osxNotarizeOptions = hasNotarizeCredentials
   }
   : undefined;
 
+// The Windows installer is signed with the certificate whose thumbprint is in
+// WINDOWS_SIGN_CERT_SHA1, which scripts/sign-windows-x64.mjs sets after it has
+// signed the packaged app; the hook decides which files get our signature.
+// Without a thumbprint the installer stays unsigned.
+const windowsSignOptions = process.env.WINDOWS_SIGN_CERT_SHA1
+  ? { hookModulePath: path.resolve(__dirname, "scripts", "windows-sign-file.cjs") }
+  : undefined;
+
 const config = {
   packagerConfig: {
     name: productName,
     executableName: productName,
     appBundleId: process.env.MACOS_BUNDLE_ID || "com.juliakrivchikova.accordagents",
+    // node-pty's native parts run from real files: the terminal panel's host
+    // loads pty.node and execs spawn-helper, which cannot be inside an asar.
     asar: process.platform === "win32"
       ? { unpack: path.join("**", "node_modules", "node-pty", "prebuilds", "win32-x64", "**", "*.{node,dll,exe}") }
-      : true,
+      : { unpack: "**/node_modules/node-pty/prebuilds/darwin-*/{pty.node,spawn-helper}" },
     icon: process.platform === "win32" ? iconBasePath : iconPath,
-    ...(process.platform === "win32" ? { extraResource: [sqliteResourcePath] } : {}),
+    extraResource: [
+      ...(process.platform === "win32" ? [sqliteResourcePath] : []),
+      machinePayloadPath,
+      hubPayloadPath,
+      // A checkout without cmake builds no engine (and the release check
+      // refuses such an app); packaging it anyway must not fail here.
+      ...(process.platform === "darwin" && existsSync(whisperPayloadPath) ? [whisperPayloadPath] : [])
+    ],
     extendInfo: {
       CFBundleDisplayName: productName,
       CFBundleName: productName,
-      LSMinimumSystemVersion: "13.0"
+      LSMinimumSystemVersion: "13.0",
+      NSMicrophoneUsageDescription: "AccordAgents uses the microphone to dictate messages. Speech is recognized on this Mac."
     },
     ignore: [
-      ignoredRootDirectory(".claude"),
-      ignoredRootDirectory(".codex"),
-      ignoredRootDirectory(".github"),
-      ignoredRootDirectory(".gstack"),
-      ignoredRootDirectory(".history"),
-      ignoredRootDirectory(".idea"),
-      ignoredRootDirectory("assets"),
-      ignoredRootDirectory("brand-research"),
-      ignoredRootDirectory("docs"),
-      ignoredRootDirectory("lib"),
-      ignoredRootDirectory("out"),
-      ignoredRootDirectory("screenshots"),
-      ignoredRootDirectory("scripts"),
-      ignoredRootDirectory("signed"),
-      ignoredRootDirectory("src"),
-      ignoredRootFile(".env.local"),
-      ignoredRootFile(".env.local.example"),
-      ignoredRootFile(".gitignore"),
-      ignoredRootFile("AGENTS.md"),
-      ignoredRootFile("CLAUDE.md"),
-      ignoredRootFile("Makefile"),
-      ignoredRootFile("components.json"),
-      ignoredRootFile("entitlements.mac.inherit.plist"),
-      ignoredRootFile("entitlements.mac.plist"),
-      ignoredRootFile("forge.config.ts"),
-      ignoredRootFile("index.html"),
-      ignoredRootFile("package-lock.json"),
-      ignoredRootFile("tsconfig.json"),
-      ignoredRootFile("tsconfig.main.json"),
-      ignoredRootFile("tsconfig.renderer.json"),
-      ignoredRootFile("vite.config.mts"),
-      ...(process.platform === "win32" ? [] : [ignoredRootDirectory("node_modules/node-pty")]),
+      // Only runtime roots belong in the app; local worktrees and data must never ship.
+      /^\/(?!(?:dist|node_modules)(?:\/|$)|package\.json$).+/,
+      // The terminal panel's native module ships with its own platform's
+      // ready-made binaries only (the Windows ones are 58 MB), and without
+      // the sources it would be built from.
+      ...(process.platform === "win32" ? [] : [
+        /^\/node_modules\/node-pty\/prebuilds\/(?!darwin-)/,
+        /^\/node_modules\/node-pty\/(?:src|deps|third_party|scripts|binding\.gyp)(?:\/|$)/
+      ]),
+      // Shipped as a loose resource instead (machinePayloadPath); keeping it in
+      // the asar as well would ship the same 6 MB twice and still be unusable.
+      /^\/dist\/machine(?:\/|$)/,
+      /^\/dist\/hub(?:\/|$)/,
+      /^\/dist\/whisper(?:\/|$)/,
       /^\/dist\/renderer-tests(?:-|\/|$)/,
       /^\/dist\/codex-approval-renderer-test(?:\/|$)/,
       /^\/dist\/.*\.d\.ts$/,
@@ -128,8 +126,24 @@ const config = {
     ...(osxSignOptions ? { osxSign: osxSignOptions } : {}),
     ...(osxNotarizeOptions ? { osxNotarize: osxNotarizeOptions } : {})
   },
-  // node-pty ships N-API Windows binaries, so rebuilding it on Windows is unnecessary.
-  rebuildConfig: process.platform === "win32" ? { onlyModules: [] } : {},
+  hooks: {
+    // npm leaves node-pty's spawn-helper without the execute bit, and every
+    // terminal fails to start without it. Set before signing and before the
+    // asar step copies it out unpacked.
+    packageAfterPrune: async (_config: unknown, buildPath: string, _electronVersion: string, platform: string) => {
+      if (platform !== "darwin") return;
+      const { chmod, readdir } = await import("node:fs/promises");
+      const prebuilds = path.join(buildPath, "node_modules", "node-pty", "prebuilds");
+      for (const entry of await readdir(prebuilds).catch(() => [] as string[])) {
+        if (!entry.startsWith("darwin-")) continue;
+        await chmod(path.join(prebuilds, entry, "spawn-helper"), 0o755);
+      }
+    }
+  },
+  // node-pty ships ready-made N-API binaries for Windows and macOS, so it is
+  // never rebuilt; it is the app's only native production dependency. A
+  // rebuild would also put a build/Release copy ahead of the prebuild.
+  rebuildConfig: { onlyModules: [] },
   makers: [
     new MakerZIP({}, ["darwin"]),
     new MakerDMG({
@@ -163,7 +177,8 @@ const config = {
       ]
     }, ["darwin"]),
     new MakerSquirrel({
-      setupIcon: windowsIconPath
+      setupIcon: windowsIconPath,
+      ...(windowsSignOptions ? { windowsSign: windowsSignOptions } : {})
     }, ["win32"])
   ],
   plugins: [

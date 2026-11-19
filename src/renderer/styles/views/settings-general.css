@@ -11,7 +11,7 @@
 }
 
 /* Canonical pane title — one rule for every settings screen so titles share
-   the same face, size, and weight (the app's Space Grotesk display family). */
+   the same face, size, and weight (the app's display family). */
 .settings-view .settings-view-head h1 {
   font-family: var(--font-display);
   font-size: 21px;
@@ -29,12 +29,6 @@
   margin-left: auto;
 }
 
-.settings-view .settings-view-head-actions > button {
-  border: 0 !important;
-  box-shadow: none !important;
-  color: var(--app-muted);
-}
-
 .settings-view .gen-section {
   max-width: 740px;
   margin: 0 0 24px;
@@ -44,42 +38,44 @@
   margin-bottom: 0;
 }
 
+/* Sections, cards and rows follow the ChatGPT desktop app's settings: a 14px
+   section title, 13px row titles over 12px secondary lines, hairline card
+   edges and dividers, 12px by 16px row padding. */
 .settings-view .gen-section-head {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 9px;
+  margin-bottom: 16px;
 }
 
 .settings-view .gen-section-title {
   margin: 0;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 500;
-  line-height: 1.3;
+  line-height: 20px;
   color: var(--app-text-strong);
 }
 
 .settings-view .gen-section-title-solo {
-  margin-bottom: 10px;
+  margin-bottom: 16px;
 }
 
 .settings-view .gen-section-meta {
-  font-size: 13px;
-  color: var(--app-muted);
+  font-size: 12px;
+  color: var(--app-text-secondary);
 }
 
 .settings-view .gen-card {
   background: var(--app-surface);
-  border: 1px solid var(--app-border);
-  border-radius: 16px;
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--shadow-color) 6%, transparent);
+  border: 1px solid var(--app-hairline);
+  border-radius: 14px;
 }
 
 .settings-view .gen-card-divider {
-  height: 1px;
-  background: var(--app-border);
-  margin: 0 18px;
+  height: 0;
+  border-top: 0.5px solid var(--app-hairline);
+  margin: 0 16px;
 }
 
 /* ---- Local CLI rows ---- */
@@ -88,7 +84,7 @@
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 12px 18px;
+  padding: 12px 16px;
 }
 
 .settings-view .gen-cli-icon {
@@ -138,40 +134,17 @@
   color: var(--app-muted);
 }
 
-.settings-view .gen-host-edit {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--app-muted);
-  cursor: pointer;
-}
-
-.settings-view .gen-host-edit:hover {
-  border-color: var(--app-border);
-  color: var(--app-text-strong);
-}
-
-.settings-view .gen-host-edit:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-
 .settings-view .gen-host-add-row {
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 12px 18px;
+  padding: 12px 16px;
 }
 
 .settings-view .gen-host-add-hint {
-  font-size: 12.5px;
-  line-height: 1.4;
-  color: var(--app-muted);
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--app-text-secondary);
 }
 
 .provider-host-dialog .provider-host-form {
@@ -181,15 +154,16 @@
 }
 
 .settings-view .gen-cli-name {
-  font-size: 14.5px;
+  font-size: 13px;
   font-weight: 500;
+  line-height: 20px;
   color: var(--app-text-strong);
 }
 
 .settings-view .gen-cli-sub {
-  margin-top: 3px;
-  font-size: 13px;
-  color: var(--app-muted);
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--app-text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -201,7 +175,7 @@
   display: flex;
   align-items: center;
   gap: 20px;
-  padding: 14px 18px;
+  padding: 12px 16px;
 }
 
 .settings-view .gen-row-text {
@@ -210,17 +184,17 @@
 }
 
 .settings-view .gen-row-title {
-  font-size: 14.5px;
+  font-size: 13px;
   font-weight: 500;
+  line-height: 20px;
   color: var(--app-text-strong);
 }
 
 .settings-view .gen-row-desc {
-  margin-top: 2px;
   max-width: 430px;
-  font-size: 12.5px;
-  line-height: 1.5;
-  color: var(--app-muted);
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--app-text-secondary);
 }
 
 .settings-view .gen-row-control {
@@ -246,7 +220,8 @@
   grid-template-columns: repeat(2, minmax(120px, 180px));
 }
 
-.settings-view .gen-input {
+.settings-view .gen-input,
+.gen-aws-dialog .gen-input {
   min-width: 0;
   width: 100%;
   padding: 9px 11px;
@@ -257,9 +232,10 @@
   font: 500 13px var(--font-body);
 }
 
-.settings-view .gen-input:focus {
-  outline: 2px solid var(--app-accent);
-  outline-offset: 1px;
+.settings-view .gen-input:focus,
+.gen-aws-dialog .gen-input:focus {
+  outline: none;
+  border-color: var(--app-focus-border);
 }
 
 .settings-view .gen-select-wrap {
@@ -290,8 +266,16 @@
   gap: 8px;
 }
 
+/* Row actions share one width, so a column of buttons lines up on both
+   edges whatever the label. */
 .settings-view .gen-actions .gen-pill {
-  min-width: 92px;
+  min-width: 124px;
+  justify-content: center;
+}
+
+.settings-view .gen-actions .gen-pill .gen-pill-label {
+  flex: 0 1 auto;
+  text-align: center;
 }
 
 .settings-view .assistant-provider-select {
@@ -306,15 +290,17 @@
   flex-shrink: 0;
 }
 
+/* A row's control, like the ChatGPT app's: 28px, white, a hairline edge. */
 .settings-view .gen-pill {
   display: inline-flex;
   align-items: center;
-  gap: 9px;
+  gap: 6px;
   min-width: 206px;
-  padding: 9px 13px;
+  height: 28px;
+  padding: 0 12px;
   border-radius: 10px;
-  border: 1px solid var(--app-border);
-  background: var(--app-surface-subtle);
+  border: 1px solid var(--app-hairline);
+  background: var(--app-surface);
   cursor: pointer;
   transition:
     background 150ms ease,
@@ -322,20 +308,24 @@
     box-shadow 150ms ease;
 }
 
-.settings-view .gen-pill:hover {
+.settings-view .gen-pill:hover:not(:disabled) {
   background: var(--app-surface-hover);
   border-color: var(--app-border-strong);
 }
 
+.settings-view .gen-pill:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 .settings-view .gen-pill.is-open {
   background: var(--app-surface);
-  border-color: var(--app-border-strong);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--shadow-color) 6%, transparent);
+  border-color: var(--app-focus-border);
 }
 
 .settings-view .gen-pill:focus-visible {
-  outline: 2px solid var(--app-accent);
-  outline-offset: 2px;
+  outline: none;
+  border-color: var(--app-focus-border);
 }
 
 .settings-view .gen-pill-lead {
@@ -347,8 +337,8 @@
 
 .settings-view .gen-pill-label {
   flex: 1;
-  font-size: 13.5px;
-  font-weight: 500;
+  font-size: 14px;
+  font-weight: 400;
   color: var(--app-text-strong);
   white-space: nowrap;
   text-align: left;
@@ -400,8 +390,8 @@
 }
 
 .gen-menu-item:focus-visible {
-  outline: 2px solid var(--app-accent);
-  outline-offset: -2px;
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 .gen-menu-item-icon {
@@ -445,8 +435,8 @@
   display: inline-flex;
   align-items: center;
   width: 250px;
-  height: 44px;
-  border: 1px solid var(--app-border);
+  height: 28px;
+  border: 1px solid var(--app-hairline);
   border-radius: 10px;
   background: var(--app-surface);
   color: var(--app-text-strong);
@@ -456,15 +446,19 @@
   width: 100%;
   height: 100%;
   min-width: 0;
-  padding: 0 36px 0 14px;
+  padding: 0 32px 0 12px;
   border: none;
   outline: none;
   appearance: none;
   background: transparent;
   color: inherit;
-  font: 500 14px var(--font-body);
+  font: 400 14px var(--font-body);
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+.settings-view .prompt-context-select-wrap:focus-within {
+  border-color: var(--app-focus-border);
 }
 
 .settings-view .prompt-context-select-wrap svg {
@@ -479,20 +473,21 @@
 .settings-view .gen-timeout-field {
   display: inline-flex;
   align-items: stretch;
-  border: 1px solid var(--app-border);
+  height: 28px;
+  border: 1px solid var(--app-hairline);
   border-radius: 10px;
   background: var(--app-surface);
   overflow: hidden;
 }
 
 .settings-view .gen-timeout-input {
-  width: 56px;
-  padding: 9px 4px;
+  width: 48px;
+  padding: 0 4px;
   border: none;
   outline: none;
   background: transparent;
   text-align: center;
-  font: 500 14px var(--font-body);
+  font: 400 14px var(--font-body);
   color: var(--app-text-strong);
 }
 
@@ -500,20 +495,21 @@
   display: inline-flex;
   align-items: center;
   padding: 0 12px;
-  border-left: 1px solid var(--app-border);
-  font-size: 12.5px;
-  font-weight: 500;
+  border-left: 1px solid var(--app-hairline);
+  font-size: 14px;
+  font-weight: 400;
   color: var(--app-text-strong);
 }
 
 .settings-view .gen-timeout-save {
-  padding: 9px 16px;
+  height: 28px;
+  padding: 0 12px;
   border-radius: 10px;
-  border: 1px solid var(--app-border);
+  border: 1px solid var(--app-hairline);
   background: var(--app-surface);
   color: var(--app-muted);
-  font-size: 12.5px;
-  font-weight: 600;
+  font-size: 14px;
+  font-weight: 400;
   cursor: default;
   transition:
     background 150ms ease,
@@ -523,7 +519,7 @@
 
 .settings-view .gen-timeout-save.is-dirty {
   border-color: transparent;
-  background: var(--app-text-strong);
+  background: var(--app-primary);
   color: var(--app-primary-fg);
   cursor: pointer;
 }
@@ -539,7 +535,7 @@
 .settings-view .gen-doctor-list {
   list-style: none;
   margin: 0;
-  padding: 14px 18px;
+  padding: 12px 16px;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -599,40 +595,6 @@
   border: 0;
 }
 
-.settings-view .gen-doctor-auth-code {
-  font-family: var(--font-mono, monospace);
-  font-weight: 650;
-}
-
-.settings-view .gen-doctor-auth-copy {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-height: 24px;
-  margin-left: 7px;
-  padding: 2px 7px;
-  border: 1px solid var(--app-border);
-  border-radius: 7px;
-  background: var(--app-surface);
-  color: var(--app-text);
-  font: inherit;
-  font-size: 11.5px;
-  font-weight: 700;
-  vertical-align: middle;
-  cursor: pointer;
-}
-
-.settings-view .gen-doctor-auth-copy:hover,
-.settings-view .gen-doctor-auth-copy:focus-visible {
-  border-color: var(--app-border-strong);
-  color: var(--app-text-strong);
-}
-
-.settings-view .gen-doctor-auth-copy:focus-visible {
-  outline: 2px solid var(--app-accent);
-  outline-offset: 2px;
-}
-
 .settings-view .gen-segmented {
   display: inline-flex;
   gap: 4px;
@@ -654,7 +616,7 @@
 }
 
 .settings-view .gen-segment.is-active {
-  background: var(--app-text-strong);
+  background: var(--app-primary);
   color: var(--app-primary-fg);
 }
 
@@ -663,94 +625,132 @@
   flex-direction: column;
 }
 
-.settings-view .gen-aws-command-box {
-  position: relative;
-  margin: 0 18px 14px;
+.settings-view .gen-aws .gen-row-desc {
+  max-width: none;
+  overflow-wrap: anywhere;
+}
+
+.settings-view .gen-aws-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 16px;
+}
+
+.settings-view .gen-aws-summary-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-view .gen-aws-summary .gen-actions {
+  justify-content: flex-start;
+}
+
+.settings-view .gen-aws-state {
+  color: var(--app-text-strong);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.settings-view .gen-aws-spinner,
+.gen-aws-dialog .gen-aws-spinner {
+  display: inline-block;
+  vertical-align: middle;
+  animation: gen-aws-spin 1s linear infinite;
+}
+
+@keyframes gen-aws-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-view .gen-aws-spinner,
+  .gen-aws-dialog .gen-aws-spinner { animation: none; }
+}
+
+.settings-view .gen-aws-state.is-billable {
+  color: var(--app-warning);
+}
+
+.gen-aws-dialog .gen-aws-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: var(--app-muted);
+  font-size: 12.5px;
+}
+
+/* A command to run in Terminal: the text and, beside it, the copy icon. */
+.gen-aws-dialog .gen-aws-command-box {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  padding: 6px;
   border-radius: 10px;
   background: var(--app-surface);
   border: 1px solid var(--app-border);
-  overflow: hidden;
 }
 
-.settings-view .gen-aws-command {
+.gen-aws-dialog .gen-aws-command-box .aa-icon-button {
+  flex: none;
+}
+
+.gen-aws-dialog .gen-aws-command {
+  flex: 1;
+  min-width: 0;
   margin: 0;
-  padding: 42px 14px 12px;
+  padding: 5px 6px 5px 8px;
   font-family: var(--font-mono, monospace);
   font-size: 11.5px;
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
-  max-height: 220px;
+  max-height: 160px;
   overflow: auto;
 }
 
-.settings-view .gen-aws-copy {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 1;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 10px;
-  border-radius: 8px;
-  border: 1px solid var(--app-border);
-  background: var(--app-surface);
-  color: var(--app-text);
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-}
-
-.settings-view .gen-aws-copy:hover,
-.settings-view .gen-aws-copy:focus-visible {
-  border-color: var(--app-border-strong);
-  color: var(--app-text-strong);
-  outline: none;
-}
-
-.settings-view .gen-aws-paste {
+.gen-aws-dialog .gen-aws-paste {
   min-height: 60px;
   resize: vertical;
   font-family: var(--font-mono, monospace);
   font-size: 11.5px;
 }
 
-.settings-view .gen-aws-message {
-  padding: 0 18px 12px;
-}
-
 .settings-view .gen-aws-specs {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin: 0 18px 14px;
-  color: var(--app-muted);
+  gap: 8px;
+  margin: 0;
+  color: var(--app-text-secondary);
   font-size: 12px;
 }
 
 .settings-view .gen-aws-specs > * {
-  padding: 4px 7px;
-  border: 1px solid var(--app-border);
-  border-radius: 7px;
-  background: var(--app-surface);
+  white-space: nowrap;
 }
 
-.settings-view .gen-aws-specs strong {
-  color: var(--app-warning);
+.settings-view .gen-aws-specs > * + *::before {
+  content: "·";
+  margin-right: 8px;
 }
 
-.settings-view .gen-aws-progress {
+/* Start progress: on the page and in the Connect dialog. */
+.settings-view .gen-aws-progress,
+.gen-aws-dialog .gen-aws-progress {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
   gap: 8px;
-  margin: 0 18px 14px;
+  margin: 0 16px 12px;
   padding: 0;
   list-style: none;
 }
 
-.settings-view .gen-aws-progress li {
+.settings-view .gen-aws-progress li,
+.gen-aws-dialog .gen-aws-progress li {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -759,7 +759,8 @@
   font-size: 11.5px;
 }
 
-.settings-view .gen-aws-progress li > span:first-child {
+.settings-view .gen-aws-progress li > span:first-child,
+.gen-aws-dialog .gen-aws-progress li > span:first-child {
   display: inline-grid;
   place-items: center;
   flex: none;
@@ -771,46 +772,368 @@
 }
 
 .settings-view .gen-aws-progress li.is-current,
-.settings-view .gen-aws-progress li.is-done {
+.settings-view .gen-aws-progress li.is-done,
+.gen-aws-dialog .gen-aws-progress li.is-current,
+.gen-aws-dialog .gen-aws-progress li.is-done {
   color: var(--app-text-strong);
   font-weight: 650;
 }
 
 .settings-view .gen-aws-progress li.is-done > span:first-child,
-.settings-view .gen-aws-progress.is-ready li > span:first-child {
+.settings-view .gen-aws-progress.is-ready li > span:first-child,
+.gen-aws-dialog .gen-aws-progress li.is-done > span:first-child,
+.gen-aws-dialog .gen-aws-progress.is-ready li > span:first-child {
   border-color: var(--app-success);
   color: var(--app-success);
 }
 
-.settings-view .gen-aws-progress .gen-aws-auth {
-  grid-column: 1 / -1;
+.settings-view .gen-aws-progress li.is-failed,
+.gen-aws-dialog .gen-aws-progress li.is-failed {
+  color: var(--app-danger);
+  font-weight: 650;
 }
 
-.settings-view .gen-aws-progress .gen-aws-auth code {
-  margin-left: 6px;
-  font-family: var(--font-mono, monospace);
-}
-
-.settings-view .gen-aws-decision,
-.settings-view .gen-aws-confirm {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin: 0 18px 14px;
-  padding: 12px;
-  border: 1px solid var(--app-warning);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--app-warning) 8%, var(--app-surface));
-  color: var(--app-text);
-  font-size: 12px;
-}
-
-.settings-view .gen-aws-confirm {
+.settings-view .gen-aws-progress li.is-failed > span:first-child,
+.gen-aws-dialog .gen-aws-progress li.is-failed > span:first-child {
   border-color: var(--app-danger-border);
-  background: color-mix(in srgb, var(--app-danger) 7%, var(--app-surface));
+  color: var(--app-danger);
 }
 
 .settings-view .gen-pill-danger {
   color: var(--app-danger);
   border-color: var(--app-danger-border);
+}
+
+.device-pairing-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px;
+  align-items: start;
+  gap: 18px;
+}
+
+.device-pairing-grid.is-managed {
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
+}
+
+.settings-view .device-pairing-body {
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+.settings-view .device-pairing-body .gen-actions {
+  justify-content: center;
+}
+
+.settings-view .device-pairing-body .device-pairing-grid {
+  width: 100%;
+}
+
+.settings-view .device-pairing-generate {
+  min-width: 92px;
+}
+
+.device-pairing-fields {
+  display: grid;
+  gap: 8px;
+}
+
+.device-pairing-fields input {
+  width: 100%;
+}
+
+.device-pairing-qr {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  color: var(--app-muted);
+}
+
+.device-pairing-qr img {
+  display: block;
+  width: 156px;
+  height: 156px;
+}
+
+.device-pairing-grid.is-managed .device-pairing-qr img {
+  width: 240px;
+  height: 240px;
+}
+
+.device-pairing-state {
+  color: var(--app-danger);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+/* A problem is a red line in the row it belongs to, not a tinted box. */
+.gen-row-error,
+.device-pairing-error {
+  overflow-wrap: anywhere;
+  color: var(--app-danger);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.settings-view .gen-row-text .gen-row-error {
+  margin-top: 3px;
+  max-width: 520px;
+}
+
+/* Speech to text: the model download's progress and its buttons. */
+.settings-view .gen-speech-progress {
+  max-width: 430px;
+  height: 4px;
+  margin-top: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--app-surface-active);
+}
+
+.settings-view .gen-speech-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--app-accent);
+  transition: width 200ms ease-out;
+}
+
+.settings-view .gen-speech-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+@media (max-width: 620px) {
+  .device-pairing-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Machines (machines transport): enrolled computers that host members. */
+.machines-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.machines-add input {
+  width: 180px;
+}
+
+.machines-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.machines-row + .machines-row {
+  border-top: 1px solid var(--border);
+}
+
+.machines-row-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.machines-state {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+}
+
+.machines-state.is-connected {
+  color: var(--foreground);
+}
+
+.machines-row-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.machines-enrollment .gen-row-text {
+  min-width: 0;
+  flex: 1;
+}
+
+.machines-enrollment-json {
+  margin-top: 8px;
+  width: 100%;
+  resize: vertical;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--foreground);
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.machines-warning {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--app-muted);
+}
+
+/* The runtime's update state on a machine row: in progress, failed, or owed. */
+.settings-view .machines-runtime-status {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+/* Machine setup: installing and upgrading the runtime over SSH. */
+.machine-setup {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--muted);
+}
+
+.machine-setup-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.machine-setup-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.machine-setup-field-wide {
+  grid-column: span 2;
+}
+
+.machine-setup-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.machine-setup-progress {
+  margin-top: 12px;
+}
+
+.machine-setup-steps {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.machine-setup-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.machine-setup-step.is-done,
+.machine-setup-step.is-current {
+  color: var(--foreground);
+}
+
+.machine-setup-step-mark {
+  display: inline-flex;
+  width: 14px;
+  justify-content: center;
+}
+
+.machine-setup-message {
+  font-size: 13px;
+  color: var(--foreground);
+}
+
+.machine-setup-note {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--app-muted);
+}
+
+.machine-setup-recovery {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--foreground);
+}
+
+.machine-setup-log {
+  margin-top: 6px;
+  max-height: 160px;
+  overflow: auto;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  color: var(--app-muted);
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+@media (max-width: 620px) {
+  .machine-setup-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .machine-setup-field-wide {
+    grid-column: span 1;
+  }
+}
+
+.machine-setup-select {
+  height: 32px;
+  padding: 0 8px;
+  font-size: 13px;
+  color: var(--foreground);
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.machines-payload {
+  padding: 0 16px 12px;
+  font-size: 12px;
+  color: var(--app-muted);
+}
+
+/* Automatic stop: one switch in the instance card. Every AWS dialog renders
+   outside the settings view, so its rules are scoped to the dialog. */
+.settings-view .gen-aws-auto-stop {
+  position: relative;
+}
+
+/* The same inset hairline as every other divider in a card. */
+.settings-view .gen-aws-auto-stop::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 16px;
+  right: 16px;
+  border-top: 0.5px solid var(--app-hairline);
+}
+
+.gen-aws-dialog {
+  width: min(560px, calc(100vw - 32px)) !important;
+  max-width: min(560px, calc(100vw - 32px)) !important;
+  gap: 14px !important;
+}
+
+.gen-aws-dialog [data-slot="dialog-footer"] {
+  margin: 0 !important;
+  padding: 12px 0 0 !important;
+  border-top: 1px solid var(--app-border-subtle);
+  background: transparent !important;
 }

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import type { Readable } from "node:stream";
 import crossSpawn from "cross-spawn";
 import { terminateProcess } from "./processTermination";
 
@@ -25,6 +26,8 @@ export interface CommandResult {
 export interface CommandOptions {
   cwd?: string;
   input?: string;
+  /** Interactive input owned by the caller; never included in command arguments. */
+  inputStream?: Readable;
   timeoutMs?: number;
   allowNoTimeout?: boolean;
   env?: NodeJS.ProcessEnv;
@@ -34,6 +37,17 @@ export interface CommandOptions {
   signal?: AbortSignal;
   onStdout?: (chunk: string) => void;
   onStderr?: (chunk: string) => void;
+  /** Use `env` as the whole environment: no `process.env`, no login-shell
+   *  variables. For programs that must see only what they were given. */
+  exactEnv?: boolean;
+  /** Keep only the last N characters of stdout and of stderr. */
+  maxOutputChars?: number;
+  /** Called once with the child's pid (its process group with killProcessGroup). */
+  onSpawn?: (pid: number) => void;
+  /** With killProcessGroup: when the child itself exits, kill whatever it
+   *  left running in its group and stop waiting for their output. The run
+   *  is the child; background helpers do not outlive it. */
+  killGroupOnExit?: boolean;
 }
 
 export interface CommandEnvironmentOptions {
@@ -76,6 +90,10 @@ export function refreshLoginShellEnv(): Promise<LoginShellEnvironmentRefresh> {
 }
 
 async function captureFreshLoginShellEnv(): Promise<LoginShellEnvironmentRefresh> {
+  if (process.platform === "win32") {
+    loginShellEnv = await captureWindowsPath();
+    return { ok: true, env: loginShellEnv };
+  }
   if (process.platform !== "darwin") {
     loginShellEnv = {};
     return { ok: true, env: {} };
@@ -119,6 +137,28 @@ export class CommandError extends Error {
   }
 }
 
+/** True when a failed command (or any error) ran out of disk space. */
+export function isDiskSpaceFailure(error: unknown): boolean {
+  const chunks = [error instanceof Error ? error.message : String(error)];
+  if (error instanceof CommandError) chunks.push(error.result.stdout, error.result.stderr);
+  // Node's "ENOSPC: System limit for number of file watchers" is not the disk.
+  return /no space left on device|disk quota exceeded|\benospc\b(?!:?\s*system limit)/i.test(chunks.join("\n"));
+}
+
+/** The last meaningful line a failed command printed, cleaned for a person:
+ *  "ssh exited with code 1" alone does not say what went wrong. */
+export function commandFailureDetail(error: unknown, maxLength = 240): string | undefined {
+  if (!(error instanceof CommandError)) return undefined;
+  const lines = `${error.result.stderr}`
+    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => line && !/^(warning: permanently added|\+ )/i.test(line));
+  const last = lines[lines.length - 1];
+  if (!last) return undefined;
+  return last.length > maxLength ? `${last.slice(0, maxLength - 1)}…` : last;
+}
+
 export function resolveCommandTimeoutMs(requestedTimeoutMs: number | undefined, allowNoTimeout = false): number {
   const requested = requestedTimeoutMs ?? 30_000;
   if (requested > 0) {
@@ -128,9 +168,17 @@ export function resolveCommandTimeoutMs(requestedTimeoutMs: number | undefined, 
 }
 
 export async function runCommand(command: string, args: string[], options: CommandOptions = {}): Promise<CommandResult> {
+  // The input can fail while the environment is still being read: keep its
+  // error for the run instead of leaving it unhandled.
+  let earlyInputError: Error | undefined;
+  const holdEarlyInputError = (error: Error): void => {
+    earlyInputError ??= error;
+  };
+  options.inputStream?.once("error", holdEarlyInputError);
   if (options.primeLoginShellEnv !== false) {
     await ensureLoginShellEnvPrimed();
   }
+  options.inputStream?.off("error", holdEarlyInputError);
   const timeoutMs = resolveCommandTimeoutMs(options.timeoutMs, options.allowNoTimeout === true);
 
   return new Promise((resolve, reject) => {
@@ -138,10 +186,18 @@ export async function runCommand(command: string, args: string[], options: Comma
     const useProcessGroup = killProcessTree && process.platform !== "win32";
     const child = spawnCommand(command, args, {
       cwd: options.cwd,
-      env: commandEnvironment(options.env, options.envOptions),
+      env: options.exactEnv === true ? { ...(options.env ?? {}) } : commandEnvironment(options.env, options.envOptions),
       detached: useProcessGroup,
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      // On Windows a console program started from the app gets a console
+      // window of its own; closing it would kill the command.
+      windowsHide: true
     });
+    if (child.pid !== undefined) {
+      options.onSpawn?.(child.pid);
+    }
+    const maxOutputChars = options.maxOutputChars !== undefined && options.maxOutputChars > 0 ? options.maxOutputChars : undefined;
+    const keepTail = (text: string): string => (maxOutputChars !== undefined && text.length > maxOutputChars ? text.slice(-maxOutputChars) : text);
 
     let stdout = "";
     let stderr = "";
@@ -154,6 +210,7 @@ export async function runCommand(command: string, args: string[], options: Comma
     // them indefinitely. A cancelled or timed-out run must not, so release our
     // ends once the child itself is gone.
     const releaseStdio = () => {
+      options.inputStream?.unpipe(child.stdin);
       child.stdout.destroy();
       child.stderr.destroy();
     };
@@ -208,18 +265,32 @@ export async function runCommand(command: string, args: string[], options: Comma
       if (!settled && (options.signal?.aborted || timedOut)) {
         releaseStdio();
       }
+      if (options.killGroupOnExit === true && useProcessGroup && child.pid) {
+        const pid = child.pid;
+        // A short grace lets the child's last output arrive first.
+        setTimeout(() => {
+          try {
+            process.kill(-pid, "SIGKILL");
+          } catch {
+            // The group is already empty.
+          }
+          if (!settled) {
+            releaseStdio();
+          }
+        }, 200).unref();
+      }
     });
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
 
     child.stdout.on("data", (chunk) => {
-      stdout += chunk;
+      stdout = keepTail(stdout + chunk);
       options.onStdout?.(chunk);
     });
 
     child.stderr.on("data", (chunk) => {
-      stderr += chunk;
+      stderr = keepTail(stderr + chunk);
       options.onStderr?.(chunk);
     });
 
@@ -228,6 +299,7 @@ export async function runCommand(command: string, args: string[], options: Comma
     });
 
     child.on("error", (error) => {
+      options.inputStream?.unpipe(child.stdin);
       if (timer) {
         clearTimeout(timer);
       }
@@ -238,6 +310,7 @@ export async function runCommand(command: string, args: string[], options: Comma
     });
 
     child.on("close", (exitCode) => {
+      options.inputStream?.unpipe(child.stdin);
       if (timer) {
         clearTimeout(timer);
       }
@@ -275,7 +348,20 @@ export async function runCommand(command: string, args: string[], options: Comma
         }
       });
     }
-    child.stdin.end();
+    if (options.inputStream && earlyInputError) {
+      stdinError ??= earlyInputError;
+      child.stdin.end();
+    } else if (options.inputStream) {
+      // pipe() leaves its destination open when the source fails: the child
+      // would wait for more input until the timeout.
+      options.inputStream.once("error", (error) => {
+        stdinError ??= error;
+        child.stdin.end();
+      });
+      options.inputStream.pipe(child.stdin);
+    } else {
+      child.stdin.end();
+    }
   });
 }
 
@@ -476,6 +562,29 @@ async function captureLoginShellEnv(): Promise<NodeJS.ProcessEnv> {
     timeoutMs: LOGIN_SHELL_ENV_TIMEOUT_MS
   });
   return parseLoginShellEnvOutput(result.stdout, startSentinel, endSentinel);
+}
+
+/** Windows has no login shell: a new terminal takes PATH from the registry,
+ *  where an installer adds its folder while the app runs. This process's own
+ *  entries stay after it. Without the registry, PATH stays as it was. */
+async function captureWindowsPath(): Promise<NodeJS.ProcessEnv> {
+  try {
+    const result = await runCommand(windowsPowerShellPath(), [
+      "-NoProfile", "-NonInteractive", "-Command",
+      "[Console]::OutputEncoding = [Text.Encoding]::UTF8; [Environment]::GetEnvironmentVariable('Path', 'Machine'); [Environment]::GetEnvironmentVariable('Path', 'User')"
+    ], { env: process.env, primeLoginShellEnv: false, timeoutMs: LOGIN_SHELL_ENV_TIMEOUT_MS });
+    const segments = [...result.stdout.split(/\r?\n/), process.env.PATH ?? ""].flatMap((value) => value.split(path.delimiter));
+    return { PATH: uniquePathSegments(segments).join(path.delimiter) };
+  } catch (error) {
+    void writeCommandDebugLog("command.windows-path-refresh-failed", {
+      reason: error instanceof CommandError && error.result.timedOut ? "timeout" : "failed"
+    });
+    return {};
+  }
+}
+
+export function windowsPowerShellPath(): string {
+  return path.win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
 
 function shellQuote(value: string): string {

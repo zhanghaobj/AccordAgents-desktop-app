@@ -1,11 +1,11 @@
+import type { MemberRestartInProgress } from "../../../shared/memberRestart";
 import { chatReasoningEffortLabel } from "../../../shared/reasoningEffort";
 import type {
   AgentHealth,
   AppSettings,
   ChatParticipant,
   ChatParticipantConfig,
-  ChatParticipantWatcherState,
-  CloudRunRemoteExecutionMode
+  ChatParticipantWatcherState
 } from "../../../shared/types";
 import { Avatar } from "../avatar/avatar";
 import { chatParticipantDisplayName } from "../conversation/conversation-display";
@@ -22,7 +22,6 @@ import {
   addableSavedParticipantConfigs,
   activeChatRoleConfigs,
   chatParticipantPermissionSummary,
-  chatRunLocationLabel,
   labelForProviderKind,
   normalizedChatDrafts,
   validateChatCliAgents,
@@ -40,18 +39,23 @@ export function ChatParticipantMenu(props: {
   agents: AgentHealth[];
   draft: string;
   addParticipantDraft: ChatParticipantDraft;
-  isRunning: boolean;
+  busyParticipantIds: ReadonlySet<string>;
   participantStatusById: ReadonlyMap<string, ChatParticipantRosterStatus>;
   participantWatchers?: Record<string, ChatParticipantWatcherState>;
   onDraftChange: (value: string) => void;
   onAddParticipantDraftChange: (draft: ChatParticipantDraft) => void;
   onAddParticipant: () => void;
-  onAddSavedParticipant: (participant: ChatParticipantConfig, remoteExecution?: CloudRunRemoteExecutionMode) => void;
+  onAddSavedParticipant: (participant: ChatParticipantConfig) => void;
   onUpdateParticipantRuntime: (
     participantId: string,
     patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch">
   ) => void;
   onCompactParticipant: (participantId: string) => void;
+  onRestartParticipant: (participantId: string, stopBackgroundTasks: boolean) => Promise<boolean>;
+  /** Stops waiting for a restart (its run id). */
+  onStopRestart: (runId: string) => void;
+  /** Members whose restart has not ended. */
+  restartingById?: ReadonlyMap<string, MemberRestartInProgress>;
   onRemoveParticipant: (participantId: string) => void;
   onJumpToParticipantLastMessage: (participantId: string) => void;
   onManageInSettings: () => void;
@@ -76,7 +80,7 @@ export function ChatParticipantMenu(props: {
       participantHasRunById={props.participantHasRunById}
       draft={props.draft}
       addValidation={addValidation}
-      isRunning={props.isRunning}
+      busyParticipantIds={props.busyParticipantIds}
       participantStatusById={props.participantStatusById}
       participantWatchers={props.participantWatchers}
       savedParticipants={savedParticipants}
@@ -107,6 +111,9 @@ export function ChatParticipantMenu(props: {
       onAddSavedParticipant={props.onAddSavedParticipant}
       onUpdateParticipantRuntime={props.onUpdateParticipantRuntime}
       onCompactParticipant={props.onCompactParticipant}
+      onRestartParticipant={props.onRestartParticipant}
+      onStopRestart={props.onStopRestart}
+      restartingById={props.restartingById}
       onRemoveParticipant={props.onRemoveParticipant}
       onJumpToParticipantLastMessage={props.onJumpToParticipantLastMessage}
       onManageInSettings={props.onManageInSettings}
@@ -117,7 +124,7 @@ export function ChatParticipantMenu(props: {
 function savedParticipantSummary(settings: AppSettings, participant: ChatParticipantConfig, autoWatchConflictReason?: string): string {
   return [
     labelForProviderKind(settings.providers, participant.kind),
-    participant.kind === "codex-cli" ? `run ${chatRunLocationLabel(participant.remoteExecution).toLowerCase()}` : "",
+
     participant.model,
     participant.reasoningEffort ? `reasoning ${chatReasoningEffortLabel(participant.reasoningEffort)}` : "",
     participant.autoWatchEnabled ? (autoWatchConflictReason ? "auto-watch off: watcher already set" : "auto-watch") : "",

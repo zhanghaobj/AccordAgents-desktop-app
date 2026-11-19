@@ -10,8 +10,8 @@ import {
 
 import {
   ARTIFACT_PANEL_DEFAULT_WIDTH,
-  CHAT_SIDE_PANEL_MAX_WIDTH,
   CHAT_SIDE_PANEL_MIN_WIDTH,
+  chatMainMinWidth,
   chatSidePanelWidthLimits,
   clampChatSidePanelWidth
 } from "../../lib/chat-split-sizing";
@@ -25,7 +25,7 @@ interface ArtifactsPanelResize {
   panelRef: RefObject<HTMLDivElement>;
   panelWidth: number;
   resizing: boolean;
-  getLimits: () => ResizeLimits;
+  limits: ResizeLimits;
   startResize: (event: ReactPointerEvent<HTMLDivElement>) => void;
   resizeWithKeyboard: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
   resetWidth: () => void;
@@ -34,21 +34,33 @@ interface ArtifactsPanelResize {
 export function useArtifactsPanelResize(): ArtifactsPanelResize {
   const panelRef = useRef<HTMLDivElement>(null);
   const cleanupResizeRef = useRef<(() => void) | null>(null);
+  // The width the User chose. The panel shows it clamped to the room there is
+  // now, so a wide panel comes back once the room does (sidebar closed again).
+  const requestedWidthRef = useRef(ARTIFACT_PANEL_DEFAULT_WIDTH);
   const [panelWidth, setPanelWidth] = useState(ARTIFACT_PANEL_DEFAULT_WIDTH);
+  const [limits, setLimits] = useState<ResizeLimits>(() => chatSidePanelWidthLimits(window.innerWidth));
   const [resizing, setResizing] = useState(false);
 
   useEffect(() => () => cleanupResizeRef.current?.(), []);
 
   const getLimits = (): ResizeLimits => {
-    const containerWidth = panelRef.current?.parentElement?.getBoundingClientRect().width ?? window.innerWidth;
+    const container = panelRef.current?.parentElement;
+    const containerWidth = container?.getBoundingClientRect().width ?? window.innerWidth;
     return chatSidePanelWidthLimits(containerWidth, {
       minWidth: CHAT_SIDE_PANEL_MIN_WIDTH,
-      maxWidth: CHAT_SIDE_PANEL_MAX_WIDTH
+      mainMinWidth: chatMainMinWidth(container)
     });
   };
 
+  const applyLimits = (next: ResizeLimits): void => {
+    setLimits((current) => (current.min === next.min && current.max === next.max ? current : next));
+    setPanelWidth(clampChatSidePanelWidth(requestedWidthRef.current, next));
+  };
+
   const updatePanelWidth = (width: number): void => {
-    setPanelWidth(clampChatSidePanelWidth(width, getLimits()));
+    const next = getLimits();
+    requestedWidthRef.current = clampChatSidePanelWidth(width, next);
+    applyLimits(next);
   };
 
   useLayoutEffect(() => {
@@ -56,10 +68,7 @@ export function useArtifactsPanelResize(): ArtifactsPanelResize {
     if (!parent) {
       return undefined;
     }
-    const clampCurrentWidth = (): void => {
-      const limits = getLimits();
-      setPanelWidth((current) => clampChatSidePanelWidth(current, limits));
-    };
+    const clampCurrentWidth = (): void => applyLimits(getLimits());
     clampCurrentWidth();
     const resizeObserver = new ResizeObserver(clampCurrentWidth);
     resizeObserver.observe(parent);
@@ -111,9 +120,13 @@ export function useArtifactsPanelResize(): ArtifactsPanelResize {
     panelRef,
     panelWidth,
     resizing,
-    getLimits,
+    limits,
     startResize,
     resizeWithKeyboard,
-    resetWidth: () => updatePanelWidth(ARTIFACT_PANEL_DEFAULT_WIDTH)
+    resetWidth: () => {
+      // The default is the request; a squeezed panel shows less until room returns.
+      requestedWidthRef.current = ARTIFACT_PANEL_DEFAULT_WIDTH;
+      applyLimits(getLimits());
+    }
   };
 }

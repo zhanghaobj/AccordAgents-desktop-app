@@ -14,7 +14,7 @@ import {
   cliProviderHostVendorsFor
 } from "../../../shared/cliProviderHosts";
 import { deriveAgentReadiness } from "../../../shared/cliReadiness";
-import { AppSelect, FormRow } from "../primitives";
+import { AppSelect, FormRow, IconButton } from "../primitives";
 import { DeleteConfirmationDialog } from "./delete-confirmation-dialog";
 
 const CLI_LABELS: Record<CliProviderHostCli, string> = { "claude-code": "Claude Code", "codex-cli": "Codex CLI" };
@@ -40,21 +40,19 @@ export function ProviderHostRows(props: {
               <div className="gen-cli-name">{host.label}</div>
               <div className="gen-cli-sub">{hostStatusLine(host, props.agents)}</div>
             </div>
-            <button
-              type="button"
-              className="gen-host-edit"
-              aria-label={`Edit ${host.label}`}
+            <IconButton
+              label={`Edit ${host.label}`}
+              icon={Pencil}
               data-testid={`provider-host-edit-${host.id}`}
               onClick={() => props.onEdit(host)}
-            >
-              <Pencil size={15} aria-hidden />
-            </button>
+            />
           </div>
         </Fragment>
       ))}
       <div className="gen-card-divider" />
       <div className="gen-host-add-row">
-        <Button type="button" variant="outline" size="sm" data-testid="provider-host-add" onClick={props.onAdd}>
+        <Button type="button" variant="outline" size="sm" data-testid="provider-host-add" onClick={props.onAdd}
+          className="rounded-[10px] border-[var(--app-hairline)] text-[14px] font-normal dark:border-[var(--app-hairline)]">
           <Plus size={14} aria-hidden />
           Add provider
         </Button>
@@ -226,9 +224,7 @@ export function ProviderHostEditorDialog(props: {
                 </DialogDescription>
               </span>
               <DialogClose asChild>
-                <button type="button" className="participants-editor-close" aria-label="Close provider editor">
-                  <X size={15} aria-hidden />
-                </button>
+                <IconButton label="Close provider editor" icon={X} />
               </DialogClose>
             </div>
           </DialogHeader>
@@ -268,7 +264,7 @@ export function ProviderHostEditorDialog(props: {
                 onChange={(event) => setDraft((current) => ({ ...current, baseUrl: event.target.value }))}
               />
             </FormRow>
-            <FormRow label="API key" hint={host?.hasApiKey && draft.apiKey === undefined ? "A key is stored. Paste a new one to replace it." : "Stored encrypted on this Mac; never shown again."}>
+            <FormRow label="API key" hint={host?.hasApiKey && draft.apiKey === undefined ? "A key is stored. Paste a new one to replace it." : "Stored encrypted on this computer; never shown again."}>
               <Input
                 type="password"
                 value={draft.apiKey ?? ""}

@@ -36,12 +36,12 @@ export interface CodexExecAppMcpOptions {
 }
 
 export interface CodexExecRemoteSandboxOptions {
-  // The remote worker box is a dedicated dev environment: remote runs keep the
-  // workspace-write sandbox but open network access (gh/npm need it) and make
-  // the workspace .git writable (workspace-write mounts it read-only by
-  // default, which blocks the agent from committing).
+  // The remote worker box is a dedicated dev environment. For non-git work we
+  // can keep workspace-write and open only the needed network/git roots; for
+  // git-backed proof/implementation runs Codex needs full Git metadata access.
   networkAccess?: boolean;
   gitWritableRoot?: string;
+  dangerFullAccess?: boolean;
 }
 
 export interface CodexExecOptions {
@@ -83,6 +83,7 @@ export function buildCodexExecInvocation(request: BuildCodexExecInvocationReques
   const resuming = Boolean(options.sessionId);
   const mode = agentModeForRun(request.kind, options);
   const permissions = permissionsForRun("codex-cli", mode, options);
+  const sandboxMode = codexSandboxMode(permissions, options.remoteSandbox);
   const args = resuming
     ? [
         "exec",
@@ -96,7 +97,7 @@ export function buildCodexExecInvocation(request: BuildCodexExecInvocationReques
     : [
         "exec",
         "--sandbox",
-        permissions.workspaceWrite ? "workspace-write" : "read-only",
+        sandboxMode,
         "--json",
         "--output-last-message",
         request.outputPath,
@@ -141,13 +142,13 @@ export function buildCodexExecInvocation(request: BuildCodexExecInvocationReques
       args,
       resuming,
       "-c",
-      `sandbox_mode=${tomlString(permissions.workspaceWrite ? "workspace-write" : "read-only")}`
+      `sandbox_mode=${tomlString(sandboxMode)}`
     );
   }
-  if (options.remoteSandbox?.networkAccess) {
+  if (sandboxMode === "workspace-write" && options.remoteSandbox?.networkAccess) {
     insertCodexOptionBeforePrompt(args, resuming, "-c", "sandbox_workspace_write.network_access=true");
   }
-  if (options.remoteSandbox?.gitWritableRoot) {
+  if (sandboxMode === "workspace-write" && options.remoteSandbox?.gitWritableRoot) {
     insertCodexOptionBeforePrompt(
       args,
       resuming,
@@ -435,6 +436,16 @@ function permissionsForRun(
   return effectiveChatAgentPermissionsForProvider(providerKind, mode, normalizeChatAgentPermissions(options.permissions));
 }
 
+function codexSandboxMode(
+  permissions: ChatAgentPermissions,
+  remoteSandbox: CodexExecRemoteSandboxOptions | undefined
+): "read-only" | "workspace-write" | "danger-full-access" {
+  if (remoteSandbox?.dangerFullAccess && permissions.workspaceWrite) {
+    return "danger-full-access";
+  }
+  return permissions.workspaceWrite ? "workspace-write" : "read-only";
+}
+
 function normalizedExtraReadableDirs(dirs: string[] | undefined): string[] {
   const seen = new Set<string>();
   const normalized: string[] = [];
@@ -449,7 +460,7 @@ function normalizedExtraReadableDirs(dirs: string[] | undefined): string[] {
   return normalized;
 }
 
-function insertCodexOptionBeforePrompt(args: string[], resuming: boolean, ...items: string[]): void {
+export function insertCodexOptionBeforePrompt(args: string[], resuming: boolean, ...items: string[]): void {
   const promptIndex = resuming ? Math.max(args.length - 2, 2) : Math.max(args.length - 1, 1);
   args.splice(promptIndex, 0, ...items);
 }

@@ -1,8 +1,8 @@
 :root {
   color-scheme: light;
-  --font-display: "Space Grotesk Variable", ui-sans-serif, system-ui, sans-serif;
-  --font-body: "Hanken Grotesk Variable", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-code: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-display: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-code: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
   font-family: var(--font-body);
   color: var(--app-text);
   background: var(--app-bg);
@@ -10,40 +10,55 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 
-  --app-header-height: 87px;
-  --app-header-title-offset-y: -7px;
-  --app-rail-width: 90px;
+  --app-header-height: 46px;
+  --app-subbar-height: 38px;
   --activity-list-width: 320px;
   --app-sidebar-width: 320px;
-  --app-bg: #f6f7f9;
+  --app-bg: #f6f6f6;
   --app-new-chat-bg: #ffffff;
   --app-activity-bg: #ffffff;
   --app-activity-token: #0ea5a5;
-  --bg-sunken: #f4f5f7;
+  --bg-sunken: #f6f6f6;
   --app-workspace-bg: #ffffff;
-  --app-sidebar-bg: #fbfbfc;
-  --app-rail-bg: #eeebf4;
-  --app-rail-fg: #666d7a;
-  --app-rail-fg-active: #16191f;
-  --app-rail-hover: rgba(22, 25, 31, 0.06);
-  --app-rail-active: rgba(22, 25, 31, 0.1);
-  --app-rail-badge-bg: #f0d8ff;
-  --app-rail-badge-fg: #16191f;
+  --app-sidebar-bg: #f6f6f6;
   --app-header-bg: #ffffff;
   --app-surface: #ffffff;
-  --app-surface-subtle: #f7f8fa;
-  --app-surface-muted: #f1f3f6;
+  --app-surface-subtle: #f4f4f4;
+  --app-surface-muted: #f4f4f4;
   --app-surface-hover: #f1f3f6;
   --app-surface-active: #eceff3;
-  --app-text: #424955;
-  --app-text-strong: #16191f;
-  --app-muted: #868d9b;
-  --app-muted-subtle: #a0a6b2;
+  /* Artifact note cards on the timeline: a shade paler than surface-subtle. */
+  --chat-artifact-note-bg: #f8f9fb;
+  --app-text: #1a1c1f;
+  --app-text-strong: #1a1c1f;
+  --app-muted: #8e8f90;
+  --app-muted-subtle: #a6a6a6;
   --app-accord-icon-top: #a855f7;
   --app-accord-icon-left: #e73975;
   --app-accord-icon-right: #447bf3;
   --app-border: #e7e9ee;
   --app-border-strong: #d7dae1;
+  /* Settings, after the ChatGPT desktop app: hairline card edges and rows,
+     a darker secondary line, a light switch track when off. */
+  --app-hairline: #ededed;
+  --app-text-secondary: #6b6c6e;
+  --app-toggle-off: #e8e8e9;
+  --app-toggle-knob: #ffffff;
+  /* Keyboard focus: the control's own 1px edge darkens; no outer ring. */
+  --app-focus-border: #787b82;
+  /* Settings → AWS disk bar: one quiet hue per kind of thing on the disk. */
+  --app-disk-1: #8b93a7;
+  --app-disk-2: #b6bcc9;
+  --app-disk-3: #d6a54a;
+  --app-disk-4: #6f8fd6;
+  --app-disk-5: #e07b57;
+  --app-disk-6: #59a98a;
+  --app-disk-7: #a58ad6;
+  --app-disk-8: #d3b78a;
+  --app-disk-9: #9cc2d8;
+  --app-disk-10: #c49bb5;
+  --app-disk-swap: #c3c8d1;
+  --app-disk-swap-gap: #e4e7ec;
   --app-shell-border: #e7e9ee;
   --app-primary: #16191f;
   --app-primary-hover: #04060a;
@@ -51,7 +66,19 @@
   --app-accent: #7d5fd3;
   --app-accent-soft: #efebfb;
   --app-accent-border: #cdbcf0;
-  --app-user-bub: #eceff3;
+  /* Code in the file panel (CodeMirror). */
+  --app-code-keyword: #8a3ab9;
+  --app-code-string: #a3412b;
+  --app-code-number: #1f6feb;
+  --app-code-comment: #6e7781;
+  --app-code-function: #0b6a8a;
+  --app-code-type: #9a5b00;
+  --app-code-property: #24537a;
+  --app-code-meta: #57606a;
+  --app-code-invalid: #cf222e;
+  --app-code-selection: #d9d2f5;
+  --app-code-cursor: #16191f;
+  --app-user-bub: #e9e9e9;
   --app-success: #08794e;
   --app-success-soft: #e8f8f1;
   --app-success-border: #b8e5cf;
@@ -141,8 +168,8 @@
   --shadow-sm: 0 2px 6px color-mix(in srgb, var(--shadow-color) 10%, transparent);
   --shadow-md: 0 10px 24px color-mix(in srgb, var(--shadow-color) 12%, transparent);
   --shadow-lg: 0 18px 42px color-mix(in srgb, var(--shadow-color) 16%, transparent);
-  --text-xs: 11px;
-  --text-sm: 12px;
+  --text-xs: 12px;
+  --text-sm: 13px;
   --text-md: 13px;
   --text-base: 14px;
   --text-lg: 16px;
@@ -166,29 +193,29 @@
   --radius-shell: 16px;
   --radius-pill: 999px;
 
-  /* One focus ring, reused everywhere (color follows themed --ring) */
-  --focus-ring-width: 3px;
-  --focus-ring-color: color-mix(in srgb, var(--ring) 45%, transparent);
-  --focus-ring: 0 0 0 var(--focus-ring-width) var(--focus-ring-color);
+  /* One focus mark, reused everywhere: a thin neutral edge inside the
+     control, so borderless controls show focus the way bordered ones do
+     (their border darkens). No outer ring, no accent colour. */
+  --focus-ring: inset 0 0 0 1px var(--app-focus-border);
 
-  --background: #f6f7f9;
-  --foreground: #424955;
+  --background: #f6f6f6;
+  --foreground: #1a1c1f;
   --card: #ffffff;
-  --card-foreground: #424955;
+  --card-foreground: #1a1c1f;
   --popover: #ffffff;
-  --popover-foreground: #424955;
+  --popover-foreground: #1a1c1f;
   --primary: #16191f;
   --primary-foreground: #ffffff;
-  --secondary: #f1f3f6;
-  --secondary-foreground: #424955;
-  --muted: #f1f3f6;
-  --muted-foreground: #868d9b;
+  --secondary: #f4f4f4;
+  --secondary-foreground: #1a1c1f;
+  --muted: #f4f4f4;
+  --muted-foreground: #8e8f90;
   --accent: #efebfb;
   --accent-foreground: #45348a;
   --destructive: #b3352d;
   --border: #e7e9ee;
   --input: #d7dae1;
-  --ring: #7d5fd3;
+  --ring: var(--app-focus-border);
   --chart-1: #7d5fd3;
   --chart-2: #08794e;
   --chart-3: #d59200;
@@ -196,45 +223,79 @@
   --chart-5: #8b5cf6;
   --radius: 0.5rem;
   --sidebar: var(--bg-sunken);
-  --sidebar-foreground: #424955;
+  --sidebar-foreground: #1a1c1f;
   --sidebar-primary: #16191f;
   --sidebar-primary-foreground: #ffffff;
   --sidebar-accent: #eceff3;
-  --sidebar-accent-foreground: #16191f;
+  --sidebar-accent-foreground: #1a1c1f;
   --sidebar-border: #e7e9ee;
-  --sidebar-ring: #7d5fd3;
+  --sidebar-ring: var(--app-focus-border);
+  /* Terminal panel: xterm.js reads these at run time (it needs real colors,
+     not CSS). The ANSI palette is VS Code's Light+, readable on white. */
+  --app-terminal-font: "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
+  --app-terminal-bg: #ffffff;
+  --app-terminal-fg: #1f2328;
+  --app-terminal-cursor: #1f2328;
+  --app-terminal-selection: rgba(0, 92, 197, 0.22);
+  --app-terminal-black: #000000;
+  --app-terminal-red: #cd3131;
+  --app-terminal-green: #107c10;
+  --app-terminal-yellow: #949800;
+  --app-terminal-blue: #0451a5;
+  --app-terminal-magenta: #bc05bc;
+  --app-terminal-cyan: #0598bc;
+  --app-terminal-white: #555555;
+  --app-terminal-bright-black: #666666;
+  --app-terminal-bright-red: #cd3131;
+  --app-terminal-bright-green: #14ce14;
+  --app-terminal-bright-yellow: #b5ba00;
+  --app-terminal-bright-blue: #0451a5;
+  --app-terminal-bright-magenta: #bc05bc;
+  --app-terminal-bright-cyan: #0598bc;
+  --app-terminal-bright-white: #a5a5a5;
 }
 
 .dark {
   color-scheme: dark;
-  --app-bg: #0d0f13;
-  --app-activity-bg: #181b21;
+  --app-bg: #141414;
+  --app-activity-bg: #181818;
   --app-activity-token: #5eead4;
-  --bg-sunken: #121419;
-  --app-workspace-bg: #181b21;
-  --app-sidebar-bg: #121419;
-  --app-rail-bg: #1f0f2d;
-  --app-rail-fg: rgba(255, 255, 255, 0.68);
-  --app-rail-fg-active: #ffffff;
-  --app-rail-hover: rgba(255, 255, 255, 0.08);
-  --app-rail-active: rgba(255, 255, 255, 0.16);
-  --app-rail-badge-bg: #f0d8ff;
-  --app-rail-badge-fg: var(--app-rail-bg);
-  --app-header-bg: #181b21;
-  --app-surface: #181b21;
-  --app-surface-subtle: #1d2128;
-  --app-surface-muted: #1d2128;
-  --app-surface-hover: #222732;
-  --app-surface-active: #272d3c;
-  --app-text: #c1c7d2;
-  --app-text-strong: #f1f3f7;
-  --app-muted: #7f8794;
-  --app-muted-subtle: #6b7280;
+  --bg-sunken: #141414;
+  --app-workspace-bg: #181818;
+  --app-sidebar-bg: #141414;
+  --app-header-bg: #181818;
+  --app-surface: #181818;
+  --app-surface-subtle: #232323;
+  --app-surface-muted: #232323;
+  --app-surface-hover: #282828;
+  --app-surface-active: #2f2f2f;
+  --chat-artifact-note-bg: #1e1e1e;
+  --app-text: #dfdfdf;
+  --app-text-strong: #dfdfdf;
+  --app-muted: #8b8b8b;
+  --app-muted-subtle: #727272;
   --app-accord-icon-top: #a855f7;
   --app-accord-icon-left: #e73975;
   --app-accord-icon-right: #447bf3;
   --app-border: #282d36;
   --app-border-strong: #353c47;
+  --app-hairline: #2c2c2c;
+  --app-text-secondary: #a1a1a1;
+  --app-toggle-off: #3a3a3a;
+  --app-toggle-knob: #d9d9d9;
+  --app-focus-border: #858b96;
+  --app-disk-1: #6f778a;
+  --app-disk-2: #4f5563;
+  --app-disk-3: #b88a35;
+  --app-disk-4: #5677c0;
+  --app-disk-5: #c4643f;
+  --app-disk-6: #3f8f72;
+  --app-disk-7: #8a6fc0;
+  --app-disk-8: #a8906a;
+  --app-disk-9: #6f9bb5;
+  --app-disk-10: #a07b93;
+  --app-disk-swap: #4a505c;
+  --app-disk-swap-gap: #30343c;
   --app-shell-border: #282d36;
   --app-primary: #f1f3f7;
   --app-primary-hover: #ffffff;
@@ -242,7 +303,18 @@
   --app-accent: #b39ef0;
   --app-accent-soft: rgba(179, 158, 240, 0.16);
   --app-accent-border: #4a3f7a;
-  --app-user-bub: #232a35;
+  --app-code-keyword: #d2a8ff;
+  --app-code-string: #f2a37b;
+  --app-code-number: #79c0ff;
+  --app-code-comment: #8b949e;
+  --app-code-function: #7ee2ff;
+  --app-code-type: #f0c674;
+  --app-code-property: #a5d6ff;
+  --app-code-meta: #9da5b0;
+  --app-code-invalid: #ff7b72;
+  --app-code-selection: #3b3554;
+  --app-code-cursor: #f1f3f7;
+  --app-user-bub: #2d2d2d;
   --app-success: #78d9aa;
   --app-success-soft: #143b2c;
   --app-success-border: #246e50;
@@ -290,37 +362,58 @@
   --shadow-sm: 0 2px 8px color-mix(in srgb, var(--shadow-color) 34%, transparent);
   --shadow-md: 0 12px 28px color-mix(in srgb, var(--shadow-color) 38%, transparent);
   --shadow-lg: 0 20px 48px color-mix(in srgb, var(--shadow-color) 46%, transparent);
-  --background: #0d0f13;
-  --foreground: #c1c7d2;
-  --card: #181b21;
-  --card-foreground: #c1c7d2;
-  --popover: #1d2128;
-  --popover-foreground: #c1c7d2;
+  --background: #141414;
+  --foreground: #dfdfdf;
+  --card: #181818;
+  --card-foreground: #dfdfdf;
+  --popover: #232323;
+  --popover-foreground: #dfdfdf;
   --primary: #f1f3f7;
   --primary-foreground: #0d0f13;
-  --secondary: #222732;
-  --secondary-foreground: #c1c7d2;
-  --muted: #222732;
-  --muted-foreground: #7f8794;
+  --secondary: #282828;
+  --secondary-foreground: #dfdfdf;
+  --muted: #282828;
+  --muted-foreground: #8b8b8b;
   --accent: rgba(179, 158, 240, 0.16);
   --accent-foreground: #d8ccf7;
   --destructive: #ff8b7e;
   --border: #282d36;
   --input: #353c47;
-  --ring: #b39ef0;
-  --sidebar: #121419;
-  --sidebar-foreground: #c1c7d2;
+  --ring: var(--app-focus-border);
+  --sidebar: #141414;
+  --sidebar-foreground: #dfdfdf;
   --sidebar-primary: #f1f3f7;
   --sidebar-primary-foreground: #0d0f13;
-  --sidebar-accent: #1d2128;
-  --sidebar-accent-foreground: #f1f3f7;
+  --sidebar-accent: #282828;
+  --sidebar-accent-foreground: #dfdfdf;
   --sidebar-border: #282d36;
-  --sidebar-ring: #b39ef0;
+  --sidebar-ring: var(--app-focus-border);
   --chart-1: #b39ef0;
   --chart-2: #78d9aa;
   --chart-3: #f1c86c;
   --chart-4: #ff8b7e;
   --chart-5: #d5a7ff;
+  /* Terminal panel, dark: VS Code's Dark+ ANSI palette. */
+  --app-terminal-bg: #181818;
+  --app-terminal-fg: #d4d4d4;
+  --app-terminal-cursor: #d4d4d4;
+  --app-terminal-selection: rgba(38, 79, 120, 0.6);
+  --app-terminal-black: #000000;
+  --app-terminal-red: #cd3131;
+  --app-terminal-green: #0dbc79;
+  --app-terminal-yellow: #e5e510;
+  --app-terminal-blue: #2472c8;
+  --app-terminal-magenta: #bc3fbc;
+  --app-terminal-cyan: #11a8cd;
+  --app-terminal-white: #e5e5e5;
+  --app-terminal-bright-black: #666666;
+  --app-terminal-bright-red: #f14c4c;
+  --app-terminal-bright-green: #23d18b;
+  --app-terminal-bright-yellow: #f5f543;
+  --app-terminal-bright-blue: #3b8eea;
+  --app-terminal-bright-magenta: #d670d6;
+  --app-terminal-bright-cyan: #29b8db;
+  --app-terminal-bright-white: #e5e5e5;
 }
 
 * {
@@ -443,7 +536,7 @@ button:not([class]):not([data-slot="button"]) {
 
 @layer base {
   * {
-    @apply border-border outline-ring/50;
+    @apply border-border outline-ring;
   }
 
   body {

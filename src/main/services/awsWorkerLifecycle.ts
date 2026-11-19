@@ -3,6 +3,7 @@
 // injectable Ec2Client so the state machine is unit-testable with a fake and
 // the real client (awsEc2Client.ts) can lazy-load the AWS SDK.
 
+import type { WorkerHostKey } from "./awsWorkerHostKeys";
 import {
   AWS_WORKER_TAG_KEY,
   AWS_WORKER_TAG_VALUE,
@@ -37,6 +38,8 @@ export interface AwsWorkerInstanceInfo {
   securityGroupId?: string;
   keyName?: string;
   launchedAt?: string;
+  /** The AWS account the instance belongs to (its reservation's owner). */
+  ownerId?: string;
 }
 
 export interface AwsWorkerImageInfo {
@@ -79,6 +82,13 @@ export interface AwsWorkerLifecycleOptions {
   generateKeyMaterial: (options?: { rotate?: boolean }) => Promise<AwsWorkerKeyMaterial>;
   deleteKeyMaterial?: (keyName: string, privateKeyPath: string) => Promise<void>;
   currentPublicIp: () => Promise<string>;
+  /** A new machine's SSH host key: made before the machine exists, given to
+   *  it at first boot, and known here under its connection name. */
+  hostKey?: {
+    /** The same key for the same launch token (a launch tried again). */
+    generate: (launchToken?: string) => Promise<WorkerHostKey>;
+    pin: (alias: string, publicKey: string, launchToken?: string) => Promise<void>;
+  };
   waitForState?: (
     poll: () => Promise<AwsWorkerInstanceInfo | undefined>,
     predicate: (info: AwsWorkerInstanceInfo | undefined) => boolean,
@@ -87,6 +97,9 @@ export interface AwsWorkerLifecycleOptions {
   logger?: (event: string, payload: Record<string, unknown>) => void;
   idleStopMs?: number;
   idleStopRetryMs?: number;
+  /** The User's automatic-stop switch. Off, an idle stop is not attempted
+   *  and not retried; the next run that ends arms it again. */
+  automaticStopEnabled?: () => Promise<boolean>;
   authorizeAutomaticStop?: (info: AwsWorkerInstanceInfo) => Promise<{
     renew(): Promise<void>;
     release(): Promise<void>;
@@ -111,12 +124,15 @@ export interface AwsWorkerDeleteResult {
 const RUNNING_WAIT_TIMEOUT_MS = 3 * 60_000;
 const STOPPED_WAIT_TIMEOUT_MS = 3 * 60_000;
 const TERMINATED_WAIT_TIMEOUT_MS = 3 * 60_000;
-const DEFAULT_IDLE_STOP_MS = 20 * 60_000;
+// The worker stops itself after this much idle time. Kept generous on purpose:
+// a stopped box has to boot and re-sync the project mirror before the next turn
+// can start, and that wait is paid by the user, not by the idle instance.
+const DEFAULT_IDLE_STOP_MS = 3 * 60 * 60_000;
 
 export class AwsWorkerLifecycle {
   private readonly options: Required<Pick<AwsWorkerLifecycleOptions,
     "createEc2Client" | "generateKeyMaterial" | "deleteKeyMaterial" | "currentPublicIp" | "waitForState" | "idleStopMs" | "idleStopRetryMs" | "authorizeAutomaticStop" | "now">>
-    & Pick<AwsWorkerLifecycleOptions, "logger">;
+    & Pick<AwsWorkerLifecycleOptions, "logger" | "automaticStopEnabled" | "hostKey">;
   private idleTimer: ReturnType<typeof setTimeout> | undefined;
   private activeRuns = 0;
 
@@ -131,7 +147,9 @@ export class AwsWorkerLifecycle {
       idleStopRetryMs: options.idleStopRetryMs ?? 60_000,
       authorizeAutomaticStop: options.authorizeAutomaticStop ?? (async () => undefined),
       now: options.now ?? (() => Date.now()),
-      logger: options.logger
+      logger: options.logger,
+      automaticStopEnabled: options.automaticStopEnabled,
+      hostKey: options.hostKey
     };
   }
 
@@ -156,6 +174,7 @@ export class AwsWorkerLifecycle {
     } else {
       await client.authorizeSshIngress(securityGroupId, cidr);
     }
+    const hostKey = await this.options.hostKey?.generate(options.clientToken);
     const spec = buildWorkerInstanceSpec({
       imageId: image.imageId,
       rootDeviceName: image.rootDeviceName,
@@ -163,10 +182,19 @@ export class AwsWorkerLifecycle {
       securityGroupId,
       instanceType: options.instanceType,
       rootVolumeSizeGb: options.rootVolumeSizeGb,
-      clientToken: options.clientToken
+      clientToken: options.clientToken,
+      ...(hostKey ? { hostKey } : {})
     });
     const instanceId = await client.runInstance(spec);
-    this.log("aws-worker.created", { instanceId, securityGroupId });
+    this.log("aws-worker.created", { instanceId, securityGroupId, hostKeyMade: Boolean(hostKey) });
+    if (hostKey) {
+      // Before anything connects to it. A failure here only leaves the first
+      // connection checked as before (trust on first use); it is logged.
+      await this.options.hostKey!.pin(`accordagents-${instanceId}`, hostKey.publicKey, options.clientToken).then(
+        () => this.log("aws-worker.host-key-pinned", { instanceId }),
+        (error: unknown) => this.log("aws-worker.host-key-pin-failed", { instanceId, message: error instanceof Error ? error.message : String(error) })
+      );
+    }
     return {
       instanceId,
       securityGroupId,
@@ -178,8 +206,10 @@ export class AwsWorkerLifecycle {
 
   // Bring the worker up for a run: start it if stopped, wait for running, then
   // re-resolve its (changed-on-each-start) public IP and re-open SSH ingress
-  // to the caller's current IP. Returns the reachable public IP.
-  async ensureRunning(credentials: AwsWorkerCredentials, handle: AwsWorkerHandle, deviceId = "legacy"): Promise<AwsWorkerInstanceInfo> {
+  // to the caller's current IP. Returns the reachable public IP. With
+  // `start: false` an instance that is not running is left as it is.
+  async ensureRunning(credentials: AwsWorkerCredentials, handle: AwsWorkerHandle, deviceId = "legacy",
+    options: { start?: boolean } = {}): Promise<AwsWorkerInstanceInfo> {
     const client = this.options.createEc2Client(credentials);
     let info = await client.describeInstance(handle.instanceId);
     if (!info || info.state === "terminated") {
@@ -187,6 +217,9 @@ export class AwsWorkerLifecycle {
     }
     if (info.rootVolumeBackedByEbs === false) {
       throw new Error("The AWS worker root device is not backed by persistent EBS storage.");
+    }
+    if (options.start === false && info.state !== "running") {
+      throw new Error(`The AWS instance is ${info.state}, so nothing was started.`);
     }
     if (info.state === "stopped" || info.state === "stopping") {
       this.log("aws-worker.starting", { instanceId: handle.instanceId });
@@ -236,6 +269,10 @@ export class AwsWorkerLifecycle {
 
   private async stopIfIdle(credentials: AwsWorkerCredentials, handle: AwsWorkerHandle): Promise<void> {
     if (this.activeRuns > 0) {
+      return;
+    }
+    if (this.options.automaticStopEnabled && !await this.options.automaticStopEnabled().catch(() => false)) {
+      this.log("aws-worker.idle-stop.switched-off", { instanceId: handle.instanceId });
       return;
     }
     let authorization: { renew(): Promise<void>; release(): Promise<void> } | undefined;
@@ -304,29 +341,38 @@ export class AwsWorkerLifecycle {
     this.idleTimer.unref?.();
   }
 
-  async deleteWorker(credentials: AwsWorkerCredentials, handle: AwsWorkerHandle): Promise<AwsWorkerDeleteResult> {
+  /** Terminates the instance and removes what the app made for it. With
+   *  `alreadyGone` (AWS already says it is terminated or has no such
+   *  instance) nothing is terminated: there is nothing left to stop, and the
+   *  tag-scoped policy can refuse a terminate for an id AWS no longer knows. */
+  async deleteWorker(credentials: AwsWorkerCredentials, handle: AwsWorkerHandle,
+    options: { alreadyGone?: boolean } = {}): Promise<AwsWorkerDeleteResult> {
     this.clearIdleTimer();
     this.activeRuns = 0;
     const client = this.options.createEc2Client(credentials);
     const result: AwsWorkerDeleteResult = { terminationConfirmed: false, cleanupFailures: [] };
-    const terminateFailed = await this.bestEffort("aws-worker.terminate", { instanceId: handle.instanceId }, async () => {
-      await client.terminateInstance(handle.instanceId);
-      this.log("aws-worker.terminated", { instanceId: handle.instanceId });
-    });
-    if (terminateFailed) {
-      result.terminateFailed = terminateFailed;
-      return result;
-    }
-    const waitFailed = await this.bestEffort("aws-worker.wait-terminated", { instanceId: handle.instanceId }, async () => {
-      await this.options.waitForState(
-        () => client.describeInstance(handle.instanceId),
-        (current) => !current || current.state === "terminated" || current.state === "absent",
-        TERMINATED_WAIT_TIMEOUT_MS
-      );
-    });
-    if (waitFailed) {
-      result.terminateFailed = waitFailed;
-      return result;
+    if (options.alreadyGone) {
+      this.log("aws-worker.already-gone", { instanceId: handle.instanceId });
+    } else {
+      const terminateFailed = await this.bestEffort("aws-worker.terminate", { instanceId: handle.instanceId }, async () => {
+        await client.terminateInstance(handle.instanceId);
+        this.log("aws-worker.terminated", { instanceId: handle.instanceId });
+      });
+      if (terminateFailed) {
+        result.terminateFailed = terminateFailed;
+        return result;
+      }
+      const waitFailed = await this.bestEffort("aws-worker.wait-terminated", { instanceId: handle.instanceId }, async () => {
+        await this.options.waitForState(
+          () => client.describeInstance(handle.instanceId),
+          (current) => !current || current.state === "terminated" || current.state === "absent",
+          TERMINATED_WAIT_TIMEOUT_MS
+        );
+      });
+      if (waitFailed) {
+        result.terminateFailed = waitFailed;
+        return result;
+      }
     }
     result.terminationConfirmed = true;
     const keyFailed = await this.bestEffort("aws-worker.delete-key-pair", { keyName: handle.keyName }, () => client.deleteKeyPair(handle.keyName));

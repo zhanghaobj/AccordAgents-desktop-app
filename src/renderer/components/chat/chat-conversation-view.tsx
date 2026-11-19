@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import { ArrowDown } from "lucide-react";
 
@@ -10,16 +10,17 @@ import type {
   Conversation,
   RepoFileMention
 } from "../../../shared/types";
-import { artifactMembersForConversation } from "../../../shared/artifacts";
 import { activeRunSummaryForConversation } from "../../../shared/chatActiveRuns";
 import { Avatar } from "../avatar/avatar";
 import { LocalFileLinkContext, LocalFileOpenChooser } from "../content/local-file-link";
 import { MessageLinkContext } from "../content/markdown-text";
 import { MentionDirectoryContext } from "../content/participant-hover-card";
 import { RunStatusLine } from "../conversation/timeline-primitives";
+import { IconButton } from "../primitives";
 import { avatarForChatParticipant } from "./chat-avatars";
 import { ChatComposer } from "./chat-composer";
 import {
+  buildChatTimelineRows,
   chatAppToolApprovals,
   chatApprovalPlacement,
   chatContinuedMentionRequestIds,
@@ -35,7 +36,13 @@ import {
   liveMessageProgressById
 } from "./chat-conversation-data";
 import { ArtifactsContext } from "../artifacts/artifacts-context";
-import { ArtifactsPanel } from "../artifacts/artifacts-panel";
+import { ArtifactNoteProgressContext } from "./chat-artifact-note-card";
+import { artifactNoteProgressById } from "../../../shared/artifactNoteProgress";
+import { ChatAccordDockSlot } from "./chat-accord-dock";
+import { useDockedAccord } from "./use-accord-progress";
+import { ARTIFACT_NOTE_MESSAGE_SOURCE } from "../../../shared/artifacts";
+import { AttachmentPanelContext } from "../files/file-panel-context";
+import { ChatSidePanel, useChatSidePanel } from "./chat-side-panel";
 import { ChatConversationTimeline } from "./chat-conversation-timeline";
 import type { ChatConversationViewProps } from "./chat-conversation-types";
 import { ChatThreadPanel } from "./chat-thread-panel";
@@ -44,9 +51,11 @@ import { useChatActivityDisclosure } from "./use-chat-activity-disclosure";
 import { useChatLocalFileOpen } from "./use-chat-local-file-open";
 import { useSubmittingIdSet } from "./use-submitting-id-set";
 import { useStableChatMessageActions } from "./use-stable-chat-message-actions";
+import { useChatPromptSuggestions } from "./use-chat-prompt-suggestions";
 import {
   CHAT_SIDE_PANEL_MIN_WIDTH,
   CHAT_THREAD_DEFAULT_WIDTH,
+  chatMainMinWidth,
   chatSidePanelWidthLimits,
   clampChatSidePanelWidth
 } from "../../lib/chat-split-sizing";
@@ -58,6 +67,7 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
     () => chatParticipants(props.conversation),
     [props.conversation.metadata.participants]
   );
+  const promptSuggestions = useChatPromptSuggestions(props.conversation.id, participants);
   const pendingAppToolApprovals = chatAppToolApprovals(props.conversation).filter((approval) => approval.status === "pending");
   const resolvedTimelineApprovals = useMemo(
     () =>
@@ -67,6 +77,8 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
           (
             approval.toolName === "app_roles_request_change" ||
             approval.toolName === "app_participants_request_change" ||
+            approval.toolName === "app_scripts_request_change" ||
+            approval.toolName === "app_connector_sign_in" ||
             approval.toolName === "codex_auto_review_approval"
           )
       ),
@@ -98,9 +110,28 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
     [participants, props.settings.chatRoleConfigs, sessionsByParticipant, contextUsageByParticipant]
   );
   const artifacts = props.artifacts;
+  // Each artifact note's drafts and signatures as they stood when it was
+  // written, read from the notes loaded for this chat. Worked out again only
+  // when the notes themselves change, not on every update of a running turn.
+  const artifactNotes = props.conversation.messages.filter(
+    (message) => message.role === "system" && message.metadata?.appMessageSource === ARTIFACT_NOTE_MESSAGE_SOURCE
+  );
+  const artifactNotesKey = artifactNotes.map((note) => `${note.id}:${note.content.length}`).join("\n");
+  const artifactNotesRef = useRef(artifactNotes);
+  artifactNotesRef.current = artifactNotes;
+  const artifactNoteProgress = useMemo(() => {
+    const byId = artifacts.context.byId;
+    return artifactNoteProgressById(artifactNotesRef.current, (artifactId) => {
+      const summary = byId.get(artifactId);
+      return summary ? { signers: summary.approval.requiredSigners.length, drafters: summary.requiredDraftCount || undefined } : undefined;
+    });
+  }, [artifactNotesKey, artifacts.context.byId]);
+  const dockedAccord = useDockedAccord(props.conversation.messages, artifactNotesKey);
   const [selectedThreadRootId, setSelectedThreadRootId] = useState<string | undefined>();
   const [threadDrafts, setThreadDrafts] = useState<Record<string, string>>({});
   const [threadWidth, setThreadWidth] = useState(CHAT_THREAD_DEFAULT_WIDTH);
+  // The width the User dragged to; shown clamped, so it returns with the room.
+  const requestedThreadWidthRef = useRef(CHAT_THREAD_DEFAULT_WIDTH);
   const [isResizingThread, setIsResizingThread] = useState(false);
   const approvalSubmission = useSubmittingIdSet();
   const choiceSubmission = useSubmittingIdSet();
@@ -112,12 +143,20 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
     onToggleReaction: props.onToggleReaction,
     onCompactParticipant: props.onCompactParticipant,
     onStopRun: props.onStopRun,
+    onDismissTurnFinishedNote: props.onDismissTurnFinishedNote,
     runChoiceWithSubmittingId: choiceSubmission.runWithSubmittingId
   });
+  // Read when used, after the viewport below exists.
+  const viewportRootRef = useRef<React.RefObject<HTMLDivElement> | undefined>(undefined);
+  const chatRoot = useCallback((): HTMLElement | null => viewportRootRef.current?.current ?? null, []);
+  const sidePanel = useChatSidePanel({ artifacts, root: chatRoot, selectThread: setSelectedThreadRootId });
   const localFileOpen = useChatLocalFileOpen({
     conversationId: props.conversation.id,
     repoFileOpenAction: props.settings.repoFileOpenAction,
-    setRepoFileOpenPreference: props.setRepoFileOpenPreference
+    repoFileExternalOpenAction: props.settings.repoFileExternalOpenAction,
+    setRepoFileOpenPreference: props.setRepoFileOpenPreference,
+    setRepoFileExternalOpenPreference: props.setRepoFileExternalOpenPreference,
+    openInPanel: sidePanel.openInPanel
   });
   const latestProgress = props.progress[props.progress.length - 1];
   const latestComposerProgress = useMemo(() => latestNonMessageProgress(props.progress), [props.progress]);
@@ -145,22 +184,15 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
     () => chatApprovalPlacement(pendingAppToolApprovals, visibleApprovalMessages),
     [pendingAppToolApprovals, visibleApprovalMessages]
   );
-  const chatTimelineRows = useMemo(() => {
-    const rows = [];
-    if (props.hasOlderMessages || props.olderMessagesLoading) {
-      rows.push({ type: "load-older" as const, id: "load-older" });
-    }
-    const entries = [
-      ...topLevelMessages.map((message) => ({ createdAt: message.createdAt, row: { type: "message" as const, id: message.id, message } })),
-      ...resolvedTimelineApprovals.map((approval) => ({ createdAt: approval.createdAt, row: { type: "approval" as const, id: approval.id, approval } }))
-    ];
-    entries.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-    rows.push(...entries.map((entry) => entry.row));
-    if (props.isRunning) {
-      rows.push(...thinkingRows.map((row) => ({ type: "thinking" as const, id: row.key, row })));
-    }
-    return rows;
-  }, [props.hasOlderMessages, props.isRunning, props.olderMessagesLoading, resolvedTimelineApprovals, thinkingRows, topLevelMessages]);
+  const chatTimelineRows = useMemo(() => buildChatTimelineRows({
+    hasOlderMessages: props.hasOlderMessages,
+    olderMessagesLoading: props.olderMessagesLoading,
+    isRunning: props.isRunning,
+    loadedMessages: props.conversation.messages,
+    topLevelMessages,
+    resolvedApprovals: resolvedTimelineApprovals,
+    thinkingRows
+  }), [props.conversation.messages, props.hasOlderMessages, props.isRunning, props.olderMessagesLoading, resolvedTimelineApprovals, thinkingRows, topLevelMessages]);
   const viewport = useChatConversationViewport({
     conversationId: props.conversation.id,
     messages: props.conversation.messages,
@@ -181,6 +213,7 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
     onLoadOlderMessages: props.onLoadOlderMessages,
     onLoadMessagePageForMessage: props.onLoadMessagePageForMessage
   });
+  viewportRootRef.current = viewport.viewRef;
 
   async function sendDraft(
     repoFileMentions: RepoFileMention[] = [],
@@ -188,9 +221,12 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
     skillMentions: ChatSkillMention[] = [],
     content?: string
   ): Promise<boolean> {
+    promptSuggestions.dismiss();
     const sent = await props.onSend(repoFileMentions, imageAttachments, skillMentions, content);
     if (sent) {
       viewport.scrollToChatBottom();
+    } else {
+      promptSuggestions.reload();
     }
     return sent;
   }
@@ -237,12 +273,13 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
     const rect = view.getBoundingClientRect();
     const limits = chatSidePanelWidthLimits(rect.width, {
       reserveWidth: 1,
-      minWidth: CHAT_SIDE_PANEL_MIN_WIDTH
+      minWidth: CHAT_SIDE_PANEL_MIN_WIDTH,
+      mainMinWidth: chatMainMinWidth(view)
     });
 
     const move = (moveEvent: PointerEvent): void => {
-      const nextWidth = Math.round(rect.right - moveEvent.clientX);
-      setThreadWidth(clampChatSidePanelWidth(nextWidth, limits));
+      requestedThreadWidthRef.current = clampChatSidePanelWidth(Math.round(rect.right - moveEvent.clientX), limits);
+      setThreadWidth(requestedThreadWidthRef.current);
     };
     const stop = (): void => {
       setIsResizingThread(false);
@@ -261,9 +298,10 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
     const clampCurrentWidth = (): void => {
       const limits = chatSidePanelWidthLimits(view.getBoundingClientRect().width, {
         reserveWidth: 1,
-        minWidth: CHAT_SIDE_PANEL_MIN_WIDTH
+        minWidth: CHAT_SIDE_PANEL_MIN_WIDTH,
+        mainMinWidth: chatMainMinWidth(view)
       });
-      setThreadWidth((current) => clampChatSidePanelWidth(current, limits));
+      setThreadWidth(clampChatSidePanelWidth(requestedThreadWidthRef.current, limits));
     };
     clampCurrentWidth();
     const resizeObserver = new ResizeObserver(clampCurrentWidth);
@@ -309,11 +347,23 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
     setSelectedThreadRootId(messageId);
   }
 
+  // Stable across renders: the message rows are memoized, and a new handler on every
+  // render re-rendered all of them on every scroll step, which made frames long.
+  const rowHandlersRef = useRef({ openThread, handleAppToolApproval });
+  rowHandlersRef.current = { openThread, handleAppToolApproval };
+  const stableOpenThread = useCallback((messageId: string) => rowHandlersRef.current.openThread(messageId), []);
+  const stableAppToolApproval = useCallback(
+    (...args: Parameters<typeof handleAppToolApproval>) => rowHandlersRef.current.handleAppToolApproval(...args),
+    []
+  );
+
   return (
     <MentionDirectoryContext.Provider value={mentionDirectory}>
     <MessageLinkContext.Provider value={viewport.focusChatMessage}>
       <ArtifactsContext.Provider value={artifacts.context}>
+      <ArtifactNoteProgressContext.Provider value={artifactNoteProgress}>
       <LocalFileLinkContext.Provider value={localFileOpen.localFileLinkContext}>
+      <AttachmentPanelContext.Provider value={sidePanel.attachmentContext}>
         <div
           className={`chat-view ${hasInlineTopBar ? "with-inline-topbar" : ""} ${hasThread ? "thread-open" : ""} ${showArtifactsPanel ? "artifacts-open" : ""} ${isResizingThread ? "resizing-thread" : ""}`}
           data-testid="chat-view"
@@ -345,14 +395,15 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
               onApproveMentions={chatMessageActions.onApproveMentions}
               onCompactParticipant={chatMessageActions.onCompactParticipant}
               onLoadOlderMessages={props.onLoadOlderMessages}
-              onOpenThread={openThread}
+              onOpenThread={stableOpenThread}
               onRejectMentions={chatMessageActions.onRejectMentions}
-              onRespondToAppToolApproval={handleAppToolApproval}
+              onRespondToAppToolApproval={stableAppToolApproval}
               onRespondToChoice={chatMessageActions.onRespondToChoice}
               onScroll={viewport.updateStickToBottom}
               onScrollIntent={viewport.markUserScrollIntent}
               onStopRun={props.onStopRun ? chatMessageActions.onStopRun : undefined}
               onToggleReaction={chatMessageActions.onToggleReaction}
+              onDismissTurnFinishedNote={props.onDismissTurnFinishedNote ? chatMessageActions.onDismissTurnFinishedNote : undefined}
               participantStatusById={props.participantStatusById}
               participants={participants}
               approvalsByMessageId={approvalPlacement.byMessageId}
@@ -368,23 +419,24 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
               virtualItems={viewport.chatVirtualItems}
               virtualizer={viewport.chatVirtualizer}
             />
-            {!viewport.isStuckToBottom && topLevelMessages.length > 0 && (
-              <button
-                type="button"
-                className="chat-jump-to-latest"
-                aria-label="Jump to latest"
-                title="Jump to latest"
-                onClick={viewport.scrollToChatBottom}
-              >
-                <ArrowDown size={19} aria-hidden />
-              </button>
-            )}
+            <ChatAccordDockSlot
+              docked={dockedAccord}
+              conversationId={props.conversation.id}
+              participants={participants}
+              keepAtLatest={() => { if (viewport.isStuckToBottom) viewport.scrollToChatBottom(); }}
+            >
+              {!viewport.isStuckToBottom && topLevelMessages.length > 0 && (
+                <IconButton className="chat-jump-to-latest" floating label="Jump to latest" icon={ArrowDown} onClick={viewport.scrollToChatBottom} />
+              )}
+            </ChatAccordDockSlot>
             <ChatComposer
               participants={participants}
               savedPrompts={props.settings.chatSavedPrompts}
               conversationId={props.conversation.id}
               repoPath={props.conversation.repoPath}
               draft={props.draft}
+              picks={props.composerPicks}
+              suggestions={promptSuggestions.suggestions}
               onDraftChange={props.onDraftChange}
               onSend={sendDraft}
               accordDisabledReason={props.accordDisabledReason}
@@ -416,6 +468,7 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
               activityDisclosure={activityDisclosure}
               rootMessage={selectedThreadRoot}
               replies={selectedThreadSummary?.replies ?? []}
+              replyCount={selectedThreadSummary?.countedReplies.length ?? 0}
               participants={participants}
               participantStatusById={props.participantStatusById}
               conversationId={props.conversation.id}
@@ -435,6 +488,7 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
               onRejectMentions={chatMessageActions.onRejectMentions}
               onRespondToChoice={chatMessageActions.onRespondToChoice}
               onToggleReaction={chatMessageActions.onToggleReaction}
+              onDismissTurnFinishedNote={props.onDismissTurnFinishedNote ? chatMessageActions.onDismissTurnFinishedNote : undefined}
               onCompactParticipant={chatMessageActions.onCompactParticipant}
               onStopRun={props.onStopRun ? chatMessageActions.onStopRun : undefined}
               continuedMentionRequestIds={continuedMentionRequestIds}
@@ -445,13 +499,12 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
             />
           )}
           {showArtifactsPanel && (
-            <ArtifactsPanel
-              conversationId={props.conversation.id}
-              members={artifactMembersForConversation(props.conversation)}
-              artifacts={artifacts.artifacts}
-              selectedId={artifacts.selectedId}
-              onSelect={artifacts.selectArtifact}
-              onClose={artifacts.closePanel}
+            <ChatSidePanel
+              conversation={props.conversation}
+              settings={props.settings}
+              artifacts={artifacts}
+              backToThread={sidePanel.backToThread}
+              openFileOutside={(ref, action) => void localFileOpen.openFileOutside(ref, action)}
             />
           )}
           <LocalFileOpenChooser
@@ -461,7 +514,9 @@ export function ChatConversationView(props: ChatConversationViewProps): JSX.Elem
             onOpenChange={localFileOpen.handleLocalFileChooserOpenChange}
           />
         </div>
+      </AttachmentPanelContext.Provider>
       </LocalFileLinkContext.Provider>
+      </ArtifactNoteProgressContext.Provider>
       </ArtifactsContext.Provider>
     </MessageLinkContext.Provider>
     </MentionDirectoryContext.Provider>

@@ -112,6 +112,52 @@ test("tag discovery includes shutting-down and selects only the app-tagged secur
   assert.equal(workers[0]?.memoryMiB, 4096);
 });
 
+test("tag discovery tolerates missing optional volume and instance-type permissions", async () => {
+  const sent: string[] = [];
+  const ec2 = fakeClient(async (command) => {
+    sent.push(command.constructor.name);
+    switch (command.constructor.name) {
+      case "DescribeInstancesCommand":
+        return {
+          Reservations: [{ Instances: [{
+            InstanceId: "i-shared",
+            State: { Name: "running" },
+            PublicIpAddress: "198.51.100.8",
+            RootDeviceName: "/dev/sda1",
+            BlockDeviceMappings: [{ DeviceName: "/dev/sda1", Ebs: { VolumeId: "vol-root" } }],
+            InstanceType: "t3.small",
+            Placement: { AvailabilityZone: "us-east-1a" },
+            SecurityGroups: [{ GroupId: "sg-app" }]
+          }] }]
+        };
+      case "DescribeVolumesCommand":
+      case "DescribeInstanceTypesCommand": {
+        const error = new Error(`not authorized to perform ${command.constructor.name}`);
+        error.name = "UnauthorizedOperation";
+        throw error;
+      }
+      case "DescribeSecurityGroupsCommand":
+        return { SecurityGroups: [
+          { GroupId: "sg-app", Tags: [{ Key: "accordagents-worker", Value: "1" }] }
+        ] };
+      default:
+        throw new Error(`Unexpected ${command.constructor.name}`);
+    }
+  });
+  const client = new SdkEc2Client(ec2 as EC2Client, fakeClient(async () => ({})) as EC2InstanceConnectClient, "us-east-1");
+
+  const workers = await client.findWorkerInstances();
+
+  assert.deepEqual(sent.filter((name) => name === "DescribeVolumesCommand"), ["DescribeVolumesCommand"]);
+  assert.deepEqual(sent.filter((name) => name === "DescribeInstanceTypesCommand"), ["DescribeInstanceTypesCommand"]);
+  assert.equal(workers[0]?.instanceId, "i-shared");
+  assert.equal(workers[0]?.publicIp, "198.51.100.8");
+  assert.equal(workers[0]?.rootVolumeId, "vol-root");
+  assert.equal(workers[0]?.rootVolumeSizeGb, undefined);
+  assert.equal(workers[0]?.memoryMiB, undefined);
+  assert.equal(workers[0]?.securityGroupId, "sg-app");
+});
+
 test("describeInstance translates InvalidInstanceID.NotFound to absence", async () => {
   const ec2 = fakeClient(async () => {
     const error = new Error("missing");
@@ -120,6 +166,38 @@ test("describeInstance translates InvalidInstanceID.NotFound to absence", async 
   });
   const client = new SdkEc2Client(ec2 as EC2Client, fakeClient(async () => ({})) as EC2InstanceConnectClient, "us-east-1");
   assert.equal(await client.describeInstance("i-gone"), undefined);
+});
+
+test("describeInstance of a terminated instance says terminated without asking for its deleted disk or security group", async () => {
+  const sent: string[] = [];
+  const ec2 = fakeClient(async (command) => {
+    sent.push(command.constructor.name);
+    if (command.constructor.name !== "DescribeInstancesCommand") {
+      const error = new Error("The security group 'sg-gone' does not exist");
+      error.name = "InvalidGroup.NotFound";
+      throw error;
+    }
+    return { Reservations: [{ Instances: [{
+      InstanceId: "i-gone",
+      State: { Name: "terminated" },
+      InstanceType: "t3.small",
+      RootDeviceName: "/dev/sda1",
+      SecurityGroups: [{ GroupId: "sg-gone" }]
+    }] }] };
+  });
+  const client = new SdkEc2Client(ec2 as EC2Client, fakeClient(async () => ({})) as EC2InstanceConnectClient, "us-east-1");
+  const info = await client.describeInstance("i-gone");
+  assert.equal(info?.state, "terminated");
+  assert.equal(info?.region, "us-east-1");
+  assert.deepEqual(sent, ["DescribeInstancesCommand"]);
+});
+
+test("describeInstance says which account the instance belongs to", async () => {
+  const ec2 = fakeClient(async (command) => command.constructor.name === "DescribeInstancesCommand"
+    ? { Reservations: [{ OwnerId: "018089055817", Instances: [{ InstanceId: "i-gone", State: { Name: "terminated" } }] }] }
+    : {});
+  const client = new SdkEc2Client(ec2 as EC2Client, fakeClient(async () => ({})) as EC2InstanceConnectClient, "us-east-1");
+  assert.equal((await client.describeInstance("i-gone"))?.ownerId, "018089055817");
 });
 
 test("terminateInstance treats InvalidInstanceID.NotFound as an idempotent success", async () => {

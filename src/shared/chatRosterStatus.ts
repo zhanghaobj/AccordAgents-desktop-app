@@ -10,12 +10,19 @@ type NonIdleRosterStatus = Exclude<ChatParticipantRosterStatus, "idle">;
 const STATUS_RANK: Record<NonIdleRosterStatus, number> = {
   error: 1,
   stopped: 2,
-  pending: 3,
-  compacting: 4,
-  running: 5
+  background: 3,
+  pending: 4,
+  compacting: 5,
+  running: 6
 };
 
-export function buildChatParticipantStatusMap(activeChatConversation: Conversation | undefined): Map<string, ChatParticipantRosterStatus> {
+/** `backgroundTasks`: live background work by member (see
+ *  ChatService.backgroundTasksForConversation); a member with some and nothing
+ *  more pressing shows as working in the background. */
+export function buildChatParticipantStatusMap(
+  activeChatConversation: Conversation | undefined,
+  backgroundTasks?: ReadonlyMap<string, readonly string[]>
+): Map<string, ChatParticipantRosterStatus> {
   const statuses = new Map<string, ChatParticipantRosterStatus>();
   if (!activeChatConversation) {
     return statuses;
@@ -32,6 +39,12 @@ export function buildChatParticipantStatusMap(activeChatConversation: Conversati
       statuses.set(participantId, status);
     }
   };
+
+  for (const [participantId, labels] of backgroundTasks ?? []) {
+    if (labels.length > 0) {
+      setStatus(participantId, "background");
+    }
+  }
 
   const activeRuns = activeRunSummaryForConversation(activeChatConversation);
   const liveRunIds = new Set(activeRuns.runIds);
@@ -114,6 +127,45 @@ function chatParticipantIds(conversation: Conversation): Set<string> {
     const id = (item as { id?: unknown }).id;
     if (typeof id === "string" && id.trim()) {
       ids.add(id);
+    }
+  }
+  return ids;
+}
+
+/** Members whose own work in this chat is still live, as the chat's saved
+ *  state shows it: a turn (also one queued behind its earlier turn, or one
+ *  another device runs, by its pending reply), a compaction, or a member
+ *  request still running that it asked or answers. Only these members'
+ *  settings and removal wait for that work to end; any other member can be
+ *  added, changed, compacted or removed meanwhile. ChatService adds the work
+ *  only its own process knows about (memberHasLiveWork). */
+export function chatMemberIdsWithLiveWork(conversation: Pick<Conversation, "metadata" | "messages">): Set<string> {
+  const ids = new Set<string>();
+  const activeRuns = activeRunSummaryForConversation(conversation);
+  for (const participantId of activeRuns.participantIds) {
+    ids.add(participantId);
+  }
+  const liveRunIds = new Set(activeRuns.runIds);
+  for (const [participantId, state] of Object.entries(readParticipantCompactions(conversation.metadata))) {
+    if (liveRunIds.has(state.runId)) {
+      ids.add(participantId);
+    }
+  }
+  for (const message of conversation.messages) {
+    if (message.role === "participant" && message.status === "pending" && message.participantId) {
+      ids.add(message.participantId);
+    }
+    const participantRequest = message.metadata?.participantRequest;
+    if (!participantRequest) {
+      continue;
+    }
+    for (const item of participantRequest.items) {
+      if (item.status === "running") {
+        ids.add(item.targetParticipantId);
+        ids.add(participantRequest.requesterParticipantId);
+      } else if (item.status === "resuming_requester") {
+        ids.add(participantRequest.requesterParticipantId);
+      }
     }
   }
   return ids;

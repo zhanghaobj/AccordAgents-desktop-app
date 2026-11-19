@@ -1,0 +1,169 @@
+/**
+ * The one description of this phone's database, for both contexts that open it.
+ *
+ * The page and the service worker are separate programs over the same
+ * IndexedDB. They each used to carry their own copy of the version number and
+ * the store list, and they drifted: the page moved to version 4 while the
+ * worker still asked for 3. IndexedDB refuses to open a database at a version
+ * lower than the one on disk, so from that moment every push-woken sync failed
+ * before it read a single byte -- silently, because a push handler has nobody
+ * to tell.
+ *
+ * So there is one version and one upgrade here, and both load it. A store
+ * added for the page exists for the worker too, and neither can move without
+ * the other.
+ *
+ * The upgrade only ever adds. A store this build does not know about is left
+ * alone, because the other context may be a build ahead.
+ */
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === "object" && module.exports) module.exports = api;
+  else root.AccordMobileDb = api;
+})(typeof self !== "undefined" ? self : globalThis, function () {
+  "use strict";
+
+  const DB_NAME = "accordagents-mobile-control";
+  // Raise this only together with a store or an index added in upgradeControlDb.
+  const DB_VERSION = 7;
+
+  // `sealed`, `events` and the three machine stores held what a pairing made
+  // the old way (through the desktop's relay) kept. Nothing reads them any
+  // more and the app empties them; they stay here (without the indexes they
+  // once had) because the upgrade only ever adds, and a build a version
+  // behind may still ask for them.
+  const STORES = {
+    outbox: "outbox",
+    timeline: "timeline",
+    meta: "meta",
+    sealed: "sealedEnvelopes",
+    events: "events",
+    machineEvents: "machineEvents",
+    machineOutbox: "machineOutbox",
+    machineBlobs: "machineBlobs",
+    // Every attempt to send that failed, and why (agreement Д12): kept on the
+    // phone, the newest few hundred, so the User can read why something she
+    // sent did not go.
+    sendFailures: "sendFailures"
+  };
+  // The timeline's rows by chat. Every delivered batch is deduplicated inside
+  // one chat, and the read that did it used to scan the whole store per row:
+  // on a phone with a few weeks of chats that was seconds of main-thread work
+  // for one batch, arriving every few seconds while a member wrote.
+  const TIMELINE_CONVERSATION_INDEX = "conversationId";
+
+  function upgradeControlDb(db, transaction) {
+    if (!db.objectStoreNames.contains(STORES.outbox)) {
+      const store = db.createObjectStore(STORES.outbox, { keyPath: "eventId" });
+      store.createIndex("status", "status", { unique: false });
+      store.createIndex("createdAt", "createdAt", { unique: false });
+    }
+    if (!db.objectStoreNames.contains(STORES.timeline)) {
+      const store = db.createObjectStore(STORES.timeline, { keyPath: "id" });
+      store.createIndex("createdAt", "createdAt", { unique: false });
+    }
+    // An index on a store that already exists is reached through the upgrade
+    // transaction; a store created just above is reached the same way.
+    const timeline = transaction ? transaction.objectStore(STORES.timeline) : undefined;
+    if (timeline && !timeline.indexNames.contains(TIMELINE_CONVERSATION_INDEX)) {
+      timeline.createIndex(TIMELINE_CONVERSATION_INDEX, "conversationId", { unique: false });
+    }
+    if (!db.objectStoreNames.contains(STORES.meta)) {
+      db.createObjectStore(STORES.meta, { keyPath: "key" });
+    }
+    if (!db.objectStoreNames.contains(STORES.sealed)) {
+      db.createObjectStore(STORES.sealed, { keyPath: "eventId" });
+    }
+    if (!db.objectStoreNames.contains(STORES.events)) {
+      db.createObjectStore(STORES.events, { keyPath: "eventId" });
+    }
+    if (!db.objectStoreNames.contains(STORES.machineEvents)) {
+      db.createObjectStore(STORES.machineEvents, { keyPath: "eventId" });
+    }
+    if (!db.objectStoreNames.contains(STORES.machineOutbox)) {
+      db.createObjectStore(STORES.machineOutbox, { keyPath: "eventId" });
+    }
+    if (!db.objectStoreNames.contains(STORES.machineBlobs)) {
+      db.createObjectStore(STORES.machineBlobs, { keyPath: "key" });
+    }
+    if (!db.objectStoreNames.contains(STORES.sendFailures)) {
+      db.createObjectStore(STORES.sendFailures, { keyPath: "id", autoIncrement: true });
+    }
+  }
+
+  function hasStores(db, names) {
+    return (names || []).every(function (name) { return db.objectStoreNames.contains(name); });
+  }
+
+  function request(open) {
+    return new Promise(function (resolve, reject) {
+      open.onupgradeneeded = function () { upgradeControlDb(open.result, open.transaction); };
+      open.onsuccess = function () {
+        const db = open.result;
+        // The other context asking for a newer version must not wait on this
+        // connection: it is closed, and the next transaction opens afresh at
+        // whatever version is then on disk. Both contexts open a connection
+        // per transaction, so nothing long-lived is lost with it.
+        db.onversionchange = function () { db.close(); };
+        resolve(db);
+      };
+      open.onerror = function () { reject(open.error || new Error("IndexedDB open failed.")); };
+      open.onblocked = function () {
+        reject(new Error("Another tab is holding this phone's database at an older version."));
+      };
+    });
+  }
+
+  /**
+   * Opens the database without ever asking for a version older than the one on
+   * disk.
+   *
+   * A build that is behind the other context still gets a usable handle: it
+   * opens whatever is there and uses it if the stores it needs exist. It only
+   * forces its own version when something it needs is genuinely missing, and
+   * then never below the version already on disk -- so the two contexts cannot
+   * lock each other out whichever of them updates first.
+   */
+  // What the last successful open settled on, so the ordinary case is one
+  // open and not two. Per context, because each has its own module instance.
+  let resolvedVersion;
+
+  async function openControlDb(indexedDb, needed) {
+    if (resolvedVersion) {
+      try {
+        return await request(indexedDb.open(DB_NAME, resolvedVersion));
+      } catch (error) {
+        // The other context upgraded underneath this one: a worker that
+        // updated mid-session. Settle on the new version rather than failing
+        // every read from here on.
+        if (!error || error.name !== "VersionError") throw error;
+        resolvedVersion = undefined;
+      }
+    }
+    const existing = await request(indexedDb.open(DB_NAME));
+    const wanted = needed || Object.values(STORES);
+    if (existing.version >= DB_VERSION && hasStores(existing, wanted)) {
+      resolvedVersion = existing.version;
+      return existing;
+    }
+    // Never below what is already on disk: asking for an older version is the
+    // error that broke the push path, and it would break the other context now.
+    const version = Math.max(DB_VERSION, existing.version + (existing.version >= DB_VERSION ? 1 : 0));
+    existing.close();
+    const upgraded = await request(indexedDb.open(DB_NAME, version));
+    resolvedVersion = upgraded.version;
+    return upgraded;
+  }
+
+  return {
+    DB_NAME: DB_NAME,
+    DB_VERSION: DB_VERSION,
+    STORES: STORES,
+    TIMELINE_CONVERSATION_INDEX: TIMELINE_CONVERSATION_INDEX,
+    upgradeControlDb: upgradeControlDb,
+    hasStores: hasStores,
+    openControlDb: openControlDb,
+    /** Test seam: forget what the last open settled on. */
+    resetResolvedVersion: function () { resolvedVersion = undefined; }
+  };
+});

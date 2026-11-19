@@ -4,6 +4,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { createReleaseAtFreshCommit, preflightReleaseRepo, verifyReleaseListing } from "./release-repo-target.mjs";
 
 const rootDir = process.cwd();
 const signedDir = path.join(rootDir, "signed");
@@ -20,21 +21,22 @@ function printHelp() {
   console.log(`Usage: npm run release:<patch|minor|major|beta> [-- options]
 
 Creates a macOS arm64 release:
-  1. bumps package.json/package-lock.json,
-  2. commits and pushes the version bump to the source repo,
-  3. tags the source repo at v<version>,
-  4. builds signed/notarized DMG and signed ZIP artifacts,
-  5. creates or updates a GitHub Release in the public release repo,
+  1. bumps package.json/package-lock.json and commits the bump locally,
+  2. tags it locally at v<version>,
+  3. builds signed/notarized DMG and signed ZIP artifacts and launch-checks the app,
+  4. pushes the bump and the tag to the source repo (a failed build pushes nothing and uses no version),
+  5. creates or updates a GitHub Release in the public release repo; a new release is tagged at a new
+     empty commit on the release repo's default branch so the update feed lists it first,
   6. checks update.electronjs.org for the ZIP asset.
 
 Options:
   --repo owner/repo              Public GitHub release repo. Defaults to RELEASE_REPO, package.json config.releaseRepo for stable,
                                  or package.json config.betaReleaseRepo for beta.
-  --branch name                  Source branch to release from. Defaults to origin HEAD, usually main.
   --draft                        Create a draft GitHub Release. Auto-update check is skipped.
   --prerelease                   Mark the GitHub Release as a prerelease. Auto-update check is skipped.
   --skip-update-check            Do not query update.electronjs.org after upload.
   --allow-private-release-repo   Allow publishing to a private release repo. Auto-updates will not work there.
+  --expect-head <sha>            Stop before bumping unless the source branch, after pulling, is at <sha>.
   --dry-run                      Print the planned release without changing files or GitHub state.
   -h, --help                     Show this help.
 
@@ -55,12 +57,34 @@ function run(command, args, options = {}) {
   });
 }
 
-function runInherited(command, args) {
+function runInherited(command, args, env = process.env) {
   execFileSync(command, args, {
     cwd: rootDir,
-    env: process.env,
+    env,
     stdio: "inherit"
   });
+}
+
+// The build runs every dependency's code; it needs no GitHub credentials.
+function envWithoutGitHubTokens() {
+  const { GH_TOKEN, GITHUB_TOKEN, SOURCE_PUSH_TOKEN, ...env } = process.env;
+  return env;
+}
+
+// In CI the source repo is checked out without stored credentials; the token
+// for pushing the bump and the tag is handed to those two git calls only.
+function sourcePushEnv() {
+  const token = process.env.SOURCE_PUSH_TOKEN;
+  if (!token) {
+    return process.env;
+  }
+  const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
+  return {
+    ...process.env,
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+    GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${auth}`
+  };
 }
 
 function commandSucceeds(command, args) {
@@ -142,11 +166,11 @@ function parseArgs() {
   const options = {
     target: "current",
     releaseRepo: envReleaseRepo,
-    sourceBranch: process.env.RELEASE_BRANCH || "",
     draft: false,
     prerelease: false,
     skipUpdateCheck: false,
     allowPrivateReleaseRepo: false,
+    expectHead: "",
     dryRun: false
   };
 
@@ -167,15 +191,6 @@ function parseArgs() {
       options.releaseRepo = parseRequiredGitHubRepo(arg.slice("--repo=".length), "--repo");
       continue;
     }
-    if (arg === "--branch") {
-      options.sourceBranch = readOptionValue(args, index, arg);
-      index += 1;
-      continue;
-    }
-    if (arg.startsWith("--branch=")) {
-      options.sourceBranch = arg.slice("--branch=".length);
-      continue;
-    }
     if (arg === "--draft") {
       options.draft = true;
       continue;
@@ -194,6 +209,11 @@ function parseArgs() {
     }
     if (arg === "--dry-run") {
       options.dryRun = true;
+      continue;
+    }
+    if (arg === "--expect-head") {
+      options.expectHead = readOptionValue(args, index, arg);
+      index += 1;
       continue;
     }
     if (arg.startsWith("-")) {
@@ -232,27 +252,6 @@ function requireCommand(command, args = ["--version"]) {
   if (!commandSucceeds(command, args)) {
     fail(`Required command is unavailable or failed: ${command}`);
   }
-}
-
-function originDefaultBranch() {
-  try {
-    const localHead = run("git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).trim();
-    if (localHead.startsWith("origin/")) {
-      return localHead.slice("origin/".length);
-    }
-  } catch {
-    // Fall through to remote inspection.
-  }
-  try {
-    const remote = run("git", ["remote", "show", "origin"]);
-    const match = remote.match(/HEAD branch:\s*(\S+)/);
-    if (match) {
-      return match[1];
-    }
-  } catch {
-    // Fall through to main.
-  }
-  return "main";
 }
 
 function ensureCleanWorktree() {
@@ -344,7 +343,6 @@ function bumpVersion(target, sourceBranch) {
   const afterVersion = currentVersion();
   runInherited("git", ["add", "package.json", "package-lock.json"]);
   runInherited("git", ["commit", "-m", `Bump version to ${afterVersion}`]);
-  runInherited("git", ["push", "origin", `HEAD:${sourceBranch}`]);
 
   return afterVersion;
 }
@@ -361,6 +359,8 @@ function remoteTagExists(tagName) {
   return run("git", ["ls-remote", "--tags", "origin", `refs/tags/${tagName}`]).trim().length > 0;
 }
 
+// The bump commit and tag stay local until the signed build succeeded, so a
+// failed build uses no version.
 function ensureSourceTag(tagName) {
   const headCommit = run("git", ["rev-parse", "HEAD"]).trim();
   const localCommit = localTagCommit(tagName);
@@ -386,9 +386,26 @@ function ensureSourceTag(tagName) {
     console.log(`\n==> Creating source tag ${tagName}`);
     runInherited("git", ["tag", "-a", tagName, "-m", `Release ${tagName}`]);
   }
+}
 
-  console.log(`\n==> Pushing source tag ${tagName}`);
-  runInherited("git", ["push", "origin", tagName]);
+function pushSource(sourceBranch, tagName) {
+  console.log(`\n==> Pushing the version bump and source tag ${tagName}`);
+  try {
+    runInherited("git", ["push", "--atomic", "origin", `HEAD:refs/heads/${sourceBranch}`, `refs/tags/${tagName}`], sourcePushEnv());
+  } catch {
+    rollBackLocalBump(tagName);
+    fail(`Pushing ${tagName} to ${sourceBranch} failed, so nothing was published and no version was used. If ${sourceBranch} moved meanwhile, start a new release for the commit you want.`);
+  }
+}
+
+function rollBackLocalBump(tagName) {
+  console.log(`\n==> Dropping the unpushed version bump and tag ${tagName}`);
+  try {
+    runInherited("git", ["tag", "-d", tagName]);
+  } catch {
+    // The tag was never created.
+  }
+  runInherited("git", ["reset", "--hard", "HEAD~1"]);
 }
 
 function requireFile(filePath) {
@@ -428,7 +445,7 @@ function releaseExists(tagName, releaseRepo) {
   return commandSucceeds("gh", ["release", "view", tagName, "--repo", releaseRepo]);
 }
 
-function createOrUpdateGitHubRelease(options, tagName, releaseRepoTargetBranch, assets) {
+function createOrUpdateGitHubRelease(options, tagName, releaseRepoBranch, assets) {
   const title = `${productName()} ${tagName}`;
   const notes = releaseNotes(tagName, assets);
 
@@ -440,32 +457,27 @@ function createOrUpdateGitHubRelease(options, tagName, releaseRepoTargetBranch, 
   }
 
   console.log(`\n==> Creating GitHub Release ${tagName} in ${options.releaseRepo}`);
-  const args = [
-    "release",
-    "create",
-    tagName,
-    ...assets,
-    "--repo",
-    options.releaseRepo,
-    "--target",
-    releaseRepoTargetBranch,
-    "--title",
-    title,
-    "--notes",
-    notes
-  ];
+  const releaseArgs = [...assets, "--repo", options.releaseRepo, "--title", title, "--notes", notes];
 
   if (options.draft) {
-    args.push("--draft");
+    releaseArgs.push("--draft");
   }
   if (options.prerelease) {
-    args.push("--prerelease");
+    releaseArgs.push("--prerelease");
   }
   if (!options.draft && !options.prerelease) {
-    args.push("--latest");
+    releaseArgs.push("--latest");
   }
 
-  runInherited("gh", args);
+  try {
+    return createReleaseAtFreshCommit(
+      { releaseRepo: options.releaseRepo, branch: releaseRepoBranch, tagName, releaseArgs },
+      { gh: (args) => runInherited("gh", args) }
+    );
+  } catch (error) {
+    fail(`Publishing ${tagName} to ${options.releaseRepo} failed after the version bump and build: ${error.message}
+Do not rerun the release. If ${tagName} is missing from ${options.releaseRepo}, create it by hand from ${path.relative(rootDir, signedDir)}/ at a new empty commit on ${releaseRepoBranch} (see scripts/release-repo-target.mjs), never with --target ${releaseRepoBranch}.`);
+  }
 }
 
 function sleep(ms) {
@@ -533,7 +545,7 @@ async function checkUpdateEndpoint(options, version, fromVersion, releaseRepoIsP
 }
 
 const options = parseArgs();
-const sourceBranch = options.sourceBranch || originDefaultBranch();
+const sourceBranch = options.target === "beta" ? "beta" : "main";
 
 if (options.dryRun) {
   const fromVersion = currentVersion();
@@ -546,7 +558,9 @@ if (options.dryRun) {
   console.log(`Next version: ${nextVersion}`);
   console.log("Build: npm run signed:mac-arm64");
   console.log(`GitHub Release state: ${options.draft ? "draft" : options.prerelease ? "prerelease" : "published"}`);
+  console.log("Release tag target: new empty commit on the release repo's default branch");
   console.log(`Update check: ${options.skipUpdateCheck || options.draft || options.prerelease ? "skipped" : "enabled against release repo"}`);
+  console.log(`Expected source commit: ${options.expectHead || "any"}`);
   process.exit(0);
 }
 
@@ -570,22 +584,64 @@ ensureSourceBranch(sourceBranch);
 ensureCleanWorktree();
 runInherited("git", ["pull", "--ff-only", "origin", sourceBranch]);
 ensureCleanWorktree();
+if (options.expectHead) {
+  const headCommit = run("git", ["rev-parse", "HEAD"]).trim();
+  if (headCommit !== options.expectHead) {
+    fail(`${sourceBranch} moved to ${headCommit} after this release was started for ${options.expectHead}. Nothing was bumped. Start a new release for the commit you want, after reconciling any earlier attempt that failed after its bump.`);
+  }
+}
+
+const releaseRepoBranch = repoInfo.defaultBranchRef?.name || "main";
+const plannedTagName = `v${nextVersionForTarget(options.target, currentVersion())}`;
+console.log(`\n==> Checking that ${options.releaseRepo} can take ${plannedTagName}`);
+try {
+  preflightReleaseRepo(options.releaseRepo, releaseRepoBranch, plannedTagName);
+} catch (error) {
+  fail(error.message);
+}
 
 const previousVersion = currentVersion();
 const version = bumpVersion(options.target, sourceBranch);
 const tagName = `v${version}`;
+if (tagName !== plannedTagName) {
+  try {
+    preflightReleaseRepo(options.releaseRepo, releaseRepoBranch, tagName);
+  } catch (error) {
+    rollBackLocalBump(tagName);
+    fail(error.message);
+  }
+}
 ensureSourceTag(tagName);
 
 console.log("\n==> Building signed macOS arm64 artifacts");
-runInherited("npm", ["run", "signed:mac-arm64"]);
+try {
+  runInherited("npm", ["run", "signed:mac-arm64"], envWithoutGitHubTokens());
+} catch {
+  rollBackLocalBump(tagName);
+  fail(`The signed build failed before anything was pushed, so ${tagName} was not used. Fix the cause and release again.`);
+}
+pushSource(sourceBranch, tagName);
 
 const assets = releaseAssets(version);
-createOrUpdateGitHubRelease(
-  options,
-  tagName,
-  repoInfo.defaultBranchRef?.name || "main",
-  assets
-);
-await checkUpdateEndpoint(options, version, previousVersion, repoInfo.isPrivate);
+const targetCommit = createOrUpdateGitHubRelease(options, tagName, releaseRepoBranch, assets);
+const listingProblem =
+  targetCommit && !options.draft
+    ? await verifyReleaseListing({ releaseRepo: options.releaseRepo, tagName, targetCommit, checkOrder: !options.prerelease })
+    : "";
+if (listingProblem) {
+  console.warn(`\n${tagName} is published in ${options.releaseRepo}, but ${listingProblem}.`);
+}
+let updateCheckError = null;
+try {
+  await checkUpdateEndpoint(options, version, previousVersion, repoInfo.isPrivate);
+} catch (error) {
+  updateCheckError = error;
+}
+if (listingProblem) {
+  fail(`${tagName} is published, but ${listingProblem}. Do not rerun the release.${updateCheckError ? `\nUpdate check: ${updateCheckError.message}` : ""}`);
+}
+if (updateCheckError) {
+  throw updateCheckError;
+}
 
 console.log(`\nRelease ${tagName} is ready in ${options.releaseRepo}.`);

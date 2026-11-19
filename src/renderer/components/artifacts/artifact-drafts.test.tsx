@@ -16,13 +16,18 @@ import type {
 import { artifactSummaryStatusLabel } from "../../../shared/artifacts";
 import { loadArtifactDetail } from "./artifact-detail-loader";
 import { AccessArtifactForm } from "./artifact-forms";
-import { ArtifactVersionSelector } from "./artifact-version-selector";
+import { artifactPickerEntries, selectArtifactPickerEntry } from "./artifact-version-selector";
+import { ArtifactDetailView } from "./artifact-detail";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 const NOW = "2026-07-13T12:00:00.000Z";
 
 test("collecting artifact renders one selector and one draft body", () => {
   const inboxSource = readFileSync(resolve("src/renderer/components/artifacts/draft-inbox.tsx"), "utf8");
-  assert.match(inboxSource, /<ArtifactVersionSelector/);
+  const panelSource = readFileSync(resolve("src/renderer/components/artifacts/artifacts-panel.tsx"), "utf8");
+  // The draft picker is the Version entry of the title menu and lists the collected drafts.
+  assert.match(panelSource, /<ArtifactVersionSubmenu/);
+  assert.match(panelSource, /drafts=\{detail\.lifecycle === "collecting_drafts" \? detail\.drafts : drafts\}/);
   assert.match(inboxSource, /const selectedDraft =/);
   assert.match(inboxSource, /selectedContent\.content/);
   assert.doesNotMatch(inboxSource, /detail\.drafts\.map/);
@@ -31,43 +36,33 @@ test("collecting artifact renders one selector and one draft body", () => {
 test("one selector contains every version and draft with author labels", () => {
   const selected: number[] = [];
   const shownDrafts: string[] = [];
-  const renderer = create(<ArtifactVersionSelector
-    selectedVersion={5}
-    headVersion={5}
-    history={[
-      { version: 1, author: "owner", createdAt: NOW, signatures: [] },
-      { version: 5, author: "owner", createdAt: NOW, signatures: [] }
-    ]}
-    drafts={[publishedDraft()]}
-    onShowVersion={(version) => selected.push(version)}
-    onShowDraft={(draftId) => shownDrafts.push(draftId)}
-  />);
-  const text = JSON.stringify(renderer.toJSON());
-  assert.match(text, /Versions/);
-  assert.match(text, /Drafts/);
-  assert.match(text, /Draft by @author-two/);
-  const selector = renderer.root.findByProps({ "data-testid": "artifact-version-selector" });
-  act(() => selector.props.onChange({ currentTarget: { value: "version:1" } }));
-  act(() => selector.props.onChange({ currentTarget: { value: "draft:draft-a" } }));
+  const entries = artifactPickerEntries({
+    headVersion: 5,
+    history: [
+      { version: 1, versionEventId: "fixture-version-1", contentHash: "1".repeat(64), author: "owner", createdAt: NOW, signatures: [] },
+      { version: 5, versionEventId: "fixture-version-5", contentHash: "5".repeat(64), author: "owner", createdAt: NOW, signatures: [] }
+    ],
+    drafts: [publishedDraft()]
+  });
+  assert.deepEqual(entries.versions.map((entry) => entry.value), ["version:5", "version:1"]);
+  assert.equal(entries.drafts[0]?.title, "Draft by @author-two");
+  selectArtifactPickerEntry("version:1", (version) => selected.push(version), (draftId) => shownDrafts.push(draftId));
+  selectArtifactPickerEntry("draft:draft-a", (version) => selected.push(version), (draftId) => shownDrafts.push(draftId));
   assert.deepEqual(selected, [1]);
   assert.deepEqual(shownDrafts, ["draft-a"]);
 });
 
 test("selector marks the head version current while viewing history", () => {
-  const renderer = create(<ArtifactVersionSelector
-    selectedVersion={1}
-    headVersion={5}
-    history={[
-      { version: 1, author: "owner", createdAt: NOW, signatures: [] },
-      { version: 5, author: "owner", createdAt: NOW, signatures: [] }
-    ]}
-    drafts={[]}
-    onShowVersion={() => undefined}
-    onShowDraft={() => undefined}
-  />);
-  const options = renderer.root.findAllByType("option");
-  assert.match(options.find((option) => option.props.value === "version:5")?.children.join("") ?? "", /Current/);
-  assert.doesNotMatch(options.find((option) => option.props.value === "version:1")?.children.join("") ?? "", /Current/);
+  const entries = artifactPickerEntries({
+    headVersion: 5,
+    history: [
+      { version: 1, versionEventId: "fixture-version-1", contentHash: "1".repeat(64), author: "owner", createdAt: NOW, signatures: [] },
+      { version: 5, versionEventId: "fixture-version-5", contentHash: "5".repeat(64), author: "owner", createdAt: NOW, signatures: [] }
+    ],
+    drafts: []
+  });
+  assert.match(entries.versions.find((entry) => entry.value === "version:5")?.title ?? "", /Current/);
+  assert.doesNotMatch(entries.versions.find((entry) => entry.value === "version:1")?.title ?? "", /Current/);
 });
 
 test("published artifact selector keeps initial draft content available", () => {
@@ -75,8 +70,10 @@ test("published artifact selector keeps initial draft content available", () => 
   const panelSource = readFileSync(resolve("src/renderer/components/artifacts/artifacts-panel.tsx"), "utf8");
   const loaderSource = readFileSync(resolve("src/renderer/components/artifacts/artifact-detail-loader.ts"), "utf8");
   assert.match(detailSource, /selectedDraft \?/);
-  assert.match(detailSource, /data-testid="artifact-draft-author"/);
-  assert.match(detailSource, /artifactMemberLabel\(selectedDraft\.author\)/);
+  // The draft's author is named once, in the selector option, not repeated below it.
+  const selectorSource = readFileSync(resolve("src/renderer/components/artifacts/artifact-version-selector.tsx"), "utf8");
+  assert.match(selectorSource, /Draft by \$\{artifactMemberLabel\(draft\.author\)\}/);
+  assert.doesNotMatch(detailSource, /artifact-draft-author/);
   assert.match(detailSource, /testId="artifact-draft-content"/);
   assert.doesNotMatch(detailSource, /<ArtifactDraftArchive drafts=\{\[selectedDraft\]\}/);
   assert.match(panelSource, /loadArtifactDetail/);
@@ -94,10 +91,13 @@ test("artifact archive tab is backed by archived state and a restore path", () =
   assert.match(panelSource, /activeArtifacts\s*=\s*props\.artifacts\.filter\(\(artifact\)\s*=>\s*!artifact\.archivedAt\)/);
   assert.match(panelSource, /archivedArtifacts\s*=\s*props\.artifacts\.filter\(\(artifact\)\s*=>\s*artifact\.archivedAt\)/);
   assert.doesNotMatch(panelSource, /Archived <span>0<\/span>[\s\S]{0,80}disabled/);
-  assert.match(panelSource, /Restore artifact/);
+  const menuSource = readFileSync(resolve("src/renderer/components/artifacts/artifact-actions-menu.tsx"), "utf8");
+  assert.match(menuSource, /"restore"/);
+  assert.match(panelSource, /onArchivedChange=\{\(archived\) => void submitArchived\(archived\)\}/);
   assert.match(panelSource, /const isArchived = Boolean\(detail\?\.summary\.archivedAt\)/);
   assert.match(panelSource, /canEdit = detail && !isArchived/);
-  assert.match(panelSource, /canManageAccess = canManageArtifact && !isArchived/);
+  // Archived artifacts still show who submitted and signed, but access is read-only.
+  assert.match(panelSource, /readOnly=\{isArchived\}/);
   assert.match(panelSource, /mode=\{isArchived \? "view" : mode\}/);
   assert.match(panelSource, /canSign=\{!isArchived && detail\.summary\.approval\.requiredSigners\.includes\(me\)\}/);
   assert.match(listSource, /emptyMessage/);
@@ -113,7 +113,10 @@ test("the detail surface renders one selected version or one selected draft", ()
 test("show diff toggle replaces version content instead of adding a comparison panel", () => {
   const detailSource = readFileSync(resolve("src/renderer/components/artifacts/artifact-detail.tsx"), "utf8");
   const panelSource = readFileSync(resolve("src/renderer/components/artifacts/artifacts-panel.tsx"), "utf8");
-  assert.match(detailSource, /data-testid="artifact-show-diff-toggle"/);
+  const menuSource = readFileSync(resolve("src/renderer/components/artifacts/artifact-actions-menu.tsx"), "utf8");
+  // Content / Changes is chosen in the title menu; the diff offers its own way back.
+  assert.match(menuSource, /data-testid="artifact-show-diff-toggle"/);
+  assert.match(detailSource, /data-testid="artifact-show-content"/);
   assert.match(detailSource, /props\.showDiff \? \(/);
   assert.match(detailSource, /data-testid="artifact-version-diff"/);
   assert.match(detailSource, /testId="artifact-version-content"/);
@@ -131,6 +134,31 @@ test("inline revision keeps notes and does not reset typed content from detail r
   assert.match(surfaceSource, /artifact-version-note/);
   assert.doesNotMatch(detailSource, /useEffect\(\(\) => \{\s*setContent\(props\.initialContent\);?\s*\}/s);
   assert.doesNotMatch(detailSource, /<div className="artifact-version-note">/);
+});
+
+test("retrying a stale revision preserves the edit and note when its base identity advances", () => {
+  const noop = (): void => undefined;
+  const saved: Array<[string, string | undefined]> = [];
+  const detail = publishedDetail("retry-artifact", "Retry", "original", false);
+  const props: Parameters<typeof ArtifactDetailView>[0] = {
+    detail, drafts: [], mode: "revise", busy: false, canEdit: true, canSign: false, alreadySigned: false,
+    reviseBase: 1, showDiff: false, onStartRevise: noop,
+    onSubmitRevise: (content, note) => { saved.push([content, note]); }, onCancelForm: noop, onSign: noop,
+    onShowVersion: noop, onShowDiffChange: noop, onRetryDrafts: noop
+  };
+  const render = (next: typeof props): JSX.Element => <TooltipProvider><ArtifactDetailView {...next} /></TooltipProvider>;
+  const renderer = create(render(props));
+  act(() => {
+    renderer.root.findByProps({ id: "artifact-revise-content" }).props.onChange({ target: { value: "my unsaved edit" } });
+    renderer.root.findByProps({ "aria-label": "Revision note" }).props.onChange({ target: { value: "my note" } });
+  });
+  const refreshed = { ...detail, summary: { ...detail.summary, headVersion: 2 },
+    version: { ...detail.version, version: 2, versionEventId: "new-base", content: "other writer" } };
+  act(() => renderer.update(render({ ...props, detail: refreshed, reviseBase: 2 })));
+  assert.equal(renderer.root.findByProps({ id: "artifact-revise-content" }).props.value, "my unsaved edit");
+  act(() => renderer.root.findByProps({ "aria-label": "Save as v3" }).props.onClick());
+  assert.deepEqual(saved, [["my unsaved edit", "my note"]]);
+  act(() => renderer.unmount());
 });
 
 test("access popover restores owner, signer, label updates and rolls back failed write toggles", async () => {
@@ -227,7 +255,6 @@ test("artifact content has an attached copy action and no copy-reference action"
 test("collecting detail does not render every draft body at once", () => {
   const inboxSource = readFileSync(resolve("src/renderer/components/artifacts/draft-inbox.tsx"), "utf8");
   assert.match(inboxSource, /selectedDraft/);
-  assert.match(inboxSource, /<ArtifactVersionSelector/);
   assert.doesNotMatch(inboxSource, /drafts\.map/);
   assert.doesNotMatch(inboxSource, /ArtifactDraftArchive|PublicationPreflight/);
 });
@@ -248,8 +275,8 @@ test("newer revisions still load the initial draft archive", async () => {
   detail.summary.submittedDraftCount = 2;
   detail.version.version = 5;
   detail.history = [
-    { version: 1, author: "owner", createdAt: NOW, signatures: [] },
-    { version: 5, author: "owner", createdAt: NOW, signatures: [] }
+    { version: 1, versionEventId: "fixture-version-1", contentHash: "1".repeat(64), author: "owner", createdAt: NOW, signatures: [] },
+    { version: 5, versionEventId: "fixture-version-5", contentHash: "5".repeat(64), author: "owner", createdAt: NOW, signatures: [] }
   ];
   let archiveReads = 0;
   let drafts: ArtifactDraftView[] = [];
@@ -453,7 +480,7 @@ function publishedDetail(
       updatedAt: NOW,
       approval: { state: "none-required", requiredSigners: [], signedCurrent: [] }
     },
-    version: { version: 1, author: "user", content, createdAt: NOW, signatures: [] },
+    version: { version: 1, versionEventId: "fixture-content-version-1", contentHash: "1".repeat(64), author: "user", content, createdAt: NOW, signatures: [] },
     history: [],
     sources: withSources ? [{
       draftId: "draft-a",

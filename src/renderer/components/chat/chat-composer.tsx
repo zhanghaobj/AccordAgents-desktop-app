@@ -1,7 +1,8 @@
 import React, { useLayoutEffect, useMemo, useRef } from "react";
 import { ArrowUp, ImagePlus, RefreshCw } from "lucide-react";
 
-import { ResizableTextarea } from "@/renderer/components/primitives";
+import { IconButton, ResizableTextarea } from "@/renderer/components/primitives";
+import { AccordMergeIcon } from "./accord-merge-icon";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type {
   ChatImageInput,
@@ -14,7 +15,8 @@ import { ChatComposerAttachmentChips } from "./chat-composer-attachment-chips";
 import {
   CHAT_COMPOSER_TEXTAREA_STYLE,
   draftStartsWithPluginMention,
-  serializeComposerDraft
+  serializeComposerDraft,
+  type DraftPluginMention
 } from "./chat-composer-draft-utils";
 import { renderSlashHighlightedDraft } from "./chat-composer-draft-highlights";
 import { ChatActiveRunPopover, type ChatActiveRunParticipantRow } from "./chat-active-run-popover";
@@ -24,6 +26,24 @@ import {
   useChatComposerImages
 } from "./use-chat-composer-images";
 import { useChatComposerMentions } from "./use-chat-composer-mentions";
+import { useChatComposerSuggestions, type ChatComposerSuggestion } from "./use-chat-composer-suggestions";
+import { useComposerNoticeClearance } from "./use-composer-notice-clearance";
+import { SpeechToTextButton } from "./speech-to-text-button";
+import { DICTATION_SESSION_ATTRIBUTE } from "./dictation-target";
+
+/**
+ * Skills, plugins and files picked for the draft's tokens. When the owner
+ * keeps them, they live as long as the owner's draft; otherwise the composer
+ * keeps its own and drops them whenever the chat changes.
+ */
+export interface ChatComposerPicks {
+  skillMentions: ChatSkillMention[];
+  onSkillMentionsChange: React.Dispatch<React.SetStateAction<ChatSkillMention[]>>;
+  pluginMentions: DraftPluginMention[];
+  onPluginMentionsChange: React.Dispatch<React.SetStateAction<DraftPluginMention[]>>;
+  fileMentions: RepoFileMention[];
+  onFileMentionsChange: React.Dispatch<React.SetStateAction<RepoFileMention[]>>;
+}
 
 export interface ChatComposerProps {
   participants: ChatParticipant[];
@@ -31,6 +51,9 @@ export interface ChatComposerProps {
   conversationId?: string;
   repoPath?: string;
   draft: string;
+  picks?: ChatComposerPicks;
+  /** Members' next-prompt suggestions, newest first (main composer only). */
+  suggestions?: ChatComposerSuggestion[];
   placeholder: string;
   isRunning: boolean;
   activeRunCount?: number;
@@ -54,9 +77,14 @@ export interface ChatComposerProps {
   ) => boolean | void | Promise<boolean | void>;
   accordDisabledReason?: string;
   onOpenAccord?: () => void;
+  /** What a dictation belongs to (a chat, or a thread in it); changing it
+   *  drops a dictation in progress. Defaults to the chat. */
+  dictationSession?: string;
 }
 
 export function ChatComposer(props: ChatComposerProps): JSX.Element {
+  const rootRef = useRef<HTMLDivElement>(null);
+  useComposerNoticeClearance(rootRef);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const highlightRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -73,9 +101,16 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
     searchSource,
     onDraftChange: props.onDraftChange,
     participants: props.participants,
-    savedPrompts: props.savedPrompts
+    savedPrompts: props.savedPrompts,
+    selectedSkillMentions: props.picks?.skillMentions,
+    onSelectedSkillMentionsChange: props.picks?.onSkillMentionsChange,
+    selectedPluginMentions: props.picks?.pluginMentions,
+    onSelectedPluginMentionsChange: props.picks?.onPluginMentionsChange,
+    selectedFileMentions: props.picks?.fileMentions,
+    onSelectedFileMentionsChange: props.picks?.onFileMentionsChange
   });
   const images = useChatComposerImages(props.conversationId);
+  const suggestions = useChatComposerSuggestions(props.suggestions, props.draft);
   const canSend = !images.hasInvalidImages && (
     Boolean(props.draft.trim()) ||
     images.readyImages.length > 0 ||
@@ -115,6 +150,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
     }
     const fileMentionsToSend = mentions.selectedFileMentions;
     const skillMentionsToSend = mentions.selectedSkillMentions;
+    const pluginMentionsToRestore = mentions.selectedPluginMentions;
     const pendingImagesToSend = images.pendingImages;
     const imageInputs = images.readyImages.map((image): ChatImageInput => ({
       filename: image.filename,
@@ -128,6 +164,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
     if (sent === false) {
       mentions.setSelectedFileMentions(fileMentionsToSend);
       mentions.setSelectedSkillMentions(skillMentionsToSend);
+      mentions.setSelectedPluginMentions(pluginMentionsToRestore);
       images.setPendingImages(pendingImagesToSend);
       return;
     }
@@ -135,7 +172,12 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
   }
 
   return (
-    <div className={["chat-composer", props.className].filter(Boolean).join(" ")} data-testid={props.testId}>
+    <div
+      ref={rootRef}
+      className={["chat-composer", props.className].filter(Boolean).join(" ")}
+      data-testid={props.testId}
+      {...{ [DICTATION_SESSION_ATTRIBUTE]: props.dictationSession ?? props.conversationId ?? "" }}
+    >
       {props.status && <div className="chat-composer-status">{props.status}</div>}
       <ChatComposerAttachmentChips
         pendingImages={images.pendingImages}
@@ -244,6 +286,15 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
               mentions.insertMention(mentions.mentionOptions[mentions.mentionIndex] ?? mentions.mentionOptions[0]);
               return;
             }
+            const suggestionKey = suggestions.handleKey(event);
+            if (suggestionKey) {
+              event.preventDefault();
+              if (suggestionKey === "accept" && suggestions.offered) {
+                mentions.pendingCaretRef.current = { value: suggestions.offered, position: suggestions.offered.length };
+                props.onDraftChange(suggestions.offered);
+              }
+              return;
+            }
             if (event.key === "Escape") {
               mentions.setMentionQuery(undefined);
               mentions.setFileQuery(undefined);
@@ -262,7 +313,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
           }, 120)}
           rows={props.rows ?? 1}
           maxHeight={props.maxHeight ?? 160}
-          placeholder={props.placeholder}
+          placeholder={suggestions.offered ?? props.placeholder}
         />
         {mentions.showSkillHighlights && (
           <div ref={highlightRef} className="chat-draft-highlight" aria-hidden="true">
@@ -284,15 +335,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                 void images.addImageFiles(files);
               }}
             />
-            <button
-              type="button"
-              className="composer-icon-button"
-              title="Attach image"
-              aria-label="Attach image"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <ImagePlus size={18} />
-            </button>
+            <IconButton label="Attach image" icon={ImagePlus} onClick={() => fileInputRef.current?.click()} />
             {activeRunCount > 0 && props.onStopAllRuns && (
               <ChatActiveRunPopover
                 activeRunCount={activeRunCount}
@@ -306,41 +349,39 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
             )}
           </div>
           <div className="chat-composer-actions">
+            {suggestions.offered && (
+              <span className="chat-composer-hint" data-testid="chat-composer-suggestion-hint">
+                <kbd>Tab</kbd> to use
+                {suggestions.count > 1 && (
+                  <>
+                    <em>·</em>
+                    <kbd>↑</kbd><kbd>↓</kbd> {suggestions.position} of {suggestions.count}
+                  </>
+                )}
+              </span>
+            )}
             {props.onOpenAccord && (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <span className="composer-accord-tooltip-trigger">
-                    <button
-                      type="button"
-                      className="composer-accord-button"
-                      aria-label="Start Accord"
+                    <IconButton
+                      label="Start Accord"
+                      icon={AccordMergeIcon}
                       disabled={Boolean(props.accordDisabledReason)}
                       data-testid="chat-accord-button"
                       onClick={props.onOpenAccord}
-                    >
-                      {/* Custom merge glyph so each branch can keep its own color. */}
-                      <svg
-                        className="composer-accord-icon"
-                        width={18}
-                        height={18}
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        strokeWidth={2.4}
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        aria-hidden
-                      >
-                        <path d="m8 6 4-4 4 4" stroke="var(--app-accord-icon-top)" />
-                        <path d="M12 2v10.3" stroke="var(--app-accord-icon-top)" />
-                        <path d="M12 12.3a4 4 0 0 1-1.172 2.872L4 22" stroke="var(--app-accord-icon-left)" />
-                        <path d="m20 22-5-5" stroke="var(--app-accord-icon-right)" />
-                      </svg>
-                    </button>
+                    />
                   </span>
                 </TooltipTrigger>
                 <TooltipContent side="top">{accordTooltip}</TooltipContent>
               </Tooltip>
             )}
+            <SpeechToTextButton
+              session={props.dictationSession ?? props.conversationId}
+              getTextarea={() => rootRef.current?.querySelector("textarea") ?? null}
+              draft={props.draft}
+              onDraftChange={props.onDraftChange}
+            />
             <button
               type="button"
               className="composer-send-button"

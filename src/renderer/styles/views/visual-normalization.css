@@ -64,20 +64,6 @@
   background: var(--app-surface);
 }
 
-.icon-button:hover {
-  background: var(--app-surface-hover);
-}
-
-.icon-button.selected {
-  background: var(--app-primary);
-  color: var(--app-surface);
-}
-
-.icon-button {
-  background: var(--app-surface-subtle);
-  color: var(--app-text);
-}
-
 .toggle input:checked + span {
   background: var(--app-accent);
   color: var(--app-surface);
@@ -301,8 +287,8 @@
 
 .decision-compose textarea:focus,
 .plan-correction-composer textarea:focus {
-  border-color: var(--app-accent);
-  box-shadow: var(--focus-ring);
+  border-color: var(--app-focus-border);
+  box-shadow: none;
 }
 
 .decision-compose textarea:disabled,

@@ -16,14 +16,19 @@ import type {
   AgentHealth,
   AgentReadinessState,
   AppSettings,
-  ChatProviderKind
+  ChatProviderKind,
+  CliSignInState
 } from "../../../shared/types";
 import {
   CLI_PROVIDER_DISPLAY_ORDER,
   cliProviderMetadata,
   deriveAgentReadiness,
+  isCliSignInKind,
+  isCliTerminalPlatform,
   providerEnabled
 } from "../../../shared/cliReadiness";
+import { IconButton } from "../primitives";
+import { CliSignInStep, useCliSignIns } from "./cli-sign-in-step";
 
 export function CliReadinessSetupPanel(props: {
   agents: AgentHealth[];
@@ -40,6 +45,7 @@ export function CliReadinessSetupPanel(props: {
   const [refreshing, setRefreshing] = useState(false);
   const [actionError, setActionError] = useState<string | undefined>();
   const checking = props.checking || refreshing;
+  const { signIns, checkingAfterSignIn } = useCliSignIns(refreshAll);
 
   useEffect(() => {
     if (didResolveInitialExpansionRef.current) {
@@ -117,16 +123,13 @@ export function CliReadinessSetupPanel(props: {
                     {health?.checking && readiness !== "checking" && <span> · Checking</span>}
                   </span>
                 </div>
-                <button
-                  type="button"
+                <IconButton
                   className="cli-readiness-toggle"
-                  aria-label={`${expanded ? "Hide" : "Set up"} ${metadata.label}`}
+                  label={`${expanded ? "Hide" : "Set up"} ${metadata.label}`}
+                  icon={expanded ? ChevronUp : ChevronDown}
                   aria-expanded={expanded}
-                  title={expanded ? "Hide" : "Set up"}
                   onClick={() => toggleProvider(kind)}
-                >
-                  {expanded ? <ChevronUp size={17} aria-hidden /> : <ChevronDown size={17} aria-hidden />}
-                </button>
+                />
               </div>
 
               {expanded && (
@@ -136,6 +139,8 @@ export function CliReadinessSetupPanel(props: {
                   health={health}
                   readiness={readiness}
                   copiedValue={copiedValue}
+                  signIn={isCliSignInKind(kind) ? signIns[kind] : undefined}
+                  checkingAfterSignIn={isCliSignInKind(kind) && Boolean(checkingAfterSignIn[kind])}
                   onCopy={copyCommand}
                   onOpenSettings={props.onOpenSettings}
                   onError={setActionError}
@@ -148,7 +153,7 @@ export function CliReadinessSetupPanel(props: {
       {actionError && <p className="inline-error cli-readiness-error">{actionError}</p>}
       <p className="cli-readiness-note">
         <ShieldCheck size={15} aria-hidden />
-        <span>Commands are copied only when you choose <strong>Copy</strong>. AccordAgents never installs software or signs in for you.</span>
+        <span>AccordAgents never installs software. <strong>Sign in</strong> runs the CLI's own sign-in; the CLI keeps your credentials.</span>
       </p>
     </section>
   );
@@ -175,12 +180,15 @@ function CliReadinessDetails(props: {
   health?: AgentHealth;
   readiness: AgentReadinessState;
   copiedValue?: string;
+  signIn?: CliSignInState;
+  checkingAfterSignIn: boolean;
   onCopy: (command: string) => Promise<void>;
   onOpenSettings: () => void;
   onError: (message: string | undefined) => void;
 }): JSX.Element {
-  const supportedPlatform = props.health?.platform === "darwin";
-  const installCommand = supportedPlatform ? props.metadata.installCommandByPlatform.darwin : undefined;
+  const platform = props.health?.platform;
+  const supportedPlatform = isCliTerminalPlatform(platform);
+  const installCommand = supportedPlatform ? props.metadata.installCommandByPlatform[platform] : undefined;
 
   if (props.readiness === "disabled") {
     return (
@@ -201,7 +209,7 @@ function CliReadinessDetails(props: {
     );
   }
 
-  if (!supportedPlatform) {
+  if (!supportedPlatform || (props.readiness === "not-detected" && !installCommand)) {
     return (
       <div className="cli-readiness-steps">
         <p>Open the official guide for setup instructions on this platform.</p>
@@ -241,16 +249,23 @@ function CliReadinessDetails(props: {
     );
   }
 
+  // Claude Code and Codex sign in from here; Antigravity only from its app.
+  const appSignIn = isCliSignInKind(props.kind) ? props.kind : undefined;
+  const tryOnly = props.readiness === "could-not-verify";
   return (
     <div className="cli-readiness-steps">
       <SetupStep number={1} done>Install the CLI in Terminal</SetupStep>
       <SetupStep number={2}>
-        {props.readiness === "could-not-verify" ? "Try sign-in from Terminal" : "Sign in from Terminal"}
+        {appSignIn ? (tryOnly ? "Try signing in with your browser" : "Sign in with your browser") : tryOnly ? "Try sign-in from Terminal" : "Sign in from Terminal"}
       </SetupStep>
+      {appSignIn && (
+        <CliSignInStep kind={appSignIn} label={props.metadata.label} signIn={props.signIn} checkingAfterSignIn={props.checkingAfterSignIn} onError={props.onError} />
+      )}
+      {appSignIn && <p className="cli-sign-in-fallback">Or in Terminal:</p>}
       <SetupCommand
         command={props.metadata.loginCommand}
         copiedValue={props.copiedValue}
-        label={props.readiness === "could-not-verify" ? "try sign-in" : "sign-in"}
+        label={tryOnly ? "try sign-in" : "sign-in"}
         onCopy={props.onCopy}
       />
       <CliReadinessActionButtons guideUrl={props.metadata.guideUrl} onError={props.onError} />
@@ -308,9 +323,13 @@ function SetupCommand(props: {
   return (
     <div className="cli-readiness-command">
       <code><span aria-hidden="true">$</span> {props.command}</code>
-      <button type="button" aria-label={`Copy ${props.label} command`} title="Copy command" onClick={() => void props.onCopy(props.command as string)}>
-        {props.copiedValue === props.command ? <Check size={14} aria-hidden /> : <Copy size={14} aria-hidden />}
-      </button>
+      <IconButton
+        size="xs"
+        label={`Copy ${props.label} command`}
+        tooltip={props.copiedValue === props.command ? "Copied" : "Copy"}
+        icon={props.copiedValue === props.command ? Check : Copy}
+        onClick={() => void props.onCopy(props.command as string)}
+      />
     </div>
   );
 }

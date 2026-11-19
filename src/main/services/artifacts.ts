@@ -31,6 +31,7 @@ import type {
   WithdrawArtifactDraftRequest
 } from "../../shared/types";
 import { ARTIFACT_USER_MEMBER } from "../../shared/types";
+import { artifactRevisionExistsSql, artifactSignatureExistsSql } from "./artifactRevisions";
 import {
   ARTIFACT_CONTENT_MAX_BYTES,
   ARTIFACT_LABEL_MAX_LENGTH,
@@ -68,6 +69,29 @@ export interface ArtifactServiceDeps {
   onChanged?(conversationId: string): void;
   logger?(event: string, payload: Record<string, unknown>): void;
   now?(): string;
+  /**
+   * Commits whatever records a change INSIDE the transaction that makes it:
+   * `write` receives the statement to include and returns whether its own
+   * change committed. On the User's server this places the change in the
+   * server's order (its feed), so a document that changed is never left
+   * without the entry every device learns it from, and an entry never
+   * announces a change that did not happen.
+   */
+  commitWithChange?<T>(
+    change: ArtifactCommittedChange,
+    write: (statement: { sql: string; onlyIfSql: (condition: string) => string }) => Promise<T>
+  ): Promise<T>;
+}
+
+/** A change about to commit: the document, and the chat note it posts. */
+export interface ArtifactCommittedChange {
+  conversationId: string;
+  artifactId: string;
+  /** The note's outbox row is written in the same transaction; its presence
+   *  is what tells that this very call changed something. */
+  event?: ArtifactEventRecord;
+  /** A draft the change wrote. */
+  draftId?: string;
 }
 
 interface ArtifactContext {
@@ -88,14 +112,38 @@ function invalid<T>(message: string): ArtifactResult<T> {
   return fail<T>({ code: "invalid_request", message });
 }
 
+/** A create request that mixes the two lifecycles' fields is refused, not
+ *  silently trimmed. A field present with no value counts as present (as an
+ *  in-process caller sees it), so this is checked before a request travels. */
+export function artifactCreateMixedFieldError(request: CreateArtifactRequest): string | undefined {
+  const input = request as unknown as Record<string, unknown>;
+  const forbidden = request.initialState === "collecting_drafts"
+    ? ["content", "note", "requiredSigners"]
+    : ["allowedDraftAuthors", "requiredDraftAuthors", "audiencePolicyByAuthor", "operationId"];
+  const mixedField = forbidden.find((field) => Object.prototype.hasOwnProperty.call(input, field));
+  return mixedField ? `Field "${mixedField}" is not valid for initialState "${request.initialState ?? "published"}".` : undefined;
+}
+
+export const SUBMIT_OWN_DRAFT_FIRST_MESSAGE =
+  "Submit your own draft to this collection before reading other authors' drafts.";
+
+/**
+ * The rules of documents (artifacts). The User's server decides every change
+ * with them over its own documents (HubArtifacts, agreement Д9); each device
+ * reads its copy with them (ArtifactClient), so a read means the same
+ * everywhere and a change is never made by a device's own copy of the rules.
+ */
 export class ArtifactService {
   // Serializes all artifact mutations per conversation. Combined with the
   // SQL-level expected-head guard in ArtifactStore.appendVersion this makes
   // concurrent revisions of the same base version a deterministic
   // one-winner/one-stale-loser outcome instead of a lost update.
-  private readonly mutationQueues = new Map<string, Promise<unknown>>();
-
   constructor(private readonly deps: ArtifactServiceDeps) {}
+
+  private async commit<T>(change: ArtifactCommittedChange, condition: string, write: (sql?: string) => Promise<T>): Promise<T> {
+    if (!this.deps.commitWithChange) return write();
+    return this.deps.commitWithChange(change, (statement) => write(statement.onlyIfSql(condition)));
+  }
 
   async deleteConversationArtifacts(conversationId: string): Promise<void> {
     await this.withMutation(conversationId, () => this.deps.store.deleteByConversation(conversationId));
@@ -147,12 +195,14 @@ export class ArtifactService {
     const summary = this.summaryFromRecord(record, signatures.filter((signature) => signature.version === record.headVersion));
     const versionContent: ArtifactVersionContent = {
       version: versionRecord.version,
+      versionEventId: versionRecord.versionEventId,
+      contentHash: versionRecord.contentHash,
       author: versionRecord.author,
       note: versionRecord.note,
       createdAt: versionRecord.createdAt,
       signatures: signatures
-        .filter((signature) => signature.version === versionRecord.version)
-        .map((signature) => ({ signer: signature.signer, signedAt: signature.signedAt })),
+        .filter((signature) => signature.versionEventId === versionRecord.versionEventId && signature.contentHash === versionRecord.contentHash)
+        .map((signature) => ({ signer: signature.signer, signedAt: signature.signedAt, versionEventId: signature.versionEventId, contentHash: signature.contentHash })),
       content: versionRecord.content
     };
     const sources = await this.deps.store.listVersionSources(record.id, versionRecord.version);
@@ -162,12 +212,14 @@ export class ArtifactService {
     const metas = await this.deps.store.listVersionMetas(record.id);
     const history: ArtifactVersionMeta[] = metas.map((meta) => ({
       version: meta.version,
+      versionEventId: meta.versionEventId,
+      contentHash: meta.contentHash,
       author: meta.author,
       note: meta.note,
       createdAt: meta.createdAt,
       signatures: signatures
-        .filter((signature) => signature.version === meta.version)
-        .map((signature) => ({ signer: signature.signer, signedAt: signature.signedAt }))
+        .filter((signature) => signature.versionEventId === meta.versionEventId && signature.contentHash === meta.contentHash)
+        .map((signature) => ({ signer: signature.signer, signedAt: signature.signedAt, versionEventId: signature.versionEventId, contentHash: signature.contentHash }))
     }));
     return ok({ lifecycle: "published", summary, version: versionContent, history, sources });
   }
@@ -216,13 +268,9 @@ export class ArtifactService {
 
   async create(actorRaw: string, request: CreateArtifactRequest): Promise<ArtifactResult<ArtifactReadResult>> {
     return this.withMutation(request.conversationId, async () => {
-      const input = request as unknown as Record<string, unknown>;
-      const forbidden = request.initialState === "collecting_drafts"
-        ? ["content", "note", "requiredSigners"]
-        : ["allowedDraftAuthors", "requiredDraftAuthors", "audiencePolicyByAuthor", "operationId"];
-      const mixedField = forbidden.find((field) => Object.prototype.hasOwnProperty.call(input, field));
+      const mixedField = artifactCreateMixedFieldError(request);
       if (mixedField) {
-        return invalid(`Field "${mixedField}" is not valid for initialState "${request.initialState ?? "published"}".`);
+        return invalid(mixedField);
       }
       const context = await this.requireMember(actorRaw, request.conversationId);
       if (!context.ok) {
@@ -301,7 +349,8 @@ export class ArtifactService {
           draftRosterRevision: 0,
           headVersion: 0,
           createdAt: now,
-          updatedAt: now
+          updatedAt: now,
+          ...(isOriginMessageId(request.originMessageId) ? { originMessageId: request.originMessageId } : {})
         };
         const operation = this.operation(
           request.conversationId,
@@ -320,7 +369,11 @@ export class ArtifactService {
           `${artifactMemberLabel(actor)} created draft collection ${artifactReference(record.id, name)} · Drafts 0/${record.requiredDraftAuthors.length}`,
           now
         );
-        const inserted = await this.deps.store.insertCollectingArtifact(record, artifactNameKey(name), operation, event);
+        const inserted = await this.commit(
+          { conversationId: request.conversationId, artifactId: record.id, event },
+          this.deps.store.operationCommittedSql(operation),
+          sql => this.deps.store.insertCollectingArtifact(record, artifactNameKey(name), operation, event, sql)
+        );
         if (!inserted) {
           const retry = await this.operationResult(
             request.conversationId,
@@ -391,18 +444,9 @@ export class ArtifactService {
         `${artifactMemberLabel(actor)} created artifact ${artifactReference(record.id, name)} · v1`,
         now
       );
-      const inserted = await this.deps.store.insertArtifact(
-        record,
-        artifactNameKey(name),
-        {
-          artifactId: record.id,
-          version: 1,
-          content: request.content,
-          author: actor,
-          note,
-          createdAt: now
-        },
-        event
+      const firstVersion = { artifactId: record.id, version: 1, versionEventId: event.id, content: request.content, author: actor, note, createdAt: now };
+      const inserted = await this.commit({ conversationId: request.conversationId, artifactId: record.id, event }, artifactRevisionExistsSql(record.id, event.id),
+        sql => this.deps.store.insertArtifact(record, artifactNameKey(name), firstVersion, event, sql)
       );
       if (!inserted) {
         return invalid("The chat was deleted before the artifact could be created.");
@@ -447,6 +491,11 @@ export class ArtifactService {
       if (baseVersion !== record.headVersion) {
         return this.staleVersionError(record, baseVersion);
       }
+      const baseRevision = await this.deps.store.getVersion(record.id, baseVersion);
+      if (!baseRevision || (request.baseVersionEventId !== undefined && request.baseVersionEventId !== baseRevision.versionEventId) ||
+          (request.baseContentHash !== undefined && request.baseContentHash !== baseRevision.contentHash)) {
+        return this.staleVersionError(record, baseVersion);
+      }
       const now = this.now();
       const note = normalizeNote(request.note);
       const nextVersion = record.headVersion + 1;
@@ -457,17 +506,23 @@ export class ArtifactService {
         `${artifactMemberLabel(actor)} revised ${artifactReference(record.id, record.name)} · v${nextVersion}${note ? ` — ${note}` : ""}`,
         now
       );
-      const accepted = await this.deps.store.appendVersion(
-        {
-          artifactId: record.id,
-          version: nextVersion,
-          content: request.content,
-          author: actor,
-          note,
-          createdAt: now
-        },
-        record.headVersion,
-        event
+      const versionEventId = randomUUID();
+      const appendVersionRecord = {
+        artifactId: record.id,
+        version: nextVersion,
+        baseVersionEventId: baseRevision.versionEventId,
+        versionEventId,
+        content: request.content,
+        author: actor,
+        note,
+        createdAt: now
+      };
+      // The revision and whatever records it (on the User's server, its place
+      // in the order) are one commit.
+      const accepted = await this.commit(
+        { conversationId: request.conversationId, artifactId: record.id, event },
+        artifactRevisionExistsSql(record.id, versionEventId),
+        (sql) => this.deps.store.appendVersion(appendVersionRecord, record.headVersion, event, sql)
       );
       if (!accepted) {
         // Another writer advanced the head between our read and the guarded
@@ -527,7 +582,9 @@ export class ArtifactService {
         `${artifactMemberLabel(actor)} renamed artifact ${artifactReference(record.id, newName)} (was "${oldName}")`,
         now
       );
-      await this.deps.store.updateName(record.id, newName, newKey, now, event);
+      await this.commit({ conversationId: request.conversationId, artifactId: record.id, event }, "1",
+        sql => this.deps.store.updateName(record.id, newName, newKey, now, event, sql)
+      );
       this.notifyChanged(request.conversationId);
       await this.flushPendingArtifactEvents();
       return this.summaryResult(record.id);
@@ -572,10 +629,14 @@ export class ArtifactService {
       }
       const now = this.now();
       const existingSignatures = await this.deps.store.listSignatures(record.id);
+      if ((request.versionEventId !== undefined && request.versionEventId !== versionRecord.versionEventId) ||
+          (request.contentHash !== undefined && request.contentHash !== versionRecord.contentHash)) {
+        return fail<ArtifactSummary>({ code: "stale_version", message: "The displayed artifact version now refers to different content; read it again before signing." });
+      }
       const projected = computeArtifactApproval(
         record.requiredSigners,
         [...existingSignatures
-          .filter((signature) => signature.version === version)
+          .filter((signature) => signature.versionEventId === versionRecord.versionEventId && signature.contentHash === versionRecord.contentHash)
           .map((signature) => ({ signer: signature.signer, signedAt: signature.signedAt })),
         { signer: actor, signedAt: now }]
       );
@@ -589,14 +650,20 @@ export class ArtifactService {
         `${artifactMemberLabel(actor)} signed ${artifactReference(record.id, record.name)} v${version}${approvalSuffix}`,
         now
       );
-      const inserted = await this.deps.store.insertSignature(
-        {
-          artifactId: record.id,
-          version,
-          signer: actor,
-          signedAt: now
-        },
-        event
+      const signatureRecord = {
+        artifactId: record.id,
+        version,
+        versionEventId: versionRecord.versionEventId,
+        contentHash: versionRecord.contentHash,
+        signer: actor,
+        signedAt: now
+      };
+      // One commit: a signature the User saw accepted is never left without
+      // what records it.
+      const inserted = await this.commit(
+        { conversationId: request.conversationId, artifactId: record.id, event },
+        artifactSignatureExistsSql(record.id, versionRecord.versionEventId, actor),
+        (sql) => this.deps.store.insertSignature(signatureRecord, event, sql)
       );
       if (inserted) {
         this.notifyChanged(request.conversationId);
@@ -655,15 +722,9 @@ export class ArtifactService {
         }
         nextLabels = labelsResult;
       }
-      await this.deps.store.updateAccess(
-        record.id,
-        {
-          owner: nextOwner,
-          contributors: nextContributors.filter((member) => member !== nextOwner),
-          requiredSigners: nextRequiredSigners,
-          labels: nextLabels
-        },
-        this.now()
+      const access = { owner: nextOwner, contributors: nextContributors.filter(member => member !== nextOwner), requiredSigners: nextRequiredSigners, labels: nextLabels };
+      await this.commit({ conversationId: request.conversationId, artifactId: record.id }, "1",
+        sql => this.deps.store.updateAccess(record.id, access, this.now(), sql)
       );
       this.notifyChanged(request.conversationId);
       return this.summaryResult(record.id);
@@ -703,7 +764,9 @@ export class ArtifactService {
         `${artifactMemberLabel(actor)} ${request.archived ? "archived" : "restored"} artifact ${artifactReference(record.id, record.name)}`,
         now
       );
-      await this.deps.store.updateArchived(record.id, request.archived ? now : undefined, now, event);
+      await this.commit({ conversationId: request.conversationId, artifactId: record.id, event }, "1",
+        sql => this.deps.store.updateArchived(record.id, request.archived ? now : undefined, now, event, sql)
+      );
       this.notifyChanged(request.conversationId);
       await this.flushPendingArtifactEvents();
       return this.summaryResult(record.id);
@@ -723,7 +786,7 @@ export class ArtifactService {
       return resolved;
     }
     const drafts = await this.deps.store.listDrafts(resolved.value.id);
-    return ok(this.draftViews(context.value.actor, drafts));
+    return ok(this.draftViews(context.value.actor, resolved.value, drafts));
   }
 
   async readDraft(
@@ -746,6 +809,11 @@ export class ArtifactService {
       return draft.state === "editing"
         ? fail({ code: "not_found", message: "Draft not found." })
         : fail({ code: "access_denied", message: "This draft's content was not shared with you." });
+    }
+    const { actor } = context.value;
+    if (draft.author !== actor
+      && this.mustSubmitOwnDraftFirst(actor, resolved.value, await this.deps.store.listDrafts(resolved.value.id))) {
+      return fail({ code: "access_denied", message: SUBMIT_OWN_DRAFT_FIRST_MESSAGE });
     }
     return ok(this.draftContent(draft));
   }
@@ -861,11 +929,9 @@ export class ArtifactService {
         now,
         artifact.id
       );
-      const saved = await this.deps.store.saveDraft(
-        draft,
-        expectedRevision,
-        artifact.draftRosterRevision,
-        operation
+      const saved = await this.commit(
+        { conversationId: request.conversationId, artifactId: artifact.id, draftId: draft.id }, this.deps.store.operationCommittedSql(operation),
+        sql => this.deps.store.saveDraft(draft, expectedRevision, artifact.draftRosterRevision, operation, sql)
       );
       if (!saved) {
         const refreshed = await this.deps.store.getDraft(draft.id);
@@ -978,12 +1044,9 @@ export class ArtifactService {
         `${artifactMemberLabel(actor)} submitted a draft to ${artifactReference(artifact.id, artifact.name)} · Submitted`,
         now
       );
-      const accepted = await this.deps.store.submitDraft(
-        submitted,
-        current.editRevision,
-        artifact.draftRosterRevision,
-        operation,
-        event
+      const accepted = await this.commit(
+        { conversationId: request.conversationId, artifactId: artifact.id, event, draftId: current.id }, this.deps.store.operationCommittedSql(operation),
+        sql => this.deps.store.submitDraft(submitted, current.editRevision, artifact.draftRosterRevision, operation, event, sql)
       );
       if (!accepted) {
         return invalid("The draft changed or another current submission already exists.");
@@ -1089,11 +1152,9 @@ export class ArtifactService {
         now,
         artifact.id
       );
-      const saved = await this.deps.store.saveDraft(
-        replacement,
-        0,
-        artifact.draftRosterRevision,
-        operation
+      const saved = await this.commit(
+        { conversationId: request.conversationId, artifactId: artifact.id, draftId: replacement.id }, this.deps.store.operationCommittedSql(operation),
+        sql => this.deps.store.saveDraft(replacement, 0, artifact.draftRosterRevision, operation, sql)
       );
       if (!saved) {
         return invalid("An editable replacement already exists for this author.");
@@ -1151,7 +1212,9 @@ export class ArtifactService {
           return invalid("Stored operation result is invalid.");
         }
         const priorDraft = await this.deps.store.getDraft(prior.value.draftId);
-        return priorDraft ? ok(this.draftSummary(priorDraft, this.canReadDraft(actor, priorDraft))) : fail({ code: "not_found", message: "Draft not found." });
+        return priorDraft
+          ? ok(this.draftSummary(priorDraft, this.canReadDraftContent(actor, artifact, priorDraft, await this.deps.store.listDrafts(artifact.id))))
+          : fail({ code: "not_found", message: "Draft not found." });
       }
       const archivedError = this.archivedMutationError(artifact, "withdrawing drafts");
       if (archivedError) {
@@ -1178,7 +1241,7 @@ export class ArtifactService {
         {
           artifactId: artifact.id,
           draftId: current.id,
-          value: this.draftSummary(withdrawn, this.canReadDraft(actor, withdrawn))
+          value: this.draftSummary(withdrawn, this.canReadDraftContent(actor, artifact, withdrawn, await this.deps.store.listDrafts(artifact.id)))
         },
         now,
         artifact.id
@@ -1190,11 +1253,9 @@ export class ArtifactService {
         `${artifactMemberLabel(current.author)} withdrew a draft from ${artifactReference(artifact.id, artifact.name)} · Withdrawn`,
         now
       );
-      const accepted = await this.deps.store.withdrawDraft(
-        withdrawn,
-        artifact.draftRosterRevision,
-        operation,
-        event
+      const accepted = await this.commit(
+        { conversationId: request.conversationId, artifactId: artifact.id, event, draftId: current.id }, this.deps.store.operationCommittedSql(operation),
+        sql => this.deps.store.withdrawDraft(withdrawn, artifact.draftRosterRevision, operation, event, sql)
       );
       if (!accepted) {
         return invalid("The draft is no longer current or has an editable replacement.");
@@ -1289,6 +1350,12 @@ export class ArtifactService {
       }
       const now = this.now();
       const drafts = await this.deps.store.listDrafts(artifact.id);
+      if (this.mustSubmitOwnDraftFirst(actor, artifact, drafts) && !rosterResult.requiredDraftAuthors.includes(actor)) {
+        return fail({
+          code: "access_denied",
+          message: "Submit your own draft before removing yourself from the required draft authors."
+        });
+      }
       const updatedRecord: ArtifactRecord = {
         ...artifact,
         ...rosterResult,
@@ -1306,12 +1373,9 @@ export class ArtifactService {
         now,
         artifact.id
       );
-      const accepted = await this.deps.store.updateDraftRoster(
-        artifact.id,
-        expectedRevision,
-        rosterResult,
-        now,
-        operation
+      const accepted = await this.commit(
+        { conversationId: request.conversationId, artifactId: artifact.id }, this.deps.store.operationCommittedSql(operation),
+        sql => this.deps.store.updateDraftRoster(artifact.id, expectedRevision, rosterResult, now, operation, sql)
       );
       if (!accepted) {
         const refreshed = await this.deps.store.getById(artifact.id);
@@ -1476,11 +1540,20 @@ export class ArtifactService {
         requiredSigners,
         updatedAt: now
       };
+      const event = this.event(
+        artifact,
+        actor,
+        "published",
+        `${artifactMemberLabel(actor)} published ${artifactReference(artifact.id, artifact.name)} · v1${note ? ` — ${note}` : ""}`,
+        now
+      );
       const storedValue: PublishedArtifactReadResult = {
         lifecycle: "published",
         summary: this.summaryFromRecord(publishedRecord, []),
         version: {
           version: 1,
+          versionEventId: event.id,
+          contentHash: createHash("sha256").update(request.content).digest("hex"),
           author: actor,
           note,
           createdAt: now,
@@ -1499,27 +1572,9 @@ export class ArtifactService {
         now,
         artifact.id
       );
-      const event = this.event(
-        artifact,
-        actor,
-        "published",
-        `${artifactMemberLabel(actor)} published ${artifactReference(artifact.id, artifact.name)} · v1`,
-        now
-      );
-      const accepted = await this.deps.store.publishFirstVersion(
-        artifact,
-        {
-          artifactId: artifact.id,
-          version: 1,
-          content: request.content,
-          author: actor,
-          note,
-          createdAt: now
-        },
-        sources,
-        requiredSigners,
-        operation,
-        event
+      const firstVersion = { artifactId: artifact.id, version: 1, versionEventId: event.id, content: request.content, author: actor, note, createdAt: now };
+      const accepted = await this.commit({ conversationId: request.conversationId, artifactId: artifact.id, event }, this.deps.store.operationCommittedSql(operation),
+        sql => this.deps.store.publishFirstVersion(artifact, firstVersion, sources, requiredSigners, operation, event, sql)
       );
       if (!accepted) {
         return invalid("Publication readiness changed before v1 could be committed.");
@@ -1588,20 +1643,45 @@ export class ArtifactService {
       allowedDraftAuthors: record.allowedDraftAuthors,
       requiredDraftAuthors: record.requiredDraftAuthors,
       audiencePolicyByAuthor: actor === "user" || actor === record.owner ? record.audiencePolicyByAuthor : {},
-      drafts: this.draftViews(actor, drafts),
+      drafts: this.draftViews(actor, record, drafts),
       missingRequiredAuthors,
       readyToPublish: missingRequiredAuthors.length === 0
     };
   }
 
-  private draftViews(actor: string, drafts: ArtifactDraftRecord[]): ArtifactDraftView[] {
+  private draftViews(actor: string, record: ArtifactRecord, drafts: ArtifactDraftRecord[]): ArtifactDraftView[] {
     return drafts.flatMap((draft) => {
-      const readable = this.canReadDraft(actor, draft);
-      if (draft.state === "editing" && !readable) {
+      if (draft.state === "editing" && !this.canReadDraft(actor, draft)) {
         return [];
       }
-      return [readable ? this.draftContent(draft) : this.draftSummary(draft, false)];
+      return [this.canReadDraftContent(actor, record, draft, drafts) ? this.draftContent(draft) : this.draftSummary(draft, false)];
     });
+  }
+
+  // The single rule for whether an actor may see a draft's body: it was shared
+  // with them, and they are not a required author still owing their own draft.
+  private canReadDraftContent(
+    actor: string,
+    record: ArtifactRecord,
+    draft: ArtifactDraftRecord,
+    drafts: ArtifactDraftRecord[]
+  ): boolean {
+    return this.canReadDraft(actor, draft)
+      && (draft.author === actor || !this.mustSubmitOwnDraftFirst(actor, record, drafts));
+  }
+
+  // While a collection gathers drafts, a required author who has never
+  // submitted a draft of their own cannot read anyone else's, so every first
+  // draft stays independent even when authors write at the same time. Any draft
+  // the author ever submitted counts, including one later withdrawn or
+  // replaced: that first draft was already written unseen. Only required
+  // authors are held back, because they must submit anyway; an optional author
+  // is never locked out. User always reads everything shared with them.
+  private mustSubmitOwnDraftFirst(actor: string, record: ArtifactRecord, drafts: ArtifactDraftRecord[]): boolean {
+    return record.lifecycle === "collecting_drafts"
+      && actor !== ARTIFACT_USER_MEMBER
+      && record.requiredDraftAuthors.includes(actor)
+      && !drafts.some((draft) => draft.author === actor && Boolean(draft.submittedAt));
   }
 
   private canReadDraft(actor: string, draft: ArtifactDraftRecord): boolean {
@@ -1782,19 +1862,21 @@ export class ArtifactService {
   private async staleVersionError(record: ArtifactRecord, baseVersion: number): Promise<ArtifactResult<ArtifactReadResult>> {
     const head = await this.deps.store.getVersion(record.id, record.headVersion);
     const signatures = head
-      ? (await this.deps.store.listSignatures(record.id)).filter((signature) => signature.version === head.version)
+      ? (await this.deps.store.listSignatures(record.id)).filter((signature) => signature.versionEventId === head.versionEventId && signature.contentHash === head.contentHash)
       : [];
     return fail({
       code: "stale_version",
-      message: `Your edit was based on v${baseVersion}, but "${record.name}" is now at v${record.headVersion}. Nothing was saved. Re-apply your change on top of the current version and revise again with baseVersion ${record.headVersion}.`,
+      message: `The base revision of your edit (v${baseVersion}) has changed. "${record.name}" is now at v${record.headVersion}. Nothing was saved. Read the current revision and re-apply your change using its version identity and content hash.`,
       currentVersion: record.headVersion,
       current: head
         ? {
             version: head.version,
+            versionEventId: head.versionEventId,
+            contentHash: head.contentHash,
             author: head.author,
             note: head.note,
             createdAt: head.createdAt,
-            signatures: signatures.map((signature) => ({ signer: signature.signer, signedAt: signature.signedAt })),
+            signatures: signatures.map((signature) => ({ signer: signature.signer, signedAt: signature.signedAt, versionEventId: signature.versionEventId, contentHash: signature.contentHash })),
             content: head.content
           }
         : undefined
@@ -1833,6 +1915,7 @@ export class ArtifactService {
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
       archivedAt: record.archivedAt,
+      ...(record.originMessageId ? { originMessageId: record.originMessageId } : {}),
       approval: computeArtifactApproval(
         record.requiredSigners,
         headSignatures.map((signature) => ({ signer: signature.signer, signedAt: signature.signedAt }))
@@ -1841,10 +1924,7 @@ export class ArtifactService {
   }
 
   private withMutation<T>(conversationId: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.mutationQueues.get(conversationId) ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(fn);
-    this.mutationQueues.set(conversationId, next.catch(() => undefined));
-    return next;
+    return this.deps.store.withMutation(conversationId, fn);
   }
 
   private notifyChanged(conversationId: string): void {
@@ -1919,6 +1999,11 @@ function normalizeLabels(raw: string[] | undefined): string[] | string {
     return `At most ${ARTIFACT_MAX_LABELS} labels are allowed.`;
   }
   return labels;
+}
+
+/** A message id the app passed with a collection, when it is one. */
+function isOriginMessageId(raw: unknown): raw is string {
+  return typeof raw === "string" && raw.length > 0 && raw.length <= 256 && !/\s/.test(raw);
 }
 
 function normalizeNote(raw: unknown): string | undefined {

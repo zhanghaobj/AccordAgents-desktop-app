@@ -53,12 +53,6 @@
   right: 10px;
 }
 
-.message-stop-button {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-}
-
 .message-meta {
   display: flex;
   align-items: center;
@@ -358,6 +352,31 @@
   font-weight: 800;
 }
 
+/* Markdown previews inside editors (artifact create form, role instructions):
+   headings keep their level at the preview's compact scale. */
+.markdown-preview .markdown-heading {
+  color: var(--app-text-strong);
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.markdown-preview .markdown-heading-1 {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.markdown-preview .markdown-heading-2 {
+  font-size: 16px;
+}
+
+.markdown-preview .markdown-heading-3 {
+  font-size: 14.5px;
+}
+
+.markdown-preview .markdown-text > .markdown-heading:not(:first-child) {
+  margin-top: 8px;
+}
+
 .markdown-text code {
   padding: 1px 4px;
   border-radius: 4px;
@@ -429,8 +448,9 @@
 }
 
 .chat-mention:focus-visible {
-  outline: 1px solid var(--app-warning);
-  outline-offset: 2px;
+  outline: none;
+  border-radius: 4px;
+  box-shadow: var(--focus-ring);
 }
 
 .chat-mention-card {
@@ -456,16 +476,6 @@
 
 .chat-mention-card-compact {
   margin-left: auto;
-  width: 26px;
-  height: 26px;
-  min-height: 26px;
-  border-radius: 7px;
-  color: var(--app-muted);
-}
-
-.chat-mention-card-compact:hover:not(:disabled) {
-  background: var(--app-surface-hover);
-  color: var(--app-text-strong);
 }
 
 .chat-mention-card-avatar {
@@ -525,29 +535,6 @@
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.chat-mention-card-copy {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  border: 1px solid var(--app-border);
-  border-radius: 6px;
-  background: var(--app-surface);
-  color: var(--app-muted);
-  cursor: pointer;
-}
-
-.chat-mention-card-copy:hover:not(:disabled) {
-  background: var(--app-surface-hover);
-  color: var(--app-text-strong);
-}
-
-.chat-mention-card-copy:disabled {
-  cursor: default;
-  opacity: 0.5;
 }
 
 .message-focused .message-body {
@@ -755,11 +742,6 @@ ul.markdown-list {
   gap: 8px;
 }
 
-.thread-panel-actions .icon-button {
-  width: 34px;
-  height: 34px;
-}
-
 .thread-panel-head span {
   color: var(--app-muted);
   font-size: 12px;
@@ -902,11 +884,14 @@ ul.markdown-list {
   line-height: 1.35;
 }
 
+/* The switch, as small as the ChatGPT app's: 32 by 20 with a light track
+   when off. */
 .toggle {
   position: relative;
   display: inline-flex;
-  width: 44px;
-  height: 26px;
+  flex: none;
+  width: 32px;
+  height: 20px;
 }
 
 .toggle input {
@@ -919,32 +904,48 @@ ul.markdown-list {
   position: absolute;
   inset: 0;
   border-radius: var(--radius-pill);
-  background: var(--app-border);
+  background: var(--app-surface-muted);
   cursor: pointer;
 }
 
 .toggle input:not(:checked):not(:disabled) + span {
-  background: var(--app-muted);
+  background: var(--app-toggle-off);
 }
 
 .toggle input:disabled + span {
   cursor: default;
 }
 
+/* An off switch that cannot be changed now is faded, so it does not read as
+   one that can. */
+.toggle input:disabled:not(:checked) + span {
+  opacity: 0.5;
+}
+
 .toggle span::before {
   content: "";
   position: absolute;
-  width: 20px;
-  height: 20px;
-  left: 3px;
-  top: 3px;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  top: 2px;
   border-radius: 50%;
-  background: var(--app-surface);
+  background: var(--app-toggle-knob);
   transition: transform 120ms ease;
 }
 
 .toggle input:checked + span {
   background: var(--app-success);
+}
+
+/* The switch's input is invisible, so focus shows on its track: a thin
+   edge inside it, light on a switched-on track as on the primary button. */
+.toggle input:focus-visible + span {
+  box-shadow: var(--focus-ring);
+}
+
+.toggle input:checked:focus-visible + span {
+  box-shadow: inset 0 0 0 1px var(--app-surface);
 }
 
 .toggle input:checked:disabled + span {
@@ -956,7 +957,8 @@ ul.markdown-list {
 }
 
 .toggle input:checked + span::before {
-  transform: translateX(18px);
+  transform: translateX(12px);
+  background: var(--app-surface);
 }
 
 .spin {

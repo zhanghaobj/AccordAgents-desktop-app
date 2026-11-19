@@ -9,8 +9,7 @@ import type {
   ChatParticipantSession,
   ChatRoleConfig,
   Conversation,
-  ConversationSummary,
-  RemoteSessionCleanupTombstone
+  ConversationSummary
 } from "../../shared/types";
 
 const NOW = "2026-05-19T12:00:00.000Z";
@@ -31,6 +30,13 @@ test("auto chat title sanitizer strips leading participant handles and slash ski
   );
   assert.equal(sanitizeAutoChatTitleSuggestion("@drew /office-hours"), undefined);
   assert.equal(sanitizeAutoChatTitleSuggestion("Codex"), undefined);
+});
+
+test("auto chat title sanitizer keeps titles that use no Latin letters", () => {
+  assert.equal(sanitizeAutoChatTitleSuggestion("Утюги в магазинах Лимассола"), "Утюги в магазинах Лимассола");
+  assert.equal(sanitizeAutoChatTitleSuggestion("@drew Роль личного кулинара"), "Роль личного кулинара");
+  assert.equal(sanitizeAutoChatTitleSuggestion("記憶の管理"), "記憶の管理");
+  assert.equal(sanitizeAutoChatTitleSuggestion("🙂 — !!"), undefined);
 });
 
 test("renameConversation updates chat title, emits a snapshot, and keeps the transcript unchanged", async () => {
@@ -159,6 +165,30 @@ test("setChatTitleFromTool applies the first eligible participant title", async 
   assert.equal(saved?.metadata.autoTitleEligibility, undefined);
   assert.equal(snapshots.at(-1)?.title, "First Agent Auto Title");
   assert.deepEqual(historyWrites, ["First Agent Auto Title"]);
+});
+
+test("setChatTitleFromTool applies a title written in a non-Latin alphabet", async () => {
+  const participant = chatParticipant();
+  const conversation = chatConversation({
+    title: "Chat",
+    messages: [
+      systemMessage(),
+      userMessage("user-message-1", "@drew надо посмотреть утюги в магазинах Лимассола")
+    ],
+    metadata: {
+      participants: [participant],
+      participantSessions: [],
+      autoTitleEligibility: autoTitleEligibility(participant)
+    }
+  });
+  const { service, storage } = testService([conversation]);
+
+  const result = await service.setChatTitleFromTool(autoTitleActor(participant), {
+    title: "Утюги в магазинах Лимассола"
+  });
+
+  assert.equal(result.status, "applied");
+  assert.equal((await storage.getConversation(conversation.id))?.title, "Утюги в магазинах Лимассола");
 });
 
 test("setChatTitleFromTool ignores duplicate, invalid, and wrong-run title calls", async () => {
@@ -380,6 +410,46 @@ test("setArchived archives a chat by stamping metadata and bumping updatedAt", a
   assert.equal(typeof stored?.metadata.archivedAt, "string");
 });
 
+test("archive and delete wait for this chat's native closure; a failed proof leaves the chat available", async () => {
+  const conversation = chatConversation();
+  const closed: string[] = [];
+  let fail = true;
+  const { service, storage } = testService([conversation], { closeSessions: async id => {
+    closed.push(id);
+    if (fail) throw new Error("native descendants still live");
+  } });
+  await assert.rejects(service.setArchived({ conversationId: conversation.id, archived: true }), /descendants still live/);
+  assert.notEqual((await storage.getConversation(conversation.id))?.metadata.archived, true);
+  fail = false;
+  await service.setArchived({ conversationId: conversation.id, archived: true });
+  fail = true;
+  await assert.rejects(service.deleteConversation({ conversationId: conversation.id }), /descendants still live/);
+  assert.ok(await storage.getConversation(conversation.id));
+  assert.deepEqual(closed, [conversation.id, conversation.id, conversation.id]);
+});
+
+test("replicated archive waits for closure and an archived machine chat cannot start a member", async () => {
+  const conversation = chatConversation({ metadata: { participants: [chatParticipant()] } });
+  let release!: () => void;
+  const closed = new Promise<void>(resolve => { release = resolve; });
+  let started!: () => void;
+  const reached = new Promise<void>(resolve => { started = resolve; });
+  const { service, storage } = testService([conversation], { closeSessions: async () => { started(); await closed; } });
+  let acknowledged = false;
+  const applying = service.applyReplicatedConversation(conversation.id, existing => existing && ({ ...existing, metadata: { ...existing.metadata, archived: true } }))
+    .then(() => { acknowledged = true; });
+  await reached;
+  assert.equal(acknowledged, false);
+  assert.notEqual((await storage.getConversation(conversation.id))?.metadata.archived, true, "closure must precede publishing the archived state");
+  const unarchive = service.setArchived({ conversationId: conversation.id, archived: false });
+  release();
+  await applying;
+  await unarchive;
+  assert.notEqual((await storage.getConversation(conversation.id))?.metadata.archived, true, "a later unarchive must wait for replicated closure and then win");
+  const batch = service as unknown as { runParticipantBatch(conversation: Conversation): Promise<void> };
+  await assert.rejects(batch.runParticipantBatch({ ...conversation, metadata: { ...conversation.metadata, archived: true } }), /Unarchive/);
+});
+
 test("setArchived unarchiving removes both archived and archivedAt", async () => {
   const conversation = chatConversation({
     title: "Archived chat",
@@ -449,7 +519,7 @@ test("setArchived rejects when a chat run already owns the run queue", async () 
   }
 });
 
-test("setArchived stops an idle warm remote session without discarding its durable handle", async () => {
+test("setArchived keeps a member's stored session so a later unarchive resumes it", async () => {
   const participant = chatParticipant();
   const conversation = chatConversation({
     metadata: {
@@ -461,35 +531,20 @@ test("setArchived stops an idle warm remote session without discarding its durab
         roleConfigVersion: ROLE.version,
         roleLabel: ROLE.label,
         roleInstructions: ROLE.instructions,
-        remoteSession: {
-          sessionKey: "remote-session",
-          sessionDir: "/srv/worker/sessions/remote-session",
-          worker: { host: "worker.example", workerRoot: "/srv/worker" },
-          protocolVersion: 1,
-          runtimeFingerprint: "fingerprint",
-          updatedAt: NOW
-        },
         updatedAt: NOW
       } satisfies ChatParticipantSession]
     }
   });
-  const { service, storage, cleanupTombstones } = testService([conversation]);
-  service.setRemoteRunService({
-    async startDetachedRun(): Promise<never> { throw new Error("not used"); },
-    async pollDetachedRun(): Promise<never> { throw new Error("not used"); },
-    async cancelDetachedRun(): Promise<never> { throw new Error("not used"); },
-    async stopParticipantSessionIfIdle(): Promise<boolean> { return true; }
-  });
+  const { service, storage } = testService([conversation]);
 
   await service.setArchived({ conversationId: conversation.id, archived: true });
   const saved = await storage.getConversation(conversation.id);
   const sessions = saved?.metadata.participantSessions as ChatParticipantSession[];
   assert.equal(saved?.metadata.archived, true);
-  assert.equal(sessions[0]?.remoteSession?.sessionKey, "remote-session");
-  assert.deepEqual(cleanupTombstones, []);
+  assert.equal(sessions[0]?.sessionId, "session-1");
 });
 
-test("deleteConversation requires archive, records remote cleanup before deleting, and removes storage", async () => {
+test("deleteConversation requires archive and removes the chat from storage", async () => {
   const participant = chatParticipant();
   const conversation = chatConversation({
     metadata: {
@@ -502,35 +557,14 @@ test("deleteConversation requires archive, records remote cleanup before deletin
         roleConfigVersion: ROLE.version,
         roleLabel: ROLE.label,
         roleInstructions: ROLE.instructions,
-        remoteSession: {
-          sessionKey: "remote-session",
-          sessionDir: "/srv/worker/sessions/remote-session",
-          worker: { host: "worker.example", workerRoot: "/srv/worker" },
-          protocolVersion: 1,
-          runtimeFingerprint: "fingerprint",
-          updatedAt: NOW
-        },
         updatedAt: NOW
       } satisfies ChatParticipantSession]
     }
   });
-  const { service, storage, cleanupTombstones } = testService([conversation]);
-  let cleanupCalls = 0;
-  service.setRemoteRunService({
-    async startDetachedRun(): Promise<never> { throw new Error("not used"); },
-    async pollDetachedRun(): Promise<never> { throw new Error("not used"); },
-    async cancelDetachedRun(): Promise<never> { throw new Error("not used"); },
-    async stopParticipantSessionIfIdle(): Promise<boolean> {
-      cleanupCalls += 1;
-      return false;
-    }
-  });
+  const { service, storage } = testService([conversation]);
 
   assert.equal(await service.deleteConversation({ conversationId: conversation.id }), true);
   assert.equal(await storage.getConversation(conversation.id), undefined);
-  assert.equal(cleanupCalls, 1);
-  assert.equal(cleanupTombstones.length, 1);
-  assert.equal(cleanupTombstones[0].reason, "chat-deleted");
 });
 
 test("deleteConversation rejects an unarchived chat", async () => {
@@ -783,6 +817,24 @@ test("hydrateContextUsage refreshes stale stored context usage for existing sess
   assert.equal(savedUsage?.[participant.id]?.usedTokens, 193_000);
 });
 
+test("hydrateContextUsage reads each session log once instead of waiting for missing logs", async () => {
+  // Opening a chat hydrates it. Old sessions' CLI logs are deleted by the CLI, and
+  // retrying each of them made every open of a big chat take a second.
+  const participant = chatParticipant({ model: "gpt-5.5" });
+  const conversation = chatConversation({
+    metadata: {
+      participants: [participant],
+      participantSessions: [chatSession(participant, "019ed183-1d77-7450-9070-6ea6f0b6dead")]
+    }
+  });
+  const contextUsageRequests: Array<{ sessionId: string | undefined; waitForLog: boolean | undefined }> = [];
+  const { service } = testService([conversation], { contextUsageRequests });
+
+  await service.hydrateContextUsage(conversation);
+
+  assert.deepEqual(contextUsageRequests, [{ sessionId: "019ed183-1d77-7450-9070-6ea6f0b6dead", waitForLog: false }]);
+});
+
 test("hydrateContextUsage does not overwrite newer stored context usage from a stale caller snapshot", async () => {
   const participant = chatParticipant({ model: "gpt-5.5" });
   const staleUsage: AgentContextUsage = {
@@ -915,8 +967,10 @@ test("participant-session metadata merge preserves newer handles and respects ne
 });
 
 function testService(conversationList: Conversation[], options: {
+  closeSessions?: (conversationId: string) => Promise<void>;
   participantConfigs?: ChatParticipantConfig[];
   contextUsageBySession?: Record<string, AgentContextUsage | undefined>;
+  contextUsageRequests?: Array<{ sessionId: string | undefined; waitForLog: boolean | undefined }>;
   failSaves?: number;
 } = {}): {
   service: ChatService;
@@ -928,12 +982,10 @@ function testService(conversationList: Conversation[], options: {
   };
   snapshots: Conversation[];
   historyWrites: string[];
-  cleanupTombstones: RemoteSessionCleanupTombstone[];
 } {
   const conversations = new Map(conversationList.map((conversation) => [conversation.id, cloneConversation(conversation)]));
   const snapshots: Conversation[] = [];
   const historyWrites: string[] = [];
-  const cleanupTombstones: RemoteSessionCleanupTombstone[] = [];
   let remainingFailedSaves = options.failSaves ?? 0;
   const storage = {
     async listConversations(): Promise<ConversationSummary[]> {
@@ -965,25 +1017,19 @@ function testService(conversationList: Conversation[], options: {
   const settings = {
     async getPublicSettings(): Promise<{ chatRoleConfigs: ChatRoleConfig[]; chatParticipantConfigs: ChatParticipantConfig[] }> {
       return { chatRoleConfigs: [ROLE], chatParticipantConfigs: options.participantConfigs ?? [] };
-    },
-    async enqueueRemoteSessionCleanup(
-      handle: RemoteSessionCleanupTombstone["handle"],
-      reason: RemoteSessionCleanupTombstone["reason"]
-    ): Promise<RemoteSessionCleanupTombstone> {
-      const tombstone = { id: `cleanup-${cleanupTombstones.length + 1}`, handle, reason, createdAt: NOW };
-      cleanupTombstones.push(tombstone);
-      return tombstone;
-    },
-    async removeRemoteSessionCleanupTombstone(id: string): Promise<void> {
-      const index = cleanupTombstones.findIndex((item) => item.id === id);
-      if (index >= 0) cleanupTombstones.splice(index, 1);
     }
   };
   const cliRunner = {
+    async closeConversationSessions(id: string): Promise<void> { await options.closeSessions?.(id); },
     async detectAgents(): Promise<[]> {
       return [];
     },
-    async contextUsageForSession(_participant: unknown, sessionId: string | undefined): Promise<AgentContextUsage | undefined> {
+    async contextUsageForSession(
+      _participant: unknown,
+      sessionId: string | undefined,
+      requestOptions: { waitForLog?: boolean } = {}
+    ): Promise<AgentContextUsage | undefined> {
+      options.contextUsageRequests?.push({ sessionId, waitForLog: requestOptions.waitForLog });
       return sessionId ? options.contextUsageBySession?.[sessionId] : undefined;
     }
   };
@@ -1006,7 +1052,7 @@ function testService(conversationList: Conversation[], options: {
   };
   (service as unknown as { cleanupDeletedConversationArtifacts(conversation: Conversation): Promise<void> })
     .cleanupDeletedConversationArtifacts = async () => undefined;
-  return { service, storage, snapshots, historyWrites, cleanupTombstones };
+  return { service, storage, snapshots, historyWrites };
 }
 
 function chatConversation(patch: Partial<Conversation> = {}): Conversation {

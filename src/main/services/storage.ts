@@ -1,10 +1,12 @@
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { app } from "electron";
-import { runCommand } from "./command";
+import { userDataPath } from "../platform";
+import { SqliteSession } from "./sqliteSession";
 import type {
   ChatMessage,
   ChatParticipant,
+  ChatRunningMessageTarget,
   Conversation,
   ConversationMessagePage,
   ConversationMessagePageInfo,
@@ -15,6 +17,7 @@ import type {
   ListChatActivityResult
 } from "../../shared/types";
 import type { ChatSearchDocument } from "../../shared/chatSearchDocuments";
+import { runningMessageForParticipant, runningMessageTarget } from "../../shared/chatRunningMessage";
 import {
   DEFAULT_CHAT_ACTIVITY_LIMIT,
   DEFAULT_CHAT_ACTIVITY_RECENT_CONVERSATION_LIMIT,
@@ -27,13 +30,33 @@ import { clearChatRunMetadata, clearParticipantCompactions, readParticipantCompa
 import { normalizeInferredParticipantRequestThreads as normalizeInferredParticipantRequestThreadMetadata } from "../../shared/chatParticipantRequestThreads";
 import { normalizeConversationSummaryChatParticipants } from "../../shared/conversationSummary";
 import { sanitizeConversationWarnings } from "../../shared/warnings";
+import { DeviceEventBlobStorage } from "./deviceEventBlobStorage";
+import { HubStorage } from "./hubStorage";
+import { HubOpsStore } from "./hubOpsStore";
+import { HubClientOpsStore } from "./hubOpsClient";
+import { NATIVE_COMMAND_SCHEMA_SQL, NativeCommandStore } from "./nativeCommandStore";
+import { MACHINE_POWER_SCHEMA, MachinePowerStore } from "./machinePowerStore";
 
 const DEFAULT_MESSAGE_PAGE_LIMIT = 80;
 const MAX_MESSAGE_PAGE_LIMIT = 200;
 const SQLITE_BUSY_TIMEOUT_MS = 30_000;
 const SQLITE_COMMAND_TIMEOUT_MS = 45_000;
 const SQLITE_MIGRATION_TIMEOUT_MS = 120_000;
+/** A message row that may be a member's reply not ended yet: its JSON (as
+ *  JSON.stringify writes it) holds a pending status somewhere. A superset —
+ *  a nested status matches too — that the exact check then narrows. It never
+ *  parses the row, so it cannot fail on one, and it is the condition of the
+ *  partial index `idx_conversation_messages_pending_reply`: a query uses that
+ *  index only while it states this very expression. The index is made once
+ *  by name, so a change here needs a new index name as well. */
+const pendingReplyRowHintSql = (column: string): string => `instr(${column}, '"status":"pending"') > 0`;
 const SCHEMA_META_COMPLETE = "complete";
+export const SUPPORTED_STORAGE_SCHEMA_VERSION = 2;
+/** What `prepareStorageForOlderVersion` puts the database back to. */
+export const PREVIOUS_STORAGE_SCHEMA_VERSION = 1;
+export const STORAGE_SCHEMA_VERSION_META_KEY = "storage-schema-version";
+/** Where this device's identity is kept (the key's name is the stored one). */
+const DEVICE_IDENTITY_META_KEY = "chat-event-device-identity-v1";
 const INFERRED_REQUEST_THREAD_MIGRATION_KEY = "inferred-participant-request-threads-v1";
 const CHAT_SEARCH_INDEX_META_KEY = "chat-search-index-version";
 const CHAT_SEARCH_INDEX_VERSION = 2;
@@ -44,10 +67,19 @@ function sqlString(value: string | undefined | null): string {
   if (value === undefined || value === null) {
     return "NULL";
   }
+  // The sqlite3 shell reads statements line by line and a NUL ends a line:
+  // the rest of the literal would leak into the statement.
+  if (value.includes("\u0000")) {
+    throw new Error("A value with a NUL character cannot be stored.");
+  }
   return `'${value.replace(/'/g, "''")}'`;
 }
 
-function sqlStringList(values: string[]): string {
+/** How many still-pending choices the phone's chat list may carry across
+ *  the listed chats before the set is called incomplete. */
+const MAX_PENDING_CHOICE_ROWS = 500;
+
+function sqlStringList(values: readonly string[]): string {
   return values.length > 0 ? `(${values.map((value) => sqlString(value)).join(", ")})` : "('')";
 }
 
@@ -83,6 +115,78 @@ function parseHexText(value: unknown, context: string): string {
   } catch {
     throw new Error(`Invalid UTF-8 text returned for ${context}.`);
   }
+}
+
+/** The chat state the running-message rule reads (chatActiveRuns.ts):
+ *  the chat's members and its run bookkeeping, nothing else of its body. */
+const RUNNING_MESSAGE_RUN_STATE_KEYS = [
+  "participants",
+  "activeRunIds",
+  "runId",
+  "activeRunOwnersByRunId",
+  "activeRunParticipantIdsByRunId",
+  "remoteRunHandles"
+] as const;
+/** Long enough for every hidden "waiting for approval" status the rule
+ *  recognises (isParticipantRequestWaitingStatus), which are one sentence. */
+const RUNNING_MESSAGE_CONTENT_CHARS = 400;
+
+function decodedRunningMessageContent(value: unknown): string {
+  try {
+    return parseHexText(value, "a running message");
+  } catch {
+    return "";
+  }
+}
+
+function parseStorageSchemaVersion(value: string | undefined): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error("This chat database has an invalid storage schema version. Restore a backup or update AccordAgents.");
+  }
+  return Number.parseInt(trimmed, 10);
+}
+
+export class UnsupportedStorageSchemaVersionError extends Error {
+  constructor(storedVersion: number, supportedVersion: number) {
+    super(
+      `This chat database was written by a newer version of AccordAgents. Update to open it. ` +
+        `Database schema ${storedVersion}, supported schema ${supportedVersion}.`
+    );
+    this.name = "UnsupportedStorageSchemaVersionError";
+  }
+}
+
+/** This device's ed25519 identity (see deviceIdentity.ts). */
+export interface DeviceIdentityRecord {
+  originId: string;
+  keyId: string;
+  publicKeyDerBase64: string;
+  privateKeyDerBase64: string;
+  createdAt: string;
+}
+
+/** One message as it is about to be written, with the hash used to decide
+ *  whether its row needs writing at all. */
+/** A message as storage writes it: its position, id, creation time, the JSON
+ *  that goes into the row and the sha1 of that JSON, which is what decides
+ *  whether the row changed since the last save. */
+export interface SavedMessageRow {
+  index: number;
+  id: string;
+  createdAt: string;
+  json: string;
+  hash: string;
+}
+
+/** What this process last committed for a conversation: the token it stamped on
+ *  the row, and the message ids and hashes in the order it wrote them. */
+interface SavedMessageState {
+  token: string;
+  rows: Array<{ id: string; hash: string }>;
 }
 
 export class InvalidChatSearchSourceError extends Error {
@@ -234,14 +338,73 @@ export interface StoredChatSearchQueryResult {
   matchedChatCount: number;
 }
 
+/**
+ * The order of signed events every device kept before the User's server
+ * owned the chats, and everything only it used: the events and their
+ * projections, the native turn commands built on them, the per-device
+ * delivery queues, the phone's turn claims, a removed machine's deletion
+ * targets, the server's order, folding, readers and retention bookkeeping,
+ * and a device's held places. Tables that refer to others come first.
+ */
+const LEGACY_EVENT_TABLES = [
+  "native_commands",
+  "native_run_cancellations",
+  "native_run_outcomes",
+  "native_session_executors",
+  "device_event_outbox",
+  "device_event_inbox",
+  "device_event_applied_heads",
+  "device_replica_copies",
+  "device_replica_inventory",
+  "chat_event_projections",
+  "phone_turn_claims",
+  "conversation_deletion_targets",
+  "hub_client_held_events",
+  "hub_log",
+  "hub_fold_state",
+  "hub_device_cursors",
+  "hub_reader_floors",
+  "hub_device_reads",
+  "hub_pair_machines",
+  "hub_chain_marks",
+  "hub_prune_state",
+  "hub_retention_candidates",
+  "device_event_blob_gc",
+  "device_event_blob_gc_refs",
+  "chat_events"
+] as const;
+/** Bodies: a device kept the large payloads of its events here; only the
+ *  User's server keeps bodies now (pictures, avatars). */
+const LEGACY_BODY_TABLES = ["device_event_blob_fragments", "device_event_blob_pins", "device_event_blobs"] as const;
+/** Where a device stood in the old order (hub_client_state keys). */
+const LEGACY_CLIENT_STATE_KEYS = ["pushed-rowid", "pulled-hub-seq", "hub-id", "given-up", "dismissed-notices"] as const;
+/** The old order's logical clock (schema_meta). */
+const LEGACY_META_KEYS = ["chat-event-clock-v1"] as const;
+/** Rows deleted per transaction while a legacy table is emptied, and the
+ *  pause between two batches (other work gets the database meanwhile): an
+ *  event row is a few KB with four indexes, so a batch holds the database
+ *  for a fraction of a second. */
+const LEGACY_DROP_BATCH_ROWS = 500;
+const LEGACY_DROP_PAUSE_MS = 100;
+
 export class StorageService {
+  private sqliteSession?: SqliteSession;
+  private hubStorage?: HubStorage;
+  private hubOpsStore?: HubOpsStore;
+  private hubClientOpsStore?: HubClientOpsStore;
+  private deviceEventBlobStorage?: DeviceEventBlobStorage;
+  private savedMessageStateCache: Map<string, SavedMessageState> | undefined;
   private readonly dbPath: string;
   private readonly sqliteExecutable: string;
   private initialized = false;
+  /** The one set-up under way: callers that arrive while it runs wait for
+   *  it instead of starting a second one, which on a new database would add
+   *  the same column twice and stop the app from starting. */
+  private initializing?: Promise<void>;
   private chatSearchIndexReady = false;
 
   constructor(options: StorageServiceOptions = {}) {
-    this.dbPath = options.dbPath ?? path.join(app.getPath("userData"), "accordagents.sqlite3");
+    this.dbPath = options.dbPath ?? path.join(userDataPath(), "accordagents.sqlite3");
     this.sqliteExecutable = options.sqliteExecutable ?? "sqlite3";
   }
 
@@ -249,8 +412,20 @@ export class StorageService {
     if (this.initialized) {
       return;
     }
+    if (!this.initializing) {
+      // A set-up that fails is tried again by the next caller.
+      this.initializing = this.runInit().finally(() => {
+        this.initializing = undefined;
+      });
+    }
+    return this.initializing;
+  }
 
+  private async runInit(): Promise<void> {
     await mkdir(path.dirname(this.dbPath), { recursive: true });
+    await this.ensureSchemaMetaTable();
+    await this.assertSupportedSchemaVersion();
+    await this.configureSqliteRuntime();
     await this.runSql(`
       create table if not exists conversations (
         id text primary key,
@@ -282,10 +457,46 @@ export class StorageService {
         conversation_id text not null,
         requested_at text not null
       );
+      -- A chat the owner deleted. Kept after the rows are gone, because a
+      -- snapshot already in flight would otherwise write it back: the copy
+      -- has no way to tell "new" from "stale" without a record of the absence.
+      create table if not exists deleted_conversations (
+        conversation_id text primary key,
+        deleted_at text not null
+      );
+      -- Enforce absence inside the write transaction, including stale writers
+      -- in other processes and snapshots queued before deletion started.
+      create trigger if not exists deleted_conversation_insert before insert on conversations
+        when exists (select 1 from deleted_conversations where conversation_id = new.id)
+        begin select raise(abort, 'Chat was permanently deleted.'); end;
+      create trigger if not exists deleted_conversation_update before update on conversations
+        when exists (select 1 from deleted_conversations where conversation_id = new.id)
+        begin select raise(abort, 'Chat was permanently deleted.'); end;
+      create trigger if not exists deleted_message_insert before insert on conversation_messages
+        when exists (select 1 from deleted_conversations where conversation_id = new.conversation_id)
+        begin select raise(abort, 'Chat was permanently deleted.'); end;
+      create trigger if not exists deleted_message_update before update on conversation_messages
+        when exists (select 1 from deleted_conversations where conversation_id = new.conversation_id)
+        begin select raise(abort, 'Chat was permanently deleted.'); end;
+      ${NATIVE_COMMAND_SCHEMA_SQL}
+      ${MACHINE_POWER_SCHEMA}
+      -- Where each relay mailbox was read to, from before the relay was removed.
+      drop table if exists device_event_mailbox_cursors;
     `);
     await this.pruneStaleRunCancelRequests();
     await this.ensureColumn("conversations", "body_json", "text");
+    await this.ensureColumn("conversations", "save_token", "text");
+    // The few message rows that may be a member's reply not ended yet, so the
+    // chat list finds them without reading every message (listConversations).
+    // Built once over the existing rows; sqlite keeps it on every write after.
+    await this.runSql(
+      `create index if not exists idx_conversation_messages_pending_reply on conversation_messages(conversation_id)
+         where ${pendingReplyRowHintSql("payload_json")};`,
+      SQLITE_MIGRATION_TIMEOUT_MS
+    );
     await this.backfillConversationBodiesAndMessages();
+    await this.backUpBeforeSchemaUpgrade();
+    await this.setSchemaMeta(STORAGE_SCHEMA_VERSION_META_KEY, String(SUPPORTED_STORAGE_SCHEMA_VERSION));
     this.initialized = true;
     await this.normalizeInferredParticipantRequestThreads();
     await this.clearInterruptedRuns();
@@ -330,6 +541,37 @@ export class StorageService {
     await this.runSql(`delete from run_cancel_requests where requested_at < ${sqlString(cutoff)};`);
   }
 
+  /** A chat's kind, project folder and members, without its messages or
+   *  the rest of its body (members' memory asks this on every request). */
+  async conversationAccess(id: string): Promise<{ kind: string; repoPath?: string; participants: unknown[] } | undefined> {
+    await this.init();
+    const rows = await this.queryJson<{ kind: string; repoPath: string | null; participantsJson: string | null }>(
+      `select kind, repo_path as repoPath,
+         json_extract(coalesce(nullif(body_json, ''), payload_json), '$.metadata.participants') as participantsJson
+       from conversations where id = ${sqlString(id)};`
+    );
+    const row = rows[0];
+    if (!row) return undefined;
+    let participants: unknown[] = [];
+    try {
+      const parsed = row.participantsJson ? JSON.parse(row.participantsJson) as unknown : [];
+      if (Array.isArray(parsed)) participants = parsed;
+    } catch {
+      participants = [];
+    }
+    return { kind: row.kind, ...(row.repoPath ? { repoPath: row.repoPath } : {}), participants };
+  }
+
+  /** The titles of the chats named (those this device still has). */
+  async conversationTitles(ids: readonly string[]): Promise<Record<string, string>> {
+    if (!ids.length) return {};
+    await this.init();
+    // sqlStringList is already parenthesized: one more pair makes a row value
+    // that sqlite refuses as soon as there are two ids.
+    const rows = await this.queryJson<{ id: string; title: string }>(`select id, title from conversations where id in ${sqlStringList(ids)};`);
+    return Object.fromEntries(rows.map((row) => [row.id, row.title]));
+  }
+
   async listConversations(): Promise<ConversationSummary[]> {
     await this.init();
     const rows = await this.queryJson<{
@@ -342,8 +584,12 @@ export class StorageService {
       running?: number | string | boolean | null;
       archived?: number | string | boolean | null;
       activeRunIdsCount?: number | string | null;
+      replyPending?: number | string | null;
       chatParticipantsJson?: string | null;
     }>(
+      // Besides this device's runs, whether a member's reply has not ended
+      // (`isPendingReply`): a machine member's turn asked from the phone runs
+      // with no run here at all, and the reply is the only sign of it.
       `select
          id,
          title,
@@ -351,10 +597,18 @@ export class StorageService {
          created_at as createdAt,
          updated_at as updatedAt,
          repo_path as repoPath,
-         json_extract(payload_json, '$.metadata.running') as running,
-         json_extract(payload_json, '$.metadata.archived') as archived,
-         coalesce(json_array_length(payload_json, '$.metadata.activeRunIds'), 0) as activeRunIdsCount,
-         json_extract(payload_json, '$.metadata.participants') as chatParticipantsJson
+         json_extract(coalesce(nullif(body_json, ''), payload_json), '$.metadata.running') as running,
+         json_extract(coalesce(nullif(body_json, ''), payload_json), '$.metadata.archived') as archived,
+         coalesce(json_array_length(coalesce(nullif(body_json, ''), payload_json), '$.metadata.activeRunIds'), 0) as activeRunIdsCount,
+         exists (
+           select 1 from conversation_messages m
+           where m.conversation_id = conversations.id
+             and ${pendingReplyRowHintSql("m.payload_json")}
+             and json_valid(m.payload_json)
+             and json_extract(m.payload_json, '$.status') = 'pending'
+             and json_extract(m.payload_json, '$.role') = 'participant'
+         ) as replyPending,
+         json_extract(coalesce(nullif(body_json, ''), payload_json), '$.metadata.participants') as chatParticipantsJson
        from conversations
        order by updated_at desc;`
     );
@@ -363,6 +617,7 @@ export class StorageService {
         ? Number.parseInt(row.activeRunIdsCount, 10) || 0
         : (row.activeRunIdsCount ?? 0);
       const runningFlag = row.running === 1 || row.running === "1" || row.running === true || row.running === "true";
+      const replyPending = row.replyPending === 1 || row.replyPending === "1";
       const isRunning = activeCount > 0 || runningFlag;
       const isArchived = row.archived === 1 || row.archived === "1" || row.archived === true || row.archived === "true";
       const chatParticipants = row.kind === "chat"
@@ -376,10 +631,95 @@ export class StorageService {
         updatedAt: row.updatedAt,
         repoPath: row.repoPath ?? undefined,
         running: isRunning,
+        ...(replyPending ? { replyPending: true } : {}),
         archived: isArchived,
         ...(chatParticipants ? { chatParticipants } : {})
       };
     });
+  }
+
+  /** Each chat's members, as the runtime fields that say which provider they
+   *  run on (the CLI and any added provider) and their role (to tell the
+   *  Assistant apart), for the usage signals. One
+   *  query over the chats' own rows, the same body the chat list reads, that
+   *  returns only those fields; no message is read, and a chat whose
+   *  row cannot be read is left out rather than failing the rest. */
+  async listChatMemberProviders(): Promise<Array<Array<{ kind?: unknown; hostId?: unknown; hostVendor?: unknown; roleConfigId?: unknown }>>> {
+    await this.init();
+    const rows = await this.queryJson<{ id: string; kind?: unknown; hostId?: unknown; hostVendor?: unknown; roleConfigId?: unknown; member?: number | null }>(
+      `select c.id as id,
+              json_extract(p.value, '$.kind') as kind,
+              json_extract(p.value, '$.hostId') as hostId,
+              json_extract(p.value, '$.hostVendor') as hostVendor,
+              json_extract(p.value, '$.roleConfigId') as roleConfigId,
+              p.key as member
+       from (
+         select id, coalesce(nullif(body_json, ''), payload_json) as body
+         from conversations
+         where kind = 'chat' and json_valid(coalesce(nullif(body_json, ''), payload_json))
+       ) c
+       left join json_each(
+         case when json_type(c.body, '$.metadata.participants') = 'array' then c.body else '{"metadata":{"participants":[]}}' end,
+         '$.metadata.participants'
+       ) p
+       order by c.id;`
+    );
+    const chats = new Map<string, Array<{ kind?: unknown; hostId?: unknown; hostVendor?: unknown; roleConfigId?: unknown }>>();
+    for (const row of rows) {
+      const members = chats.get(row.id) ?? [];
+      if (row.member !== null && row.member !== undefined) {
+        members.push({
+          kind: row.kind ?? undefined,
+          hostId: row.hostId ?? undefined,
+          hostVendor: row.hostVendor ?? undefined,
+          roleConfigId: row.roleConfigId ?? undefined
+        });
+      }
+      chats.set(row.id, members);
+    }
+    return [...chats.values()];
+  }
+
+  /** The messages whose choice still waits for the User, in the given chats:
+   *  what the phone's chat list carries so a phone can drop a card the
+   *  desktop no longer waits on. One query over the listed chats' rows (their
+   *  payloads are scanned; a chat's history is never read through the CLI).
+   *  Past the cap the set is incomplete and says so, because the phone treats
+   *  what it is given as the whole. */
+  async listPendingChoiceMessages(conversationIds: string[]): Promise<{
+    rows: Array<{ conversationId: string; message: ChatMessage }>;
+    truncated: boolean;
+  }> {
+    await this.init();
+    const ids = [...new Set(conversationIds.filter((id) => typeof id === "string" && id.trim()))];
+    if (ids.length === 0) {
+      return { rows: [], truncated: false };
+    }
+    const found = await this.queryJson<{ conversationId: string; sequence: number; payloadHex: string }>(
+      `
+        select conversation_id as conversationId, sequence, hex(payload_json) as payloadHex
+        from conversation_messages
+        where conversation_id in ${sqlStringList(ids)}
+          and json_valid(payload_json)
+          and json_extract(payload_json, '$.metadata.pendingChoice.status') = 'pending'
+        order by created_at desc
+        limit ${MAX_PENDING_CHOICE_ROWS + 1};
+      `
+    );
+    const truncated = found.length > MAX_PENDING_CHOICE_ROWS;
+    const rows: Array<{ conversationId: string; message: ChatMessage }> = [];
+    for (const row of found.slice(0, MAX_PENDING_CHOICE_ROWS)) {
+      try {
+        rows.push({
+          conversationId: row.conversationId,
+          message: parseHexJson<ChatMessage>(row.payloadHex, `pending choice message ${row.conversationId}:${row.sequence}`)
+        });
+      } catch (error) {
+        console.warn(`[StorageService] Skipping invalid pending choice message ${row.conversationId}:${row.sequence}: ${
+          error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return { rows, truncated };
   }
 
   async listChatActivity(request: ListChatActivityRequest = {}): Promise<ListChatActivityResult> {
@@ -402,7 +742,7 @@ export class StorageService {
          hex(coalesce(nullif(body_json, ''), json_set(payload_json, '$.messages', json_array()))) as bodyHex
        from conversations
        where kind = 'chat'
-         and coalesce(json_extract(payload_json, '$.metadata.archived'), 0) not in (1, '1', 'true')
+         and coalesce(json_extract(coalesce(nullif(body_json, ''), payload_json), '$.metadata.archived'), 0) not in (1, '1', 'true')
        order by updated_at desc
        limit ${conversationLimit};`
     );
@@ -462,12 +802,18 @@ export class StorageService {
         .filter((itemId): itemId is string => typeof itemId === "string" && itemId.trim().length > 0)
         .slice(-1_000)
     );
+    const preferences = {
+      clearedItemIds: excludedItemIds,
+      ...(request.clearedRecentThroughByGroup ? { clearedRecentThroughByGroup: request.clearedRecentThroughByGroup } : {}),
+      ...(request.clearedRecentThroughBefore ? { clearedRecentThroughBefore: request.clearedRecentThroughBefore } : {})
+    };
     const items = [...conversationsById.values()].flatMap((conversation) =>
       buildChatActivityItems(conversation, {
         recentWindowDays,
-        lastViewedAt: request.lastViewedAtByConversationId?.[conversation.id]
+        lastViewedAt: request.lastViewedAtByConversationId?.[conversation.id],
+        preferences
       })
-    ).filter((item) => !excludedItemIds.has(item.id));
+    );
     return {
       items: limitChatActivityItems(sortChatActivityItems(items), limit),
       generatedAt: new Date().toISOString()
@@ -476,19 +822,79 @@ export class StorageService {
 
   async getConversation(id: string): Promise<Conversation | undefined> {
     await this.init();
-    const payloadJson = await this.queryText(
-      `select payload_json from conversations where id = ${sqlString(id)} limit 1;`
+    return this.readWholeConversation(id);
+  }
+
+  /** A chat's project folder, without reading a conversation that can be
+   *  thousands of messages long. `undefined` when the chat is not stored. */
+  async conversationRepoPath(id: string): Promise<{ repoPath?: string } | undefined> {
+    await this.init();
+    const [row] = await this.queryJson<{ repoPath: string | null }>(
+      `select repo_path as repoPath from conversations where id = ${sqlString(id)} limit 1;`
     );
-    if (!payloadJson) {
+    if (!row) return undefined;
+    return typeof row.repoPath === "string" && row.repoPath.trim() ? { repoPath: row.repoPath } : {};
+  }
+
+  /** Whether a chat is stored here (and holds one message), without reading
+   *  a conversation that can be thousands of messages long. */
+  async conversationPresence(id: string, messageId?: string): Promise<{ kind: Conversation["kind"]; hasMessage: boolean } | undefined> {
+    await this.init();
+    const hasMessage = messageId
+      ? `exists(select 1 from conversation_messages where conversation_id = ${sqlString(id)} and message_id = ${sqlString(messageId)})`
+      : "0";
+    const [row] = await this.queryJson<{ kind: Conversation["kind"]; hasMessage: number }>(
+      `select kind, ${hasMessage} as hasMessage from conversations where id = ${sqlString(id)} limit 1;`
+    );
+    return row ? { kind: row.kind, hasMessage: Boolean(row.hasMessage) } : undefined;
+  }
+
+  // The conversation is assembled from its body plus its message rows. The old
+  // full `payload_json` copy is no longer written — it duplicated everything the
+  // rows already hold, and rewriting it cost megabytes on every save — so it is
+  // only read for rows that predate this change and have no body yet.
+  private async readWholeConversation(id: string): Promise<Conversation | undefined> {
+    const bodyJson = await this.queryText(
+      `select coalesce(nullif(body_json, ''), payload_json) from conversations where id = ${sqlString(id)} limit 1;`
+    );
+    if (!bodyJson) {
       return undefined;
     }
-    const conversation = JSON.parse(payloadJson) as Conversation;
+    const conversation = JSON.parse(bodyJson) as Conversation;
+    const rows = await this.readAllConversationMessages(id);
+    // No rows but the parsed copy has messages means this row still predates the
+    // split and was never backfilled — that legacy payload is then the only
+    // place the messages exist, so it wins. Anything else takes the rows.
+    const legacyPayloadIsTheOnlySource = rows.length === 0 &&
+      Array.isArray(conversation.messages) &&
+      conversation.messages.length > 0;
+    if (!legacyPayloadIsTheOnlySource) {
+      conversation.messages = rows;
+    }
     conversation.metadata = clearLegacyAccordState(conversation.metadata);
     sanitizeConversationWarnings(conversation);
     return conversation;
   }
 
-  async openConversation(id: string, limit?: number): Promise<ConversationOpenResult | undefined> {
+  private async readAllConversationMessages(id: string): Promise<ChatMessage[]> {
+    const rows = await this.queryJson<{ sequence: number; payloadHex: string }>(
+      `
+        select sequence, hex(payload_json) as payloadHex
+        from conversation_messages
+        where conversation_id = ${sqlString(id)}
+        order by sequence;
+      `
+    );
+    return rows.map((row) =>
+      parseHexJson<ChatMessage>(row.payloadHex, `conversation message ${id}:${row.sequence}`)
+    );
+  }
+
+  async openConversation(
+    id: string,
+    limit?: number,
+    page?: { beforeMessageId?: string }
+  ): Promise<ConversationOpenResult | undefined> {
     await this.init();
     const bodyJson = await this.queryText(
       `select coalesce(nullif(body_json, ''), payload_json) from conversations where id = ${sqlString(id)} limit 1;`
@@ -501,7 +907,8 @@ export class StorageService {
     sanitizeConversationWarnings(conversation);
     const messagePage = await this.listConversationMessages({
       conversationId: id,
-      limit
+      limit,
+      ...(page?.beforeMessageId ? { beforeMessageId: page.beforeMessageId } : {})
     });
     return {
       conversation: {
@@ -516,8 +923,34 @@ export class StorageService {
     await this.init();
     const limit = normalizeMessagePageLimit(request.limit);
     const aroundMessageId = typeof request.aroundMessageId === "string" ? request.aroundMessageId.trim() : "";
+    const beforeMessageId = typeof request.beforeMessageId === "string" ? request.beforeMessageId.trim() : "";
     let sequenceClause = "";
-    if (aroundMessageId) {
+    if (beforeMessageId) {
+      // Strictly before a message the reader already holds. An unknown id
+      // answers with nothing rather than the latest page: the reader asked
+      // for older history, and the latest page is not that.
+      const targetRows = await this.queryJson<{ sequence: number }>(
+        `
+          select sequence
+          from conversation_messages
+          where conversation_id = ${sqlString(request.conversationId)}
+            and message_id = ${sqlString(beforeMessageId)}
+          limit 1;
+        `
+      );
+      const targetSequence = targetRows[0]?.sequence;
+      if (targetSequence === undefined) {
+        const countRows = await this.queryJson<{ totalMessages: number }>(
+          `select count(*) as totalMessages from conversation_messages where conversation_id = ${sqlString(request.conversationId)};`
+        );
+        return {
+          messages: [],
+          hasMoreBefore: false,
+          totalMessages: countRows[0]?.totalMessages ?? 0
+        };
+      }
+      sequenceClause = ` and sequence < ${Math.max(0, Math.floor(targetSequence))}`;
+    } else if (aroundMessageId) {
       const targetRows = await this.queryJson<{ sequence: number }>(
         `
           select sequence
@@ -564,6 +997,125 @@ export class StorageService {
       hasMoreBefore: rows.length > limit,
       totalMessages: countRows[0]?.totalMessages ?? selectedRows.length
     };
+  }
+
+  /** One message of a chat by its id: a single read through the chat's
+   *  message-id index, for readers that need nothing around it. */
+  async conversationMessageById(conversationId: string, messageId: string): Promise<ChatMessage | undefined> {
+    await this.init();
+    const rows = await this.queryJson<{ sequence: number; payloadHex: string }>(
+      `select sequence, hex(payload_json) as payloadHex from conversation_messages
+        where conversation_id = ${sqlString(conversationId)} and message_id = ${sqlString(messageId)} limit 1;`
+    );
+    return rows[0] ? parseHexJson<ChatMessage>(rows[0].payloadHex, `message ${conversationId}:${rows[0].sequence}`) : undefined;
+  }
+
+  /** The member messages still in progress that answer these turns (the
+   *  member and the message each turn answers), wherever they are in the
+   *  chat. Read from the earliest of those messages on, not the whole chat;
+   *  few and small (a turn's message holds only its placeholder until it
+   *  ends). A dead message of another turn is never one of them. */
+  async listPendingTurnMessages(
+    conversationId: string,
+    turns: Array<{ messageId: string; participantId: string }>
+  ): Promise<ChatMessage[]> {
+    if (turns.length === 0) return [];
+    await this.init();
+    const asked = [...new Set(turns.map((turn) => turn.messageId))].slice(0, 200);
+    const [first] = await this.queryJson<{ sequence: number | null }>(
+      `select min(sequence) as sequence from conversation_messages
+        where conversation_id = ${sqlString(conversationId)} and message_id in (${asked.map(sqlString).join(", ")});`
+    );
+    if (typeof first?.sequence !== "number") return [];
+    const rows = await this.queryJson<{ sequence: number; payloadHex: string }>(
+      `
+        select sequence, hex(payload_json) as payloadHex
+        from conversation_messages
+        where conversation_id = ${sqlString(conversationId)}
+          and sequence >= ${Math.max(0, Math.floor(first.sequence))}
+          and payload_json like '%"status":"pending"%'
+          and json_valid(payload_json)
+          and json_extract(payload_json, '$.role') = 'participant'
+          and json_extract(payload_json, '$.status') = 'pending'
+        order by sequence;
+      `
+    );
+    const wanted = new Set(turns.map((turn) => `${turn.participantId}\u0000${turn.messageId}`));
+    return rows
+      .map((row) => parseHexJson<ChatMessage>(row.payloadHex, `pending message ${conversationId}:${row.sequence}`))
+      .filter((message) => {
+        const answers = message.metadata?.sourceMessageId || message.metadata?.parentMessageId;
+        return Boolean(message.participantId && answers) && wanted.has(`${message.participantId}\u0000${answers}`);
+      });
+  }
+
+  /** The member's turn in progress (see runningMessageForParticipant), found
+   *  in the whole chat: an open chat holds only its latest page, and a long
+   *  turn's message can be far above it. Reads only the chat's run state and,
+   *  of its pending member messages, the run fields plus the first characters
+   *  of their text (to recognise a hidden "waiting for approval" status), so
+   *  the answer stays a handful of short rows on any chat. */
+  async findRunningParticipantMessage(conversationId: string, participantId: string): Promise<ChatRunningMessageTarget | undefined> {
+    await this.init();
+    const body = `coalesce(nullif(body_json, ''), payload_json)`;
+    const runStateJson = await this.queryText(
+      `
+        select json_object(${RUNNING_MESSAGE_RUN_STATE_KEYS.map((key) =>
+          `${sqlString(key)}, json_extract(${body}, ${sqlString(`$.metadata.${key}`)})`).join(", ")})
+        from conversations
+        where id = ${sqlString(conversationId)} and json_valid(${body})
+        limit 1;
+      `
+    );
+    if (!runStateJson) {
+      return undefined;
+    }
+    const metadata = JSON.parse(runStateJson) as Conversation["metadata"];
+    const rows = await this.queryJson<{
+      id: string;
+      participantId: string | null;
+      createdAt: string | null;
+      runId: string | null;
+      queued: number;
+      chatThreadRootId: string | null;
+      hiddenFromTimeline: number | null;
+      contentHex: string | null;
+    }>(
+      `
+        select
+          message_id as id,
+          json_extract(payload_json, '$.participantId') as participantId,
+          json_extract(payload_json, '$.createdAt') as createdAt,
+          json_extract(payload_json, '$.metadata.runId') as runId,
+          json_extract(payload_json, '$.metadata.queuedBehind') is not null as queued,
+          json_extract(payload_json, '$.metadata.chatThreadRootId') as chatThreadRootId,
+          json_extract(payload_json, '$.metadata.hiddenFromTimeline') as hiddenFromTimeline,
+          hex(substr(json_extract(payload_json, '$.content'), 1, ${RUNNING_MESSAGE_CONTENT_CHARS})) as contentHex
+        from conversation_messages
+        where conversation_id = ${sqlString(conversationId)}
+          and payload_json like '%"status":"pending"%'
+          and json_valid(payload_json)
+          and json_extract(payload_json, '$.role') = 'participant'
+          and json_extract(payload_json, '$.status') = 'pending'
+        order by sequence;
+      `
+    );
+    const messages: ChatMessage[] = rows.flatMap((row) => typeof row.id === "string" && row.id ? [{
+      id: row.id,
+      role: "participant" as const,
+      status: "pending" as const,
+      ...(typeof row.participantId === "string" ? { participantId: row.participantId } : {}),
+      content: decodedRunningMessageContent(row.contentHex),
+      createdAt: typeof row.createdAt === "string" ? row.createdAt : "",
+      metadata: {
+        ...(typeof row.runId === "string" ? { runId: row.runId } : {}),
+        ...(row.queued ? { queuedBehind: { handle: "" } } : {}),
+        ...(typeof row.chatThreadRootId === "string" ? { chatThreadRootId: row.chatThreadRootId } : {}),
+        ...(row.hiddenFromTimeline ? { hiddenFromTimeline: true } : {})
+      }
+    }] : []);
+    const running = runningMessageForParticipant({ metadata, messages }, participantId);
+    return running ? runningMessageTarget(running) : undefined;
   }
 
   async listChatSearchConversationSnapshots(options: { includeParticipants?: boolean } = {}): Promise<ChatSearchConversationSnapshot[]> {
@@ -1126,22 +1678,123 @@ export class StorageService {
     };
   }
 
-  async saveConversation(conversation: Conversation): Promise<void> {
+  // Only ever a cache of what this process itself wrote. It is dropped whenever
+  // the database turns out to hold something else, so a wrong entry costs one
+  // full rewrite rather than a lost message. Created on demand because tests
+  // build this service through `Object.create`, which skips field initialisers.
+  private get savedMessageState(): Map<string, SavedMessageState> {
+    if (!this.savedMessageStateCache) {
+      this.savedMessageStateCache = new Map();
+    }
+    return this.savedMessageStateCache;
+  }
+
+  // A save used to delete every message row of a conversation and insert them
+  // all back. On a 2400-message chat that is ~33MB of SQL text piped into a
+  // spawned sqlite3 process, several times per turn, so the cost of saying
+  // anything grew with the length of the chat. Only the rows that actually
+  // changed are written now; the full rewrite remains as the fallback whenever
+  // this process cannot prove what the database currently holds.
+  /** Saves the conversation and returns the token stamped on its row. A caller
+   *  that already serialized and hashed the messages for this exact snapshot
+   *  passes them as `rows`; they are used only when they line up with the
+   *  messages one to one, otherwise the messages are serialized here. */
+  async saveConversation(conversation: Conversation, options: {
+    rows?: SavedMessageRow[];
+    /** Statements that must commit in the same transaction as this save, or
+     *  not at all: the chat's outgoing change event. `onlyIfSql` receives the
+     *  condition the incremental write is gated on. */
+    alsoCommit?: { sql: string; onlyIfSql(condition: string): string };
+  } = {}): Promise<string> {
     await this.init();
-    const payload = JSON.stringify(conversation);
+    const rows: SavedMessageRow[] = rowsMatchMessages(options.rows, conversation.messages)
+      ? options.rows
+      : conversation.messages.map((message, index) => {
+        const json = JSON.stringify(message);
+        return {
+          index,
+          id: message.id,
+          createdAt: message.createdAt,
+          json,
+          hash: createHash("sha1").update(json).digest("hex")
+        };
+      });
+    const previous = this.savedMessageState.get(conversation.id);
+    const nextToken = randomUUID();
+    // Another app instance can share this database. The token makes a partial
+    // save atomic against that: every message statement is gated on this
+    // process still owning the row it last wrote, so a foreign write in between
+    // turns the whole batch into a no-op instead of splicing our rows into
+    // theirs and producing a state neither instance ever held.
+    let claimed = false;
+    if (previous) {
+      try {
+        claimed = await this.writeConversationIncrementally(conversation, rows, previous, nextToken, options.alsoCommit);
+      } catch (error) {
+        // A failed partial write leaves this process unable to say what the row
+        // holds, so the cache is worthless and the next save must rewrite
+        // everything.
+        this.savedMessageState.delete(conversation.id);
+        throw error;
+      }
+    }
+    if (claimed) {
+      this.savedMessageState.set(conversation.id, {
+        token: nextToken,
+        rows: rows.map((row) => ({ id: row.id, hash: row.hash }))
+      });
+      return nextToken;
+    }
+    this.savedMessageState.delete(conversation.id);
+    await this.writeConversationInFull(conversation, rows, nextToken, options.alsoCommit?.sql);
+    this.savedMessageState.set(conversation.id, {
+      token: nextToken,
+      rows: rows.map((row) => ({ id: row.id, hash: row.hash }))
+    });
+    return nextToken;
+  }
+
+  /** True while the conversation row still carries `token`, the value a
+   *  particular `saveConversation` call returned. Every save — from any
+   *  instance or any caller in this process — stamps a new token, so a match
+   *  proves nothing has written the conversation since that save and storage
+   *  holds exactly the snapshot it persisted. */
+  async isConversationSaveOwned(conversationId: string, token: string): Promise<boolean> {
+    if (!token) {
+      return false;
+    }
+    await this.init();
+    const observed = await this.queryText(
+      `select save_token from conversations where id = ${sqlString(conversationId)} limit 1;`
+    );
+    return observed === token;
+  }
+
+  private async writeConversationInFull(
+    conversation: Conversation,
+    rows: SavedMessageRow[],
+    token: string,
+    alsoCommitSql = ""
+  ): Promise<void> {
     const bodyPayload = JSON.stringify(conversationBody(conversation));
-    const messageRows = conversation.messages.map((message, index) => `
+    // `payload_json` used to hold a second, complete copy of the conversation —
+    // every message again, megabytes of it, rewritten on every save. The body
+    // and the message rows are the record now; the column stays because it is
+    // `not null` and because rows written before this change are still read
+    // through it, but it is no longer a copy of anything.
+    const payload = bodyPayload;
+    const messageRows = rows.map((row) => `
       insert into conversation_messages (conversation_id, sequence, message_id, created_at, payload_json)
       values (
         ${sqlString(conversation.id)},
-        ${index},
-        ${sqlString(message.id)},
-        ${sqlString(message.createdAt)},
-        ${sqlString(JSON.stringify(message))}
+        ${row.index},
+        ${sqlString(row.id)},
+        ${sqlString(row.createdAt)},
+        ${sqlString(row.json)}
       );
     `).join("\n");
     await this.runSql(`
-      begin;
+      begin immediate;
       insert into conversations (id, title, kind, created_at, updated_at, repo_path, payload_json)
       values (
         ${sqlString(conversation.id)},
@@ -1159,14 +1812,270 @@ export class StorageService {
         repo_path = excluded.repo_path,
         body_json = ${sqlString(bodyPayload)},
         payload_json = excluded.payload_json;
-      update conversations set body_json = ${sqlString(bodyPayload)} where id = ${sqlString(conversation.id)};
+      update conversations set body_json = ${sqlString(bodyPayload)}, save_token = ${sqlString(token)}
+        where id = ${sqlString(conversation.id)};
       delete from conversation_messages where conversation_id = ${sqlString(conversation.id)};
       ${messageRows}
+      ${alsoCommitSql}
       commit;
     `);
   }
 
-  async deleteConversation(id: string): Promise<boolean> {
+  /** Returns false when this process no longer owns the row, so the caller must
+   *  fall back to a full rewrite. */
+  private async writeConversationIncrementally(
+    conversation: Conversation,
+    rows: SavedMessageRow[],
+    previous: SavedMessageState,
+    token: string,
+    alsoCommit?: { sql: string; onlyIfSql(condition: string): string }
+  ): Promise<boolean> {
+    const bodyPayload = JSON.stringify(conversationBody(conversation));
+    const payload = bodyPayload;
+    // Messages are spliced, not only appended (`chat.ts` inserts a message into
+    // the middle of the array and removes pending ones), and a splice shifts
+    // every later row's sequence while leaving its content identical. Comparing
+    // content alone would call those rows clean and leave stale sequences
+    // behind, and re-inserting a message id that still exists at another
+    // sequence would trip `unique (conversation_id, message_id)` and fail the
+    // whole transaction. So the first position whose message id differs decides:
+    // everything from there is rewritten, everything before it is touched only
+    // when its content changed. An append makes that boundary the old length; an
+    // in-place edit makes it the end.
+    const shared = Math.min(previous.rows.length, rows.length);
+    let divergence = shared;
+    for (let index = 0; index < shared; index += 1) {
+      if (previous.rows[index].id !== rows[index].id) {
+        divergence = index;
+        break;
+      }
+    }
+    const owned = `exists (select 1 from conversations where id = ${sqlString(conversation.id)}
+      and save_token = ${sqlString(previous.token)})`;
+    const statements: string[] = [];
+    statements.push(`
+      delete from conversation_messages
+      where conversation_id = ${sqlString(conversation.id)} and sequence >= ${divergence} and ${owned};
+    `);
+    for (const row of rows) {
+      const changed = row.index >= divergence || previous.rows[row.index].hash !== row.hash;
+      if (!changed) {
+        continue;
+      }
+      statements.push(`
+        insert into conversation_messages (conversation_id, sequence, message_id, created_at, payload_json)
+        select ${sqlString(conversation.id)}, ${row.index}, ${sqlString(row.id)},
+          ${sqlString(row.createdAt)}, ${sqlString(row.json)}
+        where ${owned}
+        on conflict(conversation_id, sequence) do update set
+          message_id = excluded.message_id,
+          created_at = excluded.created_at,
+          payload_json = excluded.payload_json;
+      `);
+    }
+    await this.runSql(`
+      begin immediate;
+      update conversations set
+        title = ${sqlString(conversation.title)},
+        kind = ${sqlString(conversation.kind)},
+        updated_at = ${sqlString(conversation.updatedAt)},
+        repo_path = ${sqlString(conversation.repoPath)},
+        body_json = ${sqlString(bodyPayload)},
+        payload_json = ${sqlString(payload)}
+      where id = ${sqlString(conversation.id)} and save_token = ${sqlString(previous.token)};
+      ${statements.join("\n")}
+      ${alsoCommit ? alsoCommit.onlyIfSql(owned) : ""}
+      update conversations set save_token = ${sqlString(token)}
+        where id = ${sqlString(conversation.id)} and save_token = ${sqlString(previous.token)};
+      commit;
+    `);
+    const observed = await this.queryText(
+      `select save_token from conversations where id = ${sqlString(conversation.id)} limit 1;`
+    );
+    return observed === token;
+  }
+
+  /**
+   * Chats this device has been told are gone.
+   *
+   * A replicated copy cannot tell a new conversation from a stale snapshot of
+   * a deleted one; both are just rows arriving. The tombstone is what makes
+   * the difference, and it has to outlive the rows and the process.
+   */
+  conversationTombstones(): {
+    mark(conversationId: string, deletedAt: string): Promise<void>;
+    isDeleted(conversationId: string): Promise<boolean>;
+    deletedAt(conversationId: string): Promise<string | undefined>;
+    pendingCopies(): Promise<Array<{ conversationId: string; deletedAt: string }>>;
+  } {
+    return {
+      mark: async (conversationId, deletedAt) => {
+        await this.init();
+        await this.runSql(`begin immediate; ${this.conversationDeletionSql(conversationId, deletedAt)} commit;`);
+      },
+      isDeleted: async (conversationId) => Boolean(await this.conversationTombstones().deletedAt(conversationId)),
+      deletedAt: async (conversationId) => {
+        await this.init();
+        const rows = await this.queryJson<{ deletedAt: string }>(
+          `select deleted_at as deletedAt from deleted_conversations where conversation_id = ${sqlString(conversationId)};`);
+        return rows[0]?.deletedAt;
+      },
+      pendingCopies: async () => {
+        await this.init();
+        return this.queryJson<{ conversationId: string; deletedAt: string }>(`select d.conversation_id as conversationId, d.deleted_at as deletedAt
+          from deleted_conversations d join conversations c on c.id = d.conversation_id order by d.conversation_id limit 100;`);
+      }
+    };
+  }
+
+  private conversationDeletionSql(conversationId: string, deletedAt: string): string {
+    if (!conversationId.trim() || !deletedAt.trim()) throw new Error("A deletion tombstone requires stable identities.");
+    return `insert into deleted_conversations(conversation_id, deleted_at)
+      values (${sqlString(conversationId)}, ${sqlString(deletedAt)}) on conflict(conversation_id) do nothing;`;
+  }
+
+  nativeCommands(): NativeCommandStore {
+    return new NativeCommandStore({ init: () => this.init(), query: <T>(sql: string) => this.queryJson<T>(sql), execute: sql => this.runSql(sql) });
+  }
+
+  machinePower(): MachinePowerStore {
+    return new MachinePowerStore({ init: () => this.init(), query: <T>(sql: string) => this.queryJson<T>(sql), execute: sql => this.runSql(sql) });
+  }
+
+  /** The hub's tables: on the hub, its roster, phone pairing, notices and
+   *  push subscriptions; on a device that uses one, where it stands with it. */
+  hub(): HubStorage {
+    this.hubStorage ??= new HubStorage({
+      init: () => this.init(),
+      query: <T>(sql: string) => this.queryJson<T>(sql),
+      execute: (sql: string) => this.runSql(sql)
+    });
+    return this.hubStorage;
+  }
+
+  /** This device's operations for the User's server, and its failed sends. */
+  hubClientOps(): HubClientOpsStore {
+    this.hubClientOpsStore ??= new HubClientOpsStore({
+      init: () => this.init(),
+      query: <T>(sql: string) => this.queryJson<T>(sql),
+      execute: (sql: string) => this.runSql(sql)
+    });
+    return this.hubClientOpsStore;
+  }
+
+  /** This database through its own session, for a store whose tables live
+   *  here too (the server's documents), so its changes and the server's
+   *  order can commit together. */
+  sqlExecutor(): { path: string; queryJson<T>(sql: string): Promise<T[]>; queryText(sql: string): Promise<string>; runSql(sql: string): Promise<void> } {
+    return {
+      path: this.dbPath,
+      queryJson: async <T>(sql: string) => {
+        await this.init();
+        return this.queryJson<T>(sql);
+      },
+      queryText: async (sql: string) => {
+        await this.init();
+        return this.queryText(sql);
+      },
+      runSql: async (sql: string) => {
+        await this.init();
+        await this.runSql(sql);
+      }
+    };
+  }
+
+  /** The server's accepted operations and turns (the User's server only). */
+  hubOps(): HubOpsStore {
+    this.hubOpsStore ??= new HubOpsStore({
+      init: () => this.init(),
+      query: <T>(sql: string) => this.queryJson<T>(sql),
+      execute: (sql: string) => this.runSql(sql)
+    });
+    return this.hubOpsStore;
+  }
+
+  /** The User's server's bodies (pictures, avatars); no other device keeps any. */
+  deviceEventBlobs(): DeviceEventBlobStorage {
+    this.deviceEventBlobStorage ??= new DeviceEventBlobStorage({
+      init: () => this.init(),
+      query: <T>(sql: string) => this.queryJson<T>(sql),
+      execute: (sql: string) => this.runSql(sql)
+    });
+    return this.deviceEventBlobStorage;
+  }
+
+  async getDeviceIdentityRecord(): Promise<DeviceIdentityRecord | undefined> {
+    await this.init();
+    const raw = await this.getSchemaMeta(DEVICE_IDENTITY_META_KEY);
+    if (!raw) {
+      return undefined;
+    }
+    const parsed = JSON.parse(raw) as DeviceIdentityRecord;
+    this.assertValidDeviceIdentityRecord(parsed);
+    return parsed;
+  }
+
+  async saveDeviceIdentityRecord(record: DeviceIdentityRecord): Promise<void> {
+    await this.init();
+    this.assertValidDeviceIdentityRecord(record);
+    await this.setSchemaMeta(DEVICE_IDENTITY_META_KEY, JSON.stringify(record));
+  }
+
+  /** Puts this database back into the shape an older build can open: the full
+   *  conversation copy is rebuilt from the body and the message rows, and the
+   *  schema version is lowered again. Nothing is deleted — the body and the
+   *  message rows stay exactly as they are, so running the current build again
+   *  afterwards simply raises the version back. This is the supported way to go
+   *  back to a previous version of the app; without it, raising the schema
+   *  version would be a one-way door. */
+  async prepareStorageForOlderVersion(): Promise<{ conversations: number; schemaVersion: number }> {
+    await this.init();
+    const rows = await this.queryJson<{ total: number }>("select count(*) as total from conversations;");
+    await this.runSql(`
+      begin immediate;
+      update conversations
+      set payload_json = json_set(
+        coalesce(nullif(body_json, ''), payload_json),
+        '$.messages',
+        coalesce(
+          (
+            select json_group_array(json(ordered.message_json))
+            from (
+              select m.payload_json as message_json
+              from conversation_messages m
+              where m.conversation_id = conversations.id
+              order by m.sequence
+            ) as ordered
+          ),
+          json_array()
+        )
+      )
+      where json_valid(coalesce(nullif(body_json, ''), payload_json));
+      commit;
+    `, SQLITE_MIGRATION_TIMEOUT_MS);
+    await this.setSchemaMeta(STORAGE_SCHEMA_VERSION_META_KEY, String(PREVIOUS_STORAGE_SCHEMA_VERSION));
+    // Anything this process believed about the rows it wrote is meaningless to
+    // the build that opens the database next.
+    this.savedMessageStateCache = undefined;
+    return { conversations: rows[0]?.total ?? 0, schemaVersion: PREVIOUS_STORAGE_SCHEMA_VERSION };
+  }
+
+  async createPreMigrationBackup(label: string): Promise<string> {
+    await this.init();
+    return this.backUpDatabaseTo(label);
+  }
+
+  private async backUpDatabaseTo(label: string): Promise<string> {
+    const safeLabel = label.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+    if (!safeLabel) {
+      throw new Error("Pre-migration backup label is required.");
+    }
+    const backupPath = `${this.dbPath}.${safeLabel}.bak`;
+    await this.runSql(`vacuum into ${sqlString(backupPath)};`, SQLITE_MIGRATION_TIMEOUT_MS);
+    return backupPath;
+  }
+
+  async deleteConversation(id: string, options: { alsoCommitSql?: string } = {}): Promise<boolean> {
     await this.init();
     const exists = await this.queryText(
       `select id from conversations where id = ${sqlString(id)} limit 1;`
@@ -1175,12 +2084,71 @@ export class StorageService {
       return false;
     }
     await this.runSql(`
-      begin;
+      begin immediate;
+      ${this.conversationDeletionSql(id, new Date().toISOString())}
       delete from conversation_messages where conversation_id = ${sqlString(id)};
       delete from conversations where id = ${sqlString(id)};
+      ${options.alsoCommitSql ?? ""}
       commit;
     `);
+    this.savedMessageState.delete(id);
     return true;
+  }
+
+  /**
+   * Drops, once, what devices and the server kept for the order of signed
+   * events they used before the User's server owned the chats (agreement
+   * Д7): nothing reads any of it any more. A large table (the computer's
+   * event log is about 1.6 GB on the User's machine) is emptied a bounded
+   * batch at a time, each its own short transaction, so chats keep saving
+   * while it goes; the freed space stays in the file (no VACUUM: on a 4 GB
+   * database it would hold everything for minutes). `keepBodies` keeps the
+   * pictures and avatars the server holds. Stops early when `signal` aborts
+   * and carries on at the next call; a database without these tables is
+   * left alone at once.
+   */
+  async dropLegacyEventTables(options: {
+    keepBodies: boolean;
+    signal?: AbortSignal;
+    log?: (event: string, payload: Record<string, unknown>) => void;
+    batchRows?: number;
+    pauseMs?: number;
+  }): Promise<{ tables: string[]; rows: number; done: boolean }> {
+    await this.init();
+    const wanted = [...LEGACY_EVENT_TABLES, ...(options.keepBodies ? [] : LEGACY_BODY_TABLES)];
+    const present = new Set((await this.queryJson<{ name: string }>(
+      `select name from sqlite_master where type = 'table' and name in ${sqlStringList(wanted)};`
+    )).map((row) => row.name));
+    const batch = Math.max(1, Math.floor(options.batchRows ?? LEGACY_DROP_BATCH_ROWS));
+    const pauseMs = Math.max(0, Math.floor(options.pauseMs ?? LEGACY_DROP_PAUSE_MS));
+    const started = Date.now();
+    const dropped: string[] = [];
+    let rows = 0;
+    const stopped = (): boolean => options.signal?.aborted === true;
+    for (const table of wanted) {
+      if (!present.has(table)) continue;
+      for (;;) {
+        if (stopped()) return { tables: dropped, rows, done: false };
+        const [result] = await this.queryJson<{ deleted: number }>(
+          `delete from ${table} where rowid in (select rowid from ${table} limit ${batch}); select changes() as deleted;`
+        );
+        const deleted = Number(result?.deleted ?? 0) || 0;
+        rows += deleted;
+        if (deleted < batch) break;
+        await new Promise((resolve) => setTimeout(resolve, pauseMs));
+      }
+      await this.runSql(`drop table if exists ${table};`);
+      dropped.push(table);
+    }
+    // What this device kept about where it stood in the old order.
+    await this.runSql(`
+      delete from schema_meta where key in ${sqlStringList(LEGACY_META_KEYS)};
+      delete from hub_client_state where key in ${sqlStringList(LEGACY_CLIENT_STATE_KEYS)};
+    `).catch(() => undefined);
+    if (dropped.length > 0) {
+      options.log?.("storage.legacy-tables.dropped", { tables: dropped, rows, ms: Date.now() - started });
+    }
+    return { tables: dropped, rows, done: true };
   }
 
   private async ensureColumn(table: string, column: string, definition: string): Promise<void> {
@@ -1189,6 +2157,69 @@ export class StorageService {
       return;
     }
     await this.runSql(`alter table ${table} add column ${column} ${definition};`);
+  }
+
+  private async ensureSchemaMetaTable(): Promise<void> {
+    await this.runSql(`
+      create table if not exists schema_meta (
+        key text primary key,
+        value text not null
+      );
+    `);
+  }
+
+  private async configureSqliteRuntime(): Promise<void> {
+    const journalMode = (await this.queryText("pragma journal_mode = wal;")).toLowerCase();
+    if (journalMode && journalMode !== "wal") {
+      console.warn(`[StorageService] SQLite journal_mode=wal requested, got ${journalMode}.`);
+    }
+  }
+
+  /** Raising the schema version is what stops an older build from destroying
+   *  this database, but it also means that build can no longer open it. A copy
+   *  taken the moment before the version rises is the floor under that: whatever
+   *  goes wrong afterwards, the database as the previous version left it is
+   *  still on disk, next to the live one. Taken once — a second upgrade of an
+   *  already-upgraded database finds the version unchanged and does nothing. */
+  private async backUpBeforeSchemaUpgrade(): Promise<void> {
+    const storedVersion = parseStorageSchemaVersion(await this.getSchemaMeta(STORAGE_SCHEMA_VERSION_META_KEY));
+    if (storedVersion === undefined || storedVersion >= SUPPORTED_STORAGE_SCHEMA_VERSION) {
+      return;
+    }
+    try {
+      // Deliberately not `createPreMigrationBackup`: this runs from inside
+      // `init`, and that method starts by awaiting `init` itself, which would
+      // re-enter it before `initialized` is set and never return.
+      const backupPath = await this.backUpDatabaseTo(`schema-${storedVersion}`);
+      console.info(`[StorageService] Backed up the chat database before upgrading it to schema ${SUPPORTED_STORAGE_SCHEMA_VERSION}: ${backupPath}`);
+    } catch (error) {
+      // A missing backup must not stop the app from opening. It is a safety net,
+      // and the upgrade itself is not destructive — the old copy is what the
+      // user loses the option of, not their data.
+      console.warn(`[StorageService] Could not back up the chat database before the schema upgrade: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async assertSupportedSchemaVersion(): Promise<void> {
+    const storedVersion = parseStorageSchemaVersion(await this.getSchemaMeta(STORAGE_SCHEMA_VERSION_META_KEY));
+    if (storedVersion !== undefined && storedVersion > SUPPORTED_STORAGE_SCHEMA_VERSION) {
+      throw new UnsupportedStorageSchemaVersionError(storedVersion, SUPPORTED_STORAGE_SCHEMA_VERSION);
+    }
+  }
+
+  private assertValidDeviceIdentityRecord(record: DeviceIdentityRecord): void {
+    const requiredStrings = [
+      ["originId", record.originId],
+      ["keyId", record.keyId],
+      ["publicKeyDerBase64", record.publicKeyDerBase64],
+      ["privateKeyDerBase64", record.privateKeyDerBase64],
+      ["createdAt", record.createdAt]
+    ] as const;
+    for (const [field, value] of requiredStrings) {
+      if (typeof value !== "string" || !value.trim()) {
+        throw new Error(`This device's identity requires ${field}.`);
+      }
+    }
   }
 
   private async backfillConversationBodiesAndMessages(): Promise<void> {
@@ -1229,18 +2260,19 @@ export class StorageService {
   }
 
   private async clearInterruptedRuns(): Promise<void> {
+    // Run state lives in conversation metadata, which is what `body_json` holds.
+    // The legacy full payload is only consulted for rows written before the
+    // split; searching it for current rows would match a frozen copy and act on
+    // state that is no longer true.
+    const runMarkers = ["\"running\":true", "\"activeRunIds\":[", "\"participantCompactionsByParticipantId\":"];
     const ids = await this.queryConversationIds(
-      "payload_json like '%\"running\":true%' or payload_json like '%\"activeRunIds\":[%' or payload_json like '%\"participantCompactionsByParticipantId\":%'"
+      runMarkers.map((marker) =>
+        `coalesce(nullif(body_json, ''), payload_json) like '%${marker}%'`
+      ).join(" or ")
     );
     for (const id of ids) {
-      const payloadJson = await this.readConversationPayloadById(id);
-      if (!payloadJson) {
-        continue;
-      }
-      let conversation: Conversation;
-      try {
-        conversation = JSON.parse(payloadJson) as Conversation;
-      } catch {
+      const conversation = await this.readWholeConversation(id);
+      if (!conversation) {
         continue;
       }
       const activeRunIds = Array.isArray(conversation.metadata.activeRunIds) ? conversation.metadata.activeRunIds : [];
@@ -1271,16 +2303,19 @@ export class StorageService {
       return;
     }
 
-    const ids = await this.queryConversationIds("payload_json like '%\"source\":\"inferred\"%'");
+    // This marker sits in message metadata, not conversation metadata, so it is
+    // not in `body_json` at all — the message rows are where it has to be looked
+    // for. Rows written before the split have no body and no message rows yet,
+    // so their legacy payload is still searched.
+    const ids = await this.queryConversationIds(
+      `exists (
+        select 1 from conversation_messages m
+        where m.conversation_id = conversations.id and m.payload_json like '%"source":"inferred"%'
+      ) or (coalesce(body_json, '') = '' and payload_json like '%"source":"inferred"%')`
+    );
     for (const id of ids) {
-      const payloadJson = await this.readConversationPayloadById(id);
-      if (!payloadJson) {
-        continue;
-      }
-      let conversation: Conversation;
-      try {
-        conversation = JSON.parse(payloadJson) as Conversation;
-      } catch {
+      const conversation = await this.readWholeConversation(id);
+      if (!conversation) {
         continue;
       }
       if (!normalizeInferredParticipantRequestThreadMetadata(conversation)) {
@@ -1289,6 +2324,67 @@ export class StorageService {
       await this.saveConversation(conversation);
     }
     await this.setSchemaMeta(INFERRED_REQUEST_THREAD_MIGRATION_KEY, SCHEMA_META_COMPLETE);
+  }
+
+  /** Chats holding an approved roster change that had not been applied yet
+   *  (ChatAppToolApproval.memberRemovalQueuedAt or memberAdditionQueuedAt);
+   *  read once at startup. */
+  async conversationIdsWithQueuedRosterChanges(): Promise<string[]> {
+    await this.init();
+    return this.queryConversationIds(
+      `coalesce(nullif(body_json, ''), payload_json) like '%"memberRemovalQueuedAt":%'` +
+      ` or coalesce(nullif(body_json, ''), payload_json) like '%"memberAdditionQueuedAt":%'`
+    );
+  }
+
+  /** Chats that may hold a card a member waits on: an approval waiting (or
+   *  an approved roster change not made yet), a member's choice waiting, its
+   *  mentions waiting for approval, or another device's card answered and
+   *  shown here as waiting. Read at a start and a reconnect, so the cards on
+   *  the User's server match them (ChatService.resumeServerCards). Without
+   *  `messages` only the chats' bodies are read (a reconnect): every message
+   *  row is read only at a start. */
+  async conversationIdsWithOpenCards(options: { messages?: boolean } = {}): Promise<string[]> {
+    await this.init();
+    const messages = options.messages !== false;
+    const bodies = `
+      select id from conversations
+        where kind = 'chat'
+          and coalesce(nullif(body_json, ''), payload_json) like '%"pendingAppToolApprovals":[{%'
+          and json_valid(coalesce(nullif(body_json, ''), payload_json))
+          and exists (
+            select 1 from json_each(coalesce(nullif(body_json, ''), payload_json), '$.metadata.pendingAppToolApprovals') as approval
+            where json_extract(approval.value, '$.status') = 'pending'
+              or json_extract(approval.value, '$.memberRemovalQueuedAt') is not null
+              or json_extract(approval.value, '$.memberAdditionQueuedAt') is not null
+              or json_extract(approval.value, '$.machineDecisionPending') is not null
+          )`;
+    const rows = await this.queryJson<{ id: string }>(`${bodies}${messages ? `
+      union
+      select distinct m.conversation_id as id from conversation_messages m
+        where (m.payload_json like '%"pendingChoice":%' or m.payload_json like '%"pendingMentions":%' or m.payload_json like '%"serverCard":%')
+          and json_valid(m.payload_json)
+          and (
+            json_extract(m.payload_json, '$.metadata.pendingChoice.status') = 'pending'
+            or json_extract(m.payload_json, '$.metadata.serverCard') is not null
+            or exists (
+              select 1 from json_each(m.payload_json, '$.metadata.pendingMentions') as mention
+              where json_extract(mention.value, '$.status') = 'pending'
+            )
+          )` : ""};`);
+    return rows.flatMap((row) => typeof row.id === "string" && row.id.trim() ? [row.id] : []);
+  }
+
+  /** The chats holding a member's choice that still waits for the User
+   *  (ChatService.resumeChoiceExpiry). */
+  async conversationIdsWithPendingChoices(): Promise<string[]> {
+    await this.init();
+    const rows = await this.queryJson<{ id: string }>(`
+      select distinct m.conversation_id as id from conversation_messages m
+        where m.payload_json like '%"pendingChoice":%'
+          and json_valid(m.payload_json)
+          and json_extract(m.payload_json, '$.metadata.pendingChoice.status') = 'pending';`);
+    return rows.flatMap((row) => typeof row.id === "string" && row.id.trim() ? [row.id] : []);
   }
 
   private async queryConversationIds(whereSql: string): Promise<string[]> {
@@ -1445,13 +2541,6 @@ export class StorageService {
     return [...byKey.values()];
   }
 
-  private async readConversationPayloadById(id: string): Promise<string | undefined> {
-    const payloadJson = await this.queryText(
-      `select payload_json from conversations where id = ${sqlString(id)} limit 1;`
-    );
-    return payloadJson || undefined;
-  }
-
   private async getSchemaMeta(key: string): Promise<string | undefined> {
     const value = await this.queryText(`select value from schema_meta where key = ${sqlString(key)} limit 1;`);
     return value || undefined;
@@ -1466,32 +2555,20 @@ export class StorageService {
   }
 
   private async queryJson<T>(sql: string): Promise<T[]> {
-    const result = await runCommand(this.sqliteExecutable ?? "sqlite3", this.sqliteArgs(["-json", this.dbPath, sql]), {
-      timeoutMs: SQLITE_COMMAND_TIMEOUT_MS,
-      primeLoginShellEnv: false
-    });
-    const text = result.stdout.trim();
+    const text = (await this.databaseSession().run(sql, "json", SQLITE_COMMAND_TIMEOUT_MS)).trim();
     return text ? (JSON.parse(text) as T[]) : [];
   }
 
   private async queryText(sql: string): Promise<string> {
-    const result = await runCommand(this.sqliteExecutable ?? "sqlite3", this.sqliteArgs(["-batch", "-noheader", this.dbPath, sql]), {
-      timeoutMs: SQLITE_COMMAND_TIMEOUT_MS,
-      primeLoginShellEnv: false
-    });
-    return result.stdout.trim();
+    return (await this.databaseSession().run(sql, "list", SQLITE_COMMAND_TIMEOUT_MS)).trim();
   }
 
   private async runSql(sql: string, timeoutMs = SQLITE_COMMAND_TIMEOUT_MS): Promise<void> {
-    await runCommand(this.sqliteExecutable ?? "sqlite3", this.sqliteArgs([this.dbPath]), {
-      input: sql,
-      timeoutMs,
-      primeLoginShellEnv: false
-    });
+    await this.databaseSession().run(sql, "list", timeoutMs);
   }
 
-  private sqliteArgs(args: string[]): string[] {
-    return ["-cmd", `.timeout ${SQLITE_BUSY_TIMEOUT_MS}`, ...args];
+  private databaseSession(): SqliteSession {
+    return this.sqliteSession ??= new SqliteSession(this.sqliteExecutable ?? "sqlite3", this.dbPath, SQLITE_BUSY_TIMEOUT_MS);
   }
 }
 
@@ -1526,6 +2603,18 @@ function conversationBody(conversation: Conversation): Conversation {
     ...conversation,
     messages: []
   };
+}
+
+function rowsMatchMessages(rows: SavedMessageRow[] | undefined, messages: ChatMessage[]): rows is SavedMessageRow[] {
+  if (!rows || rows.length !== messages.length) {
+    return false;
+  }
+  for (let index = 0; index < rows.length; index += 1) {
+    if (rows[index].index !== index || rows[index].id !== messages[index].id) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function messagePageInfo(page: ConversationMessagePage): ConversationMessagePageInfo {

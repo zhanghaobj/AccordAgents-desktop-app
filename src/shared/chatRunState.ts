@@ -1,6 +1,6 @@
 import type { ChatParticipantCompactionState } from "./types";
 
-const PARTICIPANT_COMPACTIONS_KEY = "participantCompactionsByParticipantId";
+export const PARTICIPANT_COMPACTIONS_KEY = "participantCompactionsByParticipantId";
 const ACTIVE_RUN_OWNERS_KEY = "activeRunOwnersByRunId";
 const ACTIVE_RUN_PARTICIPANTS_KEY = "activeRunParticipantIdsByRunId";
 
@@ -59,6 +59,20 @@ export function conversationIsRunning(metadata: Record<string, unknown>): boolea
     return true;
   }
   return metadata.running === true;
+}
+
+export function readActiveRunOwnerIds(metadata: Record<string, unknown>): Set<string> {
+  const raw = metadata[ACTIVE_RUN_OWNERS_KEY];
+  const ids = new Set<string>();
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return ids;
+  }
+  for (const [runId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (runId.trim() && value && typeof value === "object" && !Array.isArray(value)) {
+      ids.add(runId);
+    }
+  }
+  return ids;
 }
 
 export function readActiveRunParticipants(metadata: Record<string, unknown>): Map<string, string> {

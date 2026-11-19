@@ -1,0 +1,207 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
+import { DevicePairingSection, forgetDevicePairingForTests } from "./device-pairing-section";
+import type { MobileControlSettings } from "../../../shared/types";
+
+// The DOM comes from scripts/renderer-jsdom-setup.mjs via `node --import`; it
+// cannot be installed here, because Radix reads `globalThis.document` when it
+// is first imported, which happens before this file's body runs. Running this
+// file without that flag renders an empty page and reports no error, so fail
+// immediately and say which script to use instead.
+assert.ok(
+  (globalThis as unknown as { ACCORD_RENDERER_JSDOM?: boolean }).ACCORD_RENDERER_JSDOM,
+  "this test needs a DOM installed before its imports — run it via `npm run test:renderer-components`, " +
+    "which passes `--import ./scripts/renderer-jsdom-setup.mjs`"
+);
+
+// The code for the User's server: its address, a one-time token and its id.
+const PAIRING = {
+  inviteId: "invite-1",
+  expiresAt: "2026-08-17T00:00:00.000Z",
+  pwaUrl: "https://mobile.example.com/?pair=server#hub=https%3A%2F%2Fhub.example&t=token&id=hub-1",
+  qrPayload: "https://mobile.example.com/?pair=server#hub=https%3A%2F%2Fhub.example&t=token&id=hub-1"
+};
+
+const MOBILE_CONTROL: MobileControlSettings = {
+  provider: "accord-managed",
+  defaults: { staticOriginUrl: "https://mobile.example.com/" }
+};
+
+function buttonByText(text: string): HTMLButtonElement | undefined {
+  return [...document.querySelectorAll("button")].find(
+    (node) => (node.textContent ?? "").trim() === text
+  ) as HTMLButtonElement | undefined;
+}
+
+// Creating a pairing renders the QR code asynchronously and holds the section in
+// its busy state until that resolves, which disables every control. Waiting for
+// the named button to become clickable keeps the test off that race.
+async function clickableButton(text: string): Promise<HTMLButtonElement> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const found = buttonByText(text);
+    if (found && !found.disabled) {
+      return found;
+    }
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    });
+  }
+  throw new Error(`"${text}" never became clickable`);
+}
+
+// Before a pairing exists there is nothing to show a code for and nothing to
+// copy or revoke, so the section offers Generate alone.
+test("the untouched section shows no QR panel and no copy or revoke", async () => {
+  (globalThis as unknown as { window: { consensus: unknown } }).window.consensus = {
+    getHubSetupState: async () => ({ status: "ready", url: "https://52.72.175.0", bundledVersion: "1.0.0" }),
+    onHubSetupProgress: () => () => undefined,
+    createPhoneInvite: async () => PAIRING,
+    revokePhoneInvite: async () => undefined
+  };
+
+  forgetDevicePairingForTests();
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  await act(async () => {
+    root.render(<DevicePairingSection mobileControl={MOBILE_CONTROL} />);
+  });
+
+  assert.equal(document.querySelector(".device-pairing-qr"), null, "no empty QR square before generating");
+  assert.equal(buttonByText("Revoke"), undefined, "nothing to revoke yet");
+  assert.equal(buttonByText("Copy URL"), undefined, "nothing to copy yet");
+  assert.ok(buttonByText("Generate"), "Generate is the only action");
+
+  const create = await clickableButton("Generate");
+  await act(async () => {
+    create.click();
+  });
+
+  assert.ok(document.querySelector(".device-pairing-qr"), "the QR panel appears with the pairing");
+  assert.ok(buttonByText("Revoke"), "Revoke appears with the pairing");
+  assert.ok(buttonByText("Copy URL"), "Copy URL appears with the pairing");
+
+  await act(async () => {
+    root.unmount();
+  });
+});
+
+// W-J: revocation is terminal — the code stops working on the User's server and
+// a phone paired with it is removed — so one click must not be enough to fire it.
+test("device pairing does not revoke until the confirmation is accepted", async () => {
+  const revokeCalls: unknown[] = [];
+  (globalThis as unknown as { window: { consensus: unknown } }).window.consensus = {
+    getHubSetupState: async () => ({ status: "ready", url: "https://52.72.175.0", bundledVersion: "1.0.0" }),
+    onHubSetupProgress: () => () => undefined,
+    createPhoneInvite: async () => PAIRING,
+    revokePhoneInvite: async (request: unknown) => {
+      revokeCalls.push(request);
+    }
+  };
+
+  forgetDevicePairingForTests();
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+
+  await act(async () => {
+    root.render(
+      <DevicePairingSection mobileControl={MOBILE_CONTROL} />
+    );
+  });
+
+  const create = await clickableButton("Generate");
+  await act(async () => {
+    create.click();
+  });
+
+  const revoke = await clickableButton("Revoke");
+  await act(async () => {
+    revoke.click();
+  });
+  assert.equal(revokeCalls.length, 0, "the first click arms the confirmation, it must not revoke");
+  const armed = buttonByText("Revoke permanently");
+  assert.ok(armed, "the armed control says that revoking is permanent");
+  assert.match(
+    document.body.textContent ?? "",
+    /cannot be undone/i,
+    "the armed control explains that revoking cannot be undone"
+  );
+
+  await act(async () => {
+    armed.click();
+  });
+  assert.equal(revokeCalls.length, 1, "the second click revokes");
+
+  await act(async () => {
+    root.unmount();
+  });
+});
+
+// Settings unmounts the moment the user leaves the screen. If the pairing handle
+// died with it, a paired phone could never be revoked from the UI again.
+test("the pairing survives leaving and reopening settings", async () => {
+  (globalThis as unknown as { window: { consensus: unknown } }).window.consensus = {
+    getHubSetupState: async () => ({ status: "ready", url: "https://52.72.175.0", bundledVersion: "1.0.0" }),
+    onHubSetupProgress: () => () => undefined,
+    createPhoneInvite: async () => PAIRING,
+    revokePhoneInvite: async () => undefined
+  };
+
+  forgetDevicePairingForTests();
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  await act(async () => {
+    root.render(<DevicePairingSection mobileControl={MOBILE_CONTROL} />);
+  });
+
+  const create = await clickableButton("Generate");
+  await act(async () => {
+    create.click();
+  });
+  await clickableButton("Revoke");
+
+  // Leave settings.
+  await act(async () => {
+    root.unmount();
+  });
+
+  const reopened = createRoot(host);
+  await act(async () => {
+    reopened.render(<DevicePairingSection mobileControl={MOBILE_CONTROL} />);
+  });
+
+  const revokeAfterReopen = buttonByText("Revoke");
+  assert.ok(revokeAfterReopen, "the reopened section still offers Revoke");
+  assert.equal(revokeAfterReopen.disabled, false, "Revoke stays usable after reopening settings");
+
+  await act(async () => {
+    reopened.unmount();
+  });
+});
+
+test("without the User's server the phone cannot be paired, and the section says why", async () => {
+  forgetDevicePairingForTests();
+  let created = 0;
+  (globalThis as unknown as { window: { consensus: unknown } }).window.consensus = {
+    getHubSetupState: async () => ({ status: "none", bundledVersion: "1.0.0" }),
+    onHubSetupProgress: () => () => undefined,
+    createPhoneInvite: async () => { created += 1; throw new Error("not reached"); }
+  };
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  await act(async () => {
+    root.render(<DevicePairingSection mobileControl={{ provider: "accord-managed", defaults: { staticOriginUrl: "https://mobile.accordagents.com/" } }} />);
+  });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+  const generate = host.querySelector("[data-device-pairing-action=generate]") as HTMLButtonElement;
+  assert.equal(generate.disabled, true);
+  assert.match(host.querySelector("[data-testid=device-pairing-desc]")?.textContent ?? "", /Set up your server first/);
+  await act(async () => { generate.click(); });
+  assert.equal(created, 0);
+  await act(async () => { root.unmount(); host.remove(); });
+});

@@ -1,9 +1,13 @@
+import { CloudProviderAuth } from "../cloud-provider-auth";
 import { memo, useState } from "react";
+import { messageDelivery } from "../../../shared/messageDelivery";
+import { ChatMessageRefusal } from "./chat-message-refusal";
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronUp, Copy, FileText, ListChecks, RefreshCw, Reply, Smile, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { canCompactParticipant } from "../../../shared/chatParticipantStatus";
+import { machineAnswerPendingText, machineStopPendingText, machineWaitingText } from "../../../shared/machineWaitingText";
 import type {
   AgentContextUsage,
   AgentRunProgress,
@@ -34,14 +38,19 @@ import {
   participantRequestStatusLabel,
   providerLabel
 } from "./chat-conversation-data";
-import { formatChatTime } from "./chat-format";
+import { ChatArtifactNoteCard, artifactNoteCardForMessage } from "./chat-artifact-note-card";
+import { ChatTurnFinishedNote } from "./chat-turn-finished-note";
+import { ChatAccordLaunchCard, accordLaunchCardForMessage } from "./chat-accord-launch-card";
+import { turnFinishedNoteOf } from "../../../shared/turnFinishedNoteSource";
 import { ChatChoiceCard } from "./chat-choice-card";
+import { chatMessageCards } from "./chat-server-card";
 import { ChatImageAttachmentStrip } from "./chat-image-attachments";
-import { ChatExpandedProcessingTranscript, StreamingMessageContent } from "./chat-streaming";
+import { ChatExpandedProcessingTranscript, ChatMessageWhen, StreamingMessageContent } from "./chat-streaming";
 import { ChatMessageReactionList } from "./chat-message-reactions";
 import { chatReplyPreviewAvatars } from "./chat-reply-preview";
 import { Avatar, avatarForMessage } from "../avatar/avatar";
 import { MarkdownText } from "../content/markdown-text";
+import { FileLinkAuthorContext } from "../files/file-panel-context";
 import { AgentAvatarWithDetails, type ParticipantCompactContext, type ParticipantCompactHandler } from "../content/participant-hover-card";
 import { CHAT_ASSISTANT_ROLE_ID, authorForMessage, chatParticipantReference } from "../conversation/conversation-display";
 import { IconButton, StatusBadge } from "../primitives";
@@ -49,9 +58,6 @@ import { RosterStatusIndicator, type ChatParticipantRosterStatus } from "./chat-
 import { WorkedRow } from "./chat-worked-row";
 import { ChatAppToolApprovalList } from "./chat-app-tool-approvals";
 import type { ChatActivityDisclosureState } from "./use-chat-activity-disclosure";
-
-const MESSAGE_ACTION_CLASS = "message-action size-[26px] min-h-[26px] rounded-[8px] border-0 bg-transparent shadow-none";
-const MESSAGE_ACTION_STOP_CLASS = `${MESSAGE_ACTION_CLASS} message-action-stop`;
 
 declare global {
   interface Window {
@@ -65,6 +71,10 @@ export type ChatChoiceResponse = {
   customAnswer?: string;
   note?: string;
 };
+
+// A cloud member's file links name files on its machine (see FileLinkAuthorContext).
+const CLOUD_AUTHOR = { cloud: true };
+const LOCAL_AUTHOR = { cloud: false };
 
 export const ChatMessageItem = memo(function ChatMessageItem(props: {
   activityDisclosure: ChatActivityDisclosureState;
@@ -94,6 +104,8 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
   onRejectMentions: (sourceMessageId: string, targetParticipantIds: string[]) => void;
   onRespondToChoice: (sourceMessageId: string, choiceId: string, response: ChatChoiceResponse) => void | Promise<void>;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  /** Takes a turn-finished note away (its cross). */
+  onDismissTurnFinishedNote?: (messageId: string) => void;
   onCompactParticipant?: ParticipantCompactHandler;
   onStopRun?: (runId: string) => void;
   onRespondToAppToolApproval?: (
@@ -110,6 +122,22 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
   }
   const [copied, setCopied] = useState(false);
   const [reactionPickerOpen, setReactionPickerOpen] = useState(false);
+  const artifactNote = artifactNoteCardForMessage(message);
+  if (artifactNote) {
+    return <ChatArtifactNoteCard message={message} card={artifactNote} onToggleReaction={props.onToggleReaction} />;
+  }
+  const accordLaunch = accordLaunchCardForMessage(message);
+  const turnFinishedNote = turnFinishedNoteOf(message);
+  if (turnFinishedNote) {
+    return (
+      <ChatTurnFinishedNote
+        message={message}
+        note={turnFinishedNote}
+        participant={props.participants?.find((item) => item.id === turnFinishedNote.participantId)}
+        onDismiss={props.onDismissTurnFinishedNote}
+      />
+    );
+  }
   const processingTranscriptOpen = props.activityDisclosure.expandedProcessingTranscriptMessageIds.has(message.id);
   const author = authorForMessage(message, "chat");
   const isStreaming = message.status === "pending" && message.role === "participant";
@@ -140,9 +168,9 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
   const participantStatus: ChatParticipantRosterStatus = isStreaming
     ? "running"
     : props.participantStatusById.get(message.participantId ?? "") ?? "idle";
-  const pending = (message.metadata?.pendingMentions ?? []).filter((mention) => mention.status === "pending");
+  const { choice, choiceAnswered, mentionAnswered } = chatMessageCards(message);
+  const pending = mentionAnswered ? [] : (message.metadata?.pendingMentions ?? []).filter((mention) => mention.status === "pending");
   const approved = (message.metadata?.pendingMentions ?? []).filter((mention) => mention.status === "approved");
-  const choice = message.metadata?.pendingChoice;
   const participantRequest = message.metadata?.participantRequest;
   const participantRequests = [
     ...(participantRequest ? [participantRequest] : []),
@@ -160,6 +188,7 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
     omittedActivityEventCount: processingTranscript.omittedActivityEventCount
   }) : undefined;
   const queuedBehind = isStreaming ? message.metadata?.queuedBehind : undefined;
+  const stopPending = isStreaming ? message.metadata?.stopPending : undefined;
   const workedMs = typeof message.metadata?.workedMs === "number" && Number.isFinite(message.metadata.workedMs) && message.metadata.workedMs >= 0
     ? message.metadata.workedMs
     : undefined;
@@ -238,9 +267,45 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
     props.onToggleReaction(message.id, emoji);
   }
 
+  const reactAndReplyActions = (
+    <>
+      {canReact && (
+        <Popover open={reactionPickerOpen} onOpenChange={setReactionPickerOpen}>
+          <PopoverTrigger asChild>
+            <IconButton
+              size="xs"
+              icon={Smile}
+              label="Add reaction"
+              tooltip="Add reaction"
+            />
+          </PopoverTrigger>
+          <PopoverContent align="end" className="chat-reaction-popover">
+            <div className="chat-reaction-picker" aria-label="Choose reaction">
+              {CHAT_REACTION_EMOJIS.map((emoji) => (
+                <button type="button" className="chat-reaction-option" onClick={() => toggleReaction(emoji)} key={emoji}>
+                  {emoji}
+                </button>
+              ))}
+            </div>
+          </PopoverContent>
+        </Popover>
+      )}
+      {showThreadActions && (
+        <IconButton
+          size="xs"
+          icon={Reply}
+          label="Reply in thread"
+          tooltip="Reply in thread"
+          onClick={() => props.onOpenThread?.(message.id)}
+        />
+      )}
+    </>
+  );
+
+  const delivery = messageDelivery(message);
   return (
     <>
-      <article data-message-id={message.id} className={`message chat-message ${choice ? "has-choice" : ""} ${message.role} ${props.selected ? "selected-thread-root" : ""} ${props.inThread ? "in-thread" : ""} ${isStreaming ? "is-running" : ""}`}>
+      <article data-message-id={message.id} className={`message chat-message ${choice ? "has-choice" : ""} ${message.role} ${props.selected ? "selected-thread-root" : ""} ${props.inThread ? "in-thread" : ""} ${isStreaming ? "is-running" : ""} ${delivery?.state === "unsent" ? "is-unsent" : ""}`}>
         {message.role === "participant" ? (
           <AgentAvatarWithDetails
             className="message-avatar"
@@ -259,8 +324,9 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
           <div className="message-actions">
             {isStreaming && message.metadata?.runId && props.onStopRun && (
               <IconButton
-                className={MESSAGE_ACTION_STOP_CLASS}
+                className="message-action-stop"
                 size="xs"
+                tone="danger"
                 icon={X}
                 label="Stop response"
                 tooltip="Stop response"
@@ -269,7 +335,6 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
             )}
             {hasProcessingTranscript && (
               <IconButton
-                className={MESSAGE_ACTION_CLASS}
                 size="xs"
                 icon={processingTranscriptOpen ? ChevronUp : ChevronDown}
                 label={processingTranscriptOpen ? "Hide full stream" : "Show full stream"}
@@ -278,47 +343,18 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
                 onClick={() => props.activityDisclosure.toggleProcessingTranscript(message.id)}
               />
             )}
-            <IconButton
-              className={MESSAGE_ACTION_CLASS}
-              size="xs"
-              icon={copied ? CheckCircle2 : Copy}
-              label={copied ? "Copied" : "Copy message"}
-              tooltip={copied ? "Copied" : "Copy message"}
-              disabled={!canCopy}
-              onClick={() => void copyMessage()}
-            />
-            {canReact && (
-              <Popover open={reactionPickerOpen} onOpenChange={setReactionPickerOpen}>
-                <PopoverTrigger asChild>
-                  <IconButton
-                    className={MESSAGE_ACTION_CLASS}
-                    size="xs"
-                    icon={Smile}
-                    label="Add reaction"
-                    tooltip="Add reaction"
-                  />
-                </PopoverTrigger>
-                <PopoverContent align="end" className="chat-reaction-popover">
-                  <div className="chat-reaction-picker" aria-label="Choose reaction">
-                    {CHAT_REACTION_EMOJIS.map((emoji) => (
-                      <button type="button" className="chat-reaction-option" onClick={() => toggleReaction(emoji)} key={emoji}>
-                        {emoji}
-                      </button>
-                    ))}
-                  </div>
-                </PopoverContent>
-              </Popover>
-            )}
-            {showThreadActions && (
+            {/* An Accord launch's text is the prompt for its lead, not hers to copy. */}
+            {!accordLaunch && (
               <IconButton
-                className={MESSAGE_ACTION_CLASS}
                 size="xs"
-                icon={Reply}
-                label="Reply in thread"
-                tooltip="Reply in thread"
-                onClick={() => props.onOpenThread?.(message.id)}
+                icon={copied ? CheckCircle2 : Copy}
+                label={copied ? "Copied" : "Copy message"}
+                tooltip={copied ? "Copied" : "Copy message"}
+                disabled={!canCopy}
+                onClick={() => void copyMessage()}
               />
             )}
+            {reactAndReplyActions}
           </div>
           <div className="message-meta">
             <strong>{author}</strong>
@@ -335,15 +371,18 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
                 <RosterStatusIndicator
                   status={participantStatus}
                   runningRemotely={participant?.remoteExecution === "remote"}
+                  participantId={message.participantId}
                 />
               )
             )}
-            <span className="message-when">{formatChatTime(message.createdAt)}</span>
+            <ChatMessageWhen createdAt={message.createdAt} runningSince={isStreaming ? streamingStartedAt : undefined} />
             {!props.inThread && message.metadata?.parentMessageId && message.role === "user" && (
               <StatusBadge tone="neutral">reply</StatusBadge>
             )}
           </div>
           {showWorkedRow && <WorkedRow workedMs={workedMs} />}
+          {/* Every rendering of the content (streaming, transcript, final) knows its author. */}
+          <FileLinkAuthorContext.Provider value={participant?.cloudRun || participant?.homeMachineId ? CLOUD_AUTHOR : LOCAL_AUTHOR}>
           <div className="message-content">
             {isStreaming ? (
               <StreamingMessageContent
@@ -352,7 +391,6 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
                 activity={streamedActivity}
                 activityEvents={streamedActivityEvents}
                 statusLabel={streamedRemoteRunStatus?.label}
-                startedAt={streamingStartedAt}
               />
             ) : (
               <>
@@ -362,6 +400,8 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
                     view={processingTranscriptView}
                     activityEvents={activityEvents}
                   />
+                ) : accordLaunch ? (
+                  <ChatAccordLaunchCard card={accordLaunch} participants={props.participants} />
                 ) : (
                   <MarkdownText
                     content={displayContent}
@@ -371,6 +411,7 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
               </>
             )}
           </div>
+          </FileLinkAuthorContext.Provider>
           {props.appToolApprovals && props.appToolApprovals.length > 0 && props.onRespondToAppToolApproval && (
             <div className="chat-message-embedded-approvals">
               <ChatAppToolApprovalList
@@ -390,13 +431,29 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
               <span>Queued — waiting for @{queuedBehind.handle} to finish</span>
             </div>
           )}
+          {isStreaming && message.metadata?.cloudRunPreparation && !stopPending && (
+            <div className="chat-cloud-preparation" role="status">
+              <p title={message.metadata.cloudRunPreparation.message}>{message.metadata.cloudRunPreparation.message}</p>
+              {message.metadata.cloudRunPreparation.authUrl && <CloudProviderAuth {...message.metadata.cloudRunPreparation} authUrl={message.metadata.cloudRunPreparation.authUrl} />}
+            </div>
+          )}
+          {stopPending && (
+            <div className="chat-queued-badge">
+              <span>{machineStopPendingText(stopPending.machineName)}</span>
+            </div>
+          )}
+          {isStreaming && message.metadata?.machinePending && !stopPending && (
+            <div className="chat-queued-badge">
+              <span>{machineWaitingText(message.metadata.machinePending.machineName, message.metadata.machinePending.reason)}</span>
+            </div>
+          )}
           {repoFileMentions.length > 0 && (
             <div className="repo-file-reference-footer">
               <FileText size={14} />
               <span>Referenced: {repoFileMentions.map((mention) => mention.path).join(", ")}</span>
             </div>
           )}
-          {skillMentions.length > 0 && (
+          {skillMentions.length > 0 && !accordLaunch && (
             <div className="repo-file-reference-footer skill-reference-footer">
               <ListChecks size={14} />
               <span>Skills: {skillMentions.map((mention) => `${mention.displayName} (${mention.variants.map((variant) => providerLabel(variant.providerKind)).join(", ")})`).join(", ")}</span>
@@ -405,6 +462,7 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
           {imageAttachments.length > 0 && (
             <ChatImageAttachmentStrip conversationId={props.conversationId} attachments={imageAttachments} />
           )}
+          <ChatMessageRefusal delivery={delivery} />
           <ChatMessageReactionList reactions={reactionEntries} onToggleReaction={toggleReaction} />
           {participantRequests.map((request) => (
             <div className={`chat-approval-note ${participantRequestNoteClass(request)}`} key={request.id}>
@@ -424,6 +482,7 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
               )}
             </div>
           )}
+          {mentionAnswered && <div className="chat-queued-badge"><span>{machineAnswerPendingText(mentionAnswered.machineName)}</span></div>}
           {pending.length > 0 && (
             <div className="chat-approval-box">
               <div className="chat-approval-title-block">
@@ -468,6 +527,7 @@ export const ChatMessageItem = memo(function ChatMessageItem(props: {
               submitting={props.submittingChoiceIds?.has(choice.id) === true}
               onConfirm={(response) => props.onRespondToChoice(message.id, choice.id, response)}
             />
+            {choiceAnswered && <div className="chat-queued-badge"><span>{machineAnswerPendingText(choiceAnswered.machineName)}</span></div>}
             {threadActions}
           </div>
         </div>

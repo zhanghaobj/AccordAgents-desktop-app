@@ -1,8 +1,8 @@
-import { useState } from "react";
+import { useContext, useState } from "react";
 import type React from "react";
-import { AtSign, Check, ChevronDown, Minimize2, Trash2 } from "lucide-react";
+import { AtSign, Check, ChevronDown, Minimize2, RotateCcw, Trash2 } from "lucide-react";
 
-import { canCompactParticipant } from "../../../shared/chatParticipantStatus";
+import { canCompactParticipant, canRestartParticipant, memberProcessRestartable } from "../../../shared/chatParticipantStatus";
 import type {
   ChatParticipant,
   ChatParticipantConfig,
@@ -10,24 +10,28 @@ import type {
   ChatRoleParticipantDefaults,
   ChatParticipantWatcherPausedReason
 } from "../../../shared/types";
+import type { MemberRestartInProgress } from "../../../shared/memberRestart";
 import { IconButton } from "../primitives";
 import { chatParticipantDisplayName } from "../conversation/conversation-display";
 import { ParticipantRuntimeControls } from "./chat-participant-runtime-controls";
-import { chatCliProviderLabel, normalizeChatRunLocation, type ChatParticipantRuntimeOverride } from "./chat-participant-drafts";
+import { chatCliProviderLabel, type ChatParticipantRuntimeOverride } from "./chat-participant-drafts";
 import { cliProviderHostForParticipant } from "../../../shared/cliProviderHosts";
-import { RosterStatusIndicator, type ChatParticipantRosterStatus } from "./chat-roster-status";
+import { backgroundTasksStatusLabel, ChatBackgroundTasksContext, RosterStatusIndicator, type ChatParticipantRosterStatus } from "./chat-roster-status";
 
-type ParticipantRuntimePatch = Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch">;
+type ParticipantRuntimePatch = Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "cloudRun" | "homeMachineId" | "skipToolchainPreflight" | "autoWatch">;
 
 export function ChatParticipantRosterRow(props: {
   participant: ChatParticipant;
   removeDisabledReason: string | undefined;
-  isRunning: boolean;
+  /** Its own turn or compaction runs: its settings wait for it to end. */
+  busy: boolean;
   status: ChatParticipantRosterStatus;
   autoWatchDisabledReason?: string;
   autoWatchPausedReason?: ChatParticipantWatcherPausedReason;
   roleParticipantDefaults?: ChatRoleParticipantDefaults;
   runLocationLocked: boolean;
+  /** Changing where it runs moves it with its session. */
+  runLocationMoves?: boolean;
   renderParticipantAvatar: (participant: ChatParticipant) => React.ReactNode;
   participantRoleLabel: (participant: ChatParticipant) => string;
   participantRoleArchived: (participant: ChatParticipant) => boolean;
@@ -35,9 +39,15 @@ export function ChatParticipantRosterRow(props: {
   onJumpToLastMessage: (participant: ChatParticipant) => void;
   onUpdateParticipantRuntime: (
     participantId: string,
-    patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch">
+    patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "cloudRun" | "homeMachineId" | "skipToolchainPreflight" | "autoWatch">
   ) => void;
   onCompactParticipant: (participantId: string) => void;
+  /** Resolves once the restart ended (true when it worked). */
+  onRestartParticipant: (participantId: string, stopBackgroundTasks: boolean) => Promise<boolean>;
+  /** Stops waiting for a restart its machine has not taken. */
+  onStopRestart: (runId: string) => void;
+  /** Its restart has not ended (also after this row closed and opened again). */
+  restartStatus?: MemberRestartInProgress;
   onRemoveParticipant: (participantId: string) => void;
 }): JSX.Element {
   const displayName = chatParticipantDisplayName(props.participant);
@@ -45,6 +55,36 @@ export function ChatParticipantRosterRow(props: {
   const roleArchived = props.participantRoleArchived(props.participant);
   const [expanded, setExpanded] = useState(false);
   const compactDisabled = !canCompactParticipant(props.status);
+  const backgroundTasks = useContext(ChatBackgroundTasksContext).get(props.participant.id) ?? [];
+  const [confirmingRestart, setConfirmingRestart] = useState(false);
+  const [restartPending, setRestartPending] = useState(false);
+  // Also while the app waits for the member's machine, after this row closed.
+  const restarting = restartPending || props.restartStatus !== undefined;
+  // While its machine has not taken the restart, the spinning button stops it.
+  const restartWait = props.restartStatus?.waiting ? props.restartStatus : undefined;
+  const restartable = memberProcessRestartable(props.participant.kind);
+  const restartDisabled = restartWait ? false : restarting || !canRestartParticipant(props.status);
+  async function restart(stopBackgroundTasks: boolean): Promise<void> {
+    setConfirmingRestart(false);
+    setRestartPending(true);
+    try {
+      await props.onRestartParticipant(props.participant.id, stopBackgroundTasks);
+    } finally {
+      setRestartPending(false);
+    }
+  }
+  function onRestartButton(): void {
+    if (restartWait) {
+      props.onStopRestart(restartWait.runId);
+      return;
+    }
+    // Background work ends with the process: asked first, never silently.
+    if (backgroundTasks.length > 0) {
+      setConfirmingRestart(true);
+      return;
+    }
+    void restart(false);
+  }
   return (
     <div className={`chat-participant-row ${expanded ? "is-expanded" : "is-collapsed"}`}>
       <span className="chat-participant-avatar-slot" aria-hidden>
@@ -65,6 +105,7 @@ export function ChatParticipantRosterRow(props: {
                 <RosterStatusIndicator
                   status={props.status}
                   runningRemotely={props.participant.remoteExecution === "remote"}
+                  participantId={props.participant.id}
                 />
               </span>
             </span>
@@ -75,7 +116,6 @@ export function ChatParticipantRosterRow(props: {
           </button>
           <div className="chat-participant-row-actions">
             <IconButton
-              className="chat-participant-row-action chat-participant-row-disclosure"
               size="xs"
               icon={ChevronDown}
               iconClassName={expanded ? undefined : "-rotate-90"}
@@ -85,7 +125,6 @@ export function ChatParticipantRosterRow(props: {
               onClick={() => setExpanded((value) => !value)}
             />
             <IconButton
-              className="chat-participant-row-action"
               size="xs"
               icon={Minimize2}
               label={`Compact ${displayName} context`}
@@ -93,8 +132,25 @@ export function ChatParticipantRosterRow(props: {
               disabled={compactDisabled}
               onClick={() => props.onCompactParticipant(props.participant.id)}
             />
+            {restartable && (
+              <IconButton
+                size="xs"
+                icon={RotateCcw}
+                iconClassName={restarting ? "animate-spin" : undefined}
+                label={restartWait ? `Stop restarting ${displayName}` : `Restart ${displayName}`}
+                tooltip={restartWait
+                  ? "Stop waiting for the machine to restart this member."
+                  : restarting
+                    ? "Restarting…"
+                    : restartDisabled
+                      ? "This member is busy."
+                      : "Restart this member's process so its next reply picks up changed connectors and settings."}
+                disabled={restartDisabled}
+                aria-expanded={confirmingRestart || undefined}
+                onClick={onRestartButton}
+              />
+            )}
             <IconButton
-              className="chat-participant-row-action"
               size="xs"
               icon={AtSign}
               label={`Mention ${displayName}`}
@@ -102,8 +158,8 @@ export function ChatParticipantRosterRow(props: {
               onClick={() => props.onInsertMention(props.participant)}
             />
             <IconButton
-              className="chat-participant-row-action is-danger"
               size="xs"
+              tone="danger"
               icon={Trash2}
               label={`Remove ${displayName} from chat`}
               tooltip={props.removeDisabledReason ?? "Remove from chat"}
@@ -112,14 +168,32 @@ export function ChatParticipantRosterRow(props: {
             />
           </div>
         </div>
+        {restartWait && (
+          <div className="chat-participant-restart-note" role="status">{restartWait.message}</div>
+        )}
+        {/* Work that ended while asking needs no question any more. */}
+        {confirmingRestart && backgroundTasks.length > 0 && (
+          <div className="chat-participant-restart-confirm" role="group" aria-label={`Restart ${displayName}`}>
+            <span className="chat-participant-restart-confirm-text">
+              {`Restarting stops ${displayName}'s ${backgroundTasks.length === 1 ? "background task" : backgroundTasksStatusLabel(backgroundTasks.length)}.`}
+            </span>
+            <button type="button" className="chat-participant-restart-confirm-cancel" onClick={() => setConfirmingRestart(false)}>
+              Cancel
+            </button>
+            <button type="button" className="chat-participant-restart-confirm-ok" onClick={() => void restart(true)}>
+              Stop and restart
+            </button>
+          </div>
+        )}
         {expanded && (
           <ParticipantRuntimeControls
             participant={props.participant}
-            disabled={props.isRunning}
+            disabled={props.busy}
             autoWatchDisabledReason={props.autoWatchDisabledReason}
             autoWatchPausedReason={props.autoWatchPausedReason}
             roleParticipantDefaults={props.roleParticipantDefaults}
             runLocationLocked={props.runLocationLocked}
+            runLocationMoves={props.runLocationMoves}
             onUpdate={props.onUpdateParticipantRuntime}
           />
         )}
@@ -133,18 +207,20 @@ export function ChatParticipantSelectableRosterRow(props: {
   selected: boolean;
   locked?: boolean;
   disabledReason?: string;
+  /** The runtime controls; by default disabled with the member. */
+  controlsDisabled?: boolean;
   roleLabel: string;
   remoteExecution?: ChatParticipant["remoteExecution"];
   runtimeOverride?: ChatParticipantRuntimeOverride;
   renderParticipantAvatar: (participant: ChatParticipantConfig) => React.ReactNode;
   onToggleSelected: (participantId: string) => void;
-  onRunLocationChange: (participant: ChatParticipantConfig, remoteExecution: Exclude<ChatParticipant["remoteExecution"], undefined | "inherit">) => void;
   onRuntimeChange: (participant: ChatParticipantConfig, patch: ParticipantRuntimePatch) => void;
   cliProviderHosts?: CliProviderHost[];
 }): JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const displayName = chatParticipantDisplayName(props.participant);
-  const checkboxDisabled = Boolean(props.locked) || Boolean(props.disabledReason);
+  // A member that cannot run where it is set to can always be taken out again.
+  const checkboxDisabled = Boolean(props.locked) || (Boolean(props.disabledReason) && !props.selected);
   const runtimeOverride = props.runtimeOverride ?? {};
   const host = cliProviderHostForParticipant(props.participant.kind, props.participant.hostId, props.cliProviderHosts ?? []);
   const participant: ChatParticipant = {
@@ -156,7 +232,9 @@ export function ChatParticipantSelectableRosterRow(props: {
     reasoningEffort: "reasoningEffort" in runtimeOverride ? runtimeOverride.reasoningEffort : props.participant.reasoningEffort,
     agentMode: runtimeOverride.agentMode ?? props.participant.agentMode,
     permissions: runtimeOverride.permissions ?? props.participant.permissions,
-    remoteExecution: normalizeChatRunLocation(runtimeOverride.remoteExecution ?? props.remoteExecution ?? props.participant.remoteExecution),
+    remoteExecution: runtimeOverride.remoteExecution ?? props.remoteExecution ?? props.participant.remoteExecution,
+    homeMachineId: "homeMachineId" in runtimeOverride ? runtimeOverride.homeMachineId : props.participant.homeMachineId,
+    cloudRun: "cloudRun" in runtimeOverride ? runtimeOverride.cloudRun : props.participant.cloudRun,
     skipToolchainPreflight: runtimeOverride.skipToolchainPreflight ?? props.participant.skipToolchainPreflight,
     autoWatch: runtimeOverride.autoWatch ?? props.participant.autoWatchEnabled
   };
@@ -164,7 +242,6 @@ export function ChatParticipantSelectableRosterRow(props: {
   return (
     <div
       className={`chat-participant-row chat-participant-select-row ${props.selected ? "is-selected" : ""} ${expanded ? "is-expanded" : "is-collapsed"} ${props.disabledReason ? "is-disabled" : ""}`}
-      title={props.disabledReason}
     >
       <span className="chat-participant-avatar-slot" aria-hidden>
         {props.renderParticipantAvatar(props.participant)}
@@ -174,6 +251,7 @@ export function ChatParticipantSelectableRosterRow(props: {
           <button
             type="button"
             className="chat-participant-identity"
+            title={props.disabledReason}
             aria-expanded={expanded}
             onClick={() => setExpanded((value) => !value)}
           >
@@ -191,7 +269,6 @@ export function ChatParticipantSelectableRosterRow(props: {
           </button>
           <div className="chat-participant-row-actions">
             <IconButton
-              className="chat-participant-row-action chat-participant-row-disclosure"
               size="xs"
               icon={ChevronDown}
               iconClassName={expanded ? undefined : "-rotate-90"}
@@ -216,12 +293,9 @@ export function ChatParticipantSelectableRosterRow(props: {
         {expanded && (
           <ParticipantRuntimeControls
             participant={participant}
-            disabled={Boolean(props.disabledReason)}
+            disabled={props.controlsDisabled ?? Boolean(props.disabledReason)}
             runLocationLocked={false}
-            onUpdate={(_participantId, patch) => {
-              props.onRuntimeChange(props.participant, patch);
-              props.onRunLocationChange(props.participant, normalizeChatRunLocation(patch.remoteExecution));
-            }}
+            onUpdate={(_participantId, patch) => props.onRuntimeChange(props.participant, patch)}
           />
         )}
       </div>

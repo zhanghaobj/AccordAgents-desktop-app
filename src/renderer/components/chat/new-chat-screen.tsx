@@ -18,7 +18,6 @@ import {
   ImagePlus,
   Plus,
   RefreshCw,
-  Settings,
   XCircle
 } from "lucide-react";
 
@@ -30,11 +29,11 @@ import type {
   ChatParticipantConfig,
   CliProviderHost,
   ConversationSummary,
-  CloudRunRemoteExecutionMode,
   ChatSkillMention,
   GitRepoInfo,
   RepoFileMention
 } from "../../../shared/types";
+import { IconButton } from "../primitives";
 import {
   type AddableSavedParticipantConfig,
   type ChatParticipantRuntimeOverride,
@@ -43,12 +42,12 @@ import {
   NEW_CHAT_ASSISTANT_PARTICIPANT_ID,
   newChatAssistantParticipantConfig,
   newChatAssistantParticipantDraft,
-  normalizeChatRunLocation,
   selectedOrMentionedChatParticipantDrafts,
   validateChatStartupDrafts
 } from "./chat-participant-drafts";
+import { participantOptionInvalidReason } from "./chat-cli-readiness";
 import {
-  cliProviderMetadata,
+  assistantSubstituteNote,
   readyProviderKinds,
   resolveAssistantProviderKind
 } from "../../../shared/cliReadiness";
@@ -61,6 +60,8 @@ import {
   draftStartsWithPluginMention
 } from "./chat-composer-draft-utils";
 import { renderSlashHighlightedDraft } from "./chat-composer-draft-highlights";
+import { SpeechToTextButton } from "./speech-to-text-button";
+import { DICTATION_SESSION_ATTRIBUTE } from "./dictation-target";
 import { useChatComposerImages } from "./use-chat-composer-images";
 import { useChatComposerMentions } from "./use-chat-composer-mentions";
 import { sortSavedParticipantOptionsByUsage } from "./new-chat-participant-usage";
@@ -86,7 +87,6 @@ export function NewChatScreen(props: {
   repoPath: string;
   repoInfo?: GitRepoInfo;
   selectedParticipantIds: Set<string>;
-  selectedParticipantRunLocations: Record<string, CloudRunRemoteExecutionMode>;
   selectedParticipantRuntimeOverrides: Record<string, ChatParticipantRuntimeOverride>;
   settings: AppSettings;
   summaries: ConversationSummary[];
@@ -103,7 +103,6 @@ export function NewChatScreen(props: {
   onRepoBlur: (path?: string) => void;
   onSelectRepo: () => void;
   onSelectedParticipantIdsChange: Dispatch<SetStateAction<Set<string>>>;
-  onSelectedParticipantRunLocationsChange: Dispatch<SetStateAction<Record<string, CloudRunRemoteExecutionMode>>>;
   onSelectedParticipantRuntimeOverridesChange: Dispatch<SetStateAction<Record<string, ChatParticipantRuntimeOverride>>>;
   onOpenParticipantsSettings: () => void;
   onOpenProviderSettings: () => void;
@@ -130,9 +129,29 @@ export function NewChatScreen(props: {
     }),
     [props.agents, props.settings.assistantProviderKind, props.settings.providers]
   );
-  const unavailableAssistantProviderKind = props.settings.assistantProviderKind && !assistantProviderKind
-    ? props.settings.assistantProviderKind
-    : undefined;
+  // The saved Assistant CLI is not ready: this chat takes a ready one, and says so.
+  const assistantNote = useMemo(
+    () => assistantSubstituteNote({
+      agents: props.agents,
+      providers: props.settings.providers,
+      explicitKind: props.settings.assistantProviderKind
+    }),
+    [props.agents, props.settings.assistantProviderKind, props.settings.providers]
+  );
+  // The Assistant moved to another CLI (its saved one signed in or out):
+  // model, effort and where it runs were chosen for the one before.
+  const assistantKindShown = useRef(assistantProviderKind);
+  const { onSelectedParticipantRuntimeOverridesChange } = props;
+  useEffect(() => {
+    const before = assistantKindShown.current;
+    assistantKindShown.current = assistantProviderKind;
+    if (!before || !assistantProviderKind || before === assistantProviderKind) return;
+    onSelectedParticipantRuntimeOverridesChange((current) => {
+      if (!(NEW_CHAT_ASSISTANT_PARTICIPANT_ID in current)) return current;
+      const { [NEW_CHAT_ASSISTANT_PARTICIPANT_ID]: _forTheOtherCli, ...rest } = current;
+      return rest;
+    });
+  }, [assistantProviderKind, onSelectedParticipantRuntimeOverridesChange]);
   const assistantParticipant = useMemo(
     () => assistantProviderKind ? newChatAssistantParticipantConfig(assistantProviderKind) : undefined,
     [assistantProviderKind]
@@ -149,17 +168,16 @@ export function NewChatScreen(props: {
     () => [
       ...(assistantParticipant ? [assistantParticipant] : []),
       ...savedParticipantOptions
-        .filter(({ invalidReason }) => !invalidReason)
+        .filter((option) => !participantOptionInvalidReason(option, props.selectedParticipantRuntimeOverrides[option.config.id]))
         .map(({ config }) => config)
     ],
-    [assistantParticipant, savedParticipantOptions]
+    [assistantParticipant, savedParticipantOptions, props.selectedParticipantRuntimeOverrides]
   );
   const prospectiveParticipantDrafts = useMemo(() => {
     const drafts = selectedOrMentionedChatParticipantDrafts(
       props.settings.chatParticipantConfigs,
       props.selectedParticipantIds,
       props.prompt,
-      props.selectedParticipantRunLocations,
       props.selectedParticipantRuntimeOverrides
     );
     const assistantRuntimeOverride = props.selectedParticipantRuntimeOverrides[NEW_CHAT_ASSISTANT_PARTICIPANT_ID];
@@ -171,7 +189,6 @@ export function NewChatScreen(props: {
     assistantProviderKind,
     props.prompt,
     props.selectedParticipantIds,
-    props.selectedParticipantRunLocations,
     props.selectedParticipantRuntimeOverrides,
     props.settings.chatParticipantConfigs
   ]);
@@ -331,16 +348,6 @@ export function NewChatScreen(props: {
         />
       )}
 
-      {unavailableAssistantProviderKind && (
-        <div className="new-chat-provider-warning" data-testid="new-chat-provider-unavailable">
-          <strong>{cliProviderMetadata(unavailableAssistantProviderKind).label} is unavailable</strong>
-          <span>The saved Assistant provider is not ready. Choose another provider in General Settings.</span>
-          <button type="button" onClick={props.onOpenProviderSettings}>
-            <Settings size={15} aria-hidden /> Open General Settings
-          </button>
-        </div>
-      )}
-
       <div className="new-chat-card" hidden={needsProviderSetup}>
         <ChatComposerAttachmentChips
           pendingImages={images.pendingImages}
@@ -350,7 +357,7 @@ export function NewChatScreen(props: {
           selectedFileMentions={mentions.selectedFileMentions}
           selectedSkillMentions={mentions.selectedSkillMentions}
         />
-        <div className={["new-chat-input-wrap", mentions.showSkillHighlights ? "has-skill-highlights" : ""].filter(Boolean).join(" ")}>
+        <div className={["new-chat-input-wrap", mentions.showSkillHighlights ? "has-skill-highlights" : ""].filter(Boolean).join(" ")} {...{ [DICTATION_SESSION_ATTRIBUTE]: "new-chat" }}>
           <ChatComposerMenus
             fileIndex={mentions.fileIndex}
             insertCommand={mentions.insertCommand}
@@ -485,15 +492,7 @@ export function NewChatScreen(props: {
               void images.addImageFiles(files);
             }}
           />
-          <button
-            type="button"
-            className="new-chat-icon-button"
-            title="Attach image"
-            aria-label="Attach image"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <ImagePlus size={18} aria-hidden />
-          </button>
+          <IconButton label="Attach image" icon={ImagePlus} onClick={() => fileInputRef.current?.click()} />
           <FolderPicker
             repoPath={props.repoPath}
             settings={props.settings}
@@ -507,14 +506,17 @@ export function NewChatScreen(props: {
             savedParticipantOptions={savedParticipantOptions}
             cliProviderHosts={props.settings.cliProviderHosts}
             selectedParticipantIds={props.selectedParticipantIds}
-            selectedParticipantRunLocations={props.selectedParticipantRunLocations}
             selectedParticipantRuntimeOverrides={props.selectedParticipantRuntimeOverrides}
             renderParticipantAvatar={props.renderParticipantAvatar}
             participantRoleLabel={props.participantRoleLabel}
             onSelectedParticipantIdsChange={props.onSelectedParticipantIdsChange}
-            onSelectedParticipantRunLocationsChange={props.onSelectedParticipantRunLocationsChange}
             onSelectedParticipantRuntimeOverridesChange={props.onSelectedParticipantRuntimeOverridesChange}
             onOpenParticipantsSettings={props.onOpenParticipantsSettings}
+          />
+          <SpeechToTextButton
+            getTextarea={() => promptRef.current}
+            draft={props.prompt}
+            onDraftChange={props.onPromptChange}
           />
           <button
             type="button"
@@ -538,6 +540,9 @@ export function NewChatScreen(props: {
       )}
 
       {readyKinds.length > 0 && validation && <div className="inline-error new-chat-error">{validation}</div>}
+      {!needsProviderSetup && assistantNote && (
+        <p className="new-chat-assistant-note" data-testid="new-chat-assistant-note">{assistantNote}</p>
+      )}
     </div>
   );
 }
@@ -641,12 +646,10 @@ function ParticipantPicker(props: {
   cliProviderHosts: CliProviderHost[];
   savedParticipantOptions: AddableSavedParticipantConfig[];
   selectedParticipantIds: Set<string>;
-  selectedParticipantRunLocations: Record<string, CloudRunRemoteExecutionMode>;
   selectedParticipantRuntimeOverrides: Record<string, ChatParticipantRuntimeOverride>;
   renderParticipantAvatar: (participant: ChatParticipant) => ReactNode;
   participantRoleLabel: (participant: Pick<ChatParticipant, "roleConfigId">) => string;
   onSelectedParticipantIdsChange: Dispatch<SetStateAction<Set<string>>>;
-  onSelectedParticipantRunLocationsChange: Dispatch<SetStateAction<Record<string, CloudRunRemoteExecutionMode>>>;
   onSelectedParticipantRuntimeOverridesChange: Dispatch<SetStateAction<Record<string, ChatParticipantRuntimeOverride>>>;
   onOpenParticipantsSettings: () => void;
 }): JSX.Element {
@@ -673,10 +676,6 @@ function ParticipantPicker(props: {
       return next;
     });
     if (removing) {
-      props.onSelectedParticipantRunLocationsChange((current) => {
-        const { [id]: _removed, ...rest } = current;
-        return rest;
-      });
       props.onSelectedParticipantRuntimeOverridesChange((current) => {
         const { [id]: _removed, ...rest } = current;
         return rest;
@@ -684,32 +683,19 @@ function ParticipantPicker(props: {
     }
   }
 
-  function runLocationFor(participant: ChatParticipantConfig): CloudRunRemoteExecutionMode {
-    return normalizeChatRunLocation(props.selectedParticipantRunLocations[participant.id] ?? participant.remoteExecution);
-  }
-
   function runtimeOverrideFor(participant: ChatParticipantConfig): ChatParticipantRuntimeOverride | undefined {
     return props.selectedParticipantRuntimeOverrides[participant.id];
   }
 
-  function updateRunLocation(participant: ChatParticipantConfig, remoteExecution: CloudRunRemoteExecutionMode): void {
-    if (isNewChatAssistantOption(participant)) {
-      return;
-    }
-    props.onSelectedParticipantRunLocationsChange((current) => ({
-      ...current,
-      [participant.id]: normalizeChatRunLocation(remoteExecution)
-    }));
-    props.onSelectedParticipantIdsChange((current) => new Set(current).add(participant.id));
-  }
-
-  function updateRuntime(participant: ChatParticipantConfig, patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch">): void {
+  function updateRuntime(participant: ChatParticipantConfig, patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "cloudRun" | "homeMachineId" | "skipToolchainPreflight" | "autoWatch">): void {
     const runtimeOverride: ChatParticipantRuntimeOverride = {
       model: patch.model,
+      homeMachineId: patch.homeMachineId,
+      cloudRun: patch.cloudRun,
       reasoningEffort: patch.reasoningEffort,
       agentMode: patch.agentMode,
       permissions: patch.permissions,
-      remoteExecution: normalizeChatRunLocation(patch.remoteExecution),
+      remoteExecution: patch.remoteExecution,
       skipToolchainPreflight: patch.skipToolchainPreflight,
       autoWatch: patch.autoWatch
     };
@@ -717,12 +703,10 @@ function ParticipantPicker(props: {
       ...current,
       [participant.id]: runtimeOverride
     }));
-    if (!isNewChatAssistantOption(participant)) {
+    // Changing a member's settings adds it, once it can run where they put it.
+    const option = participantOptions.find(({ config }) => config.id === participant.id);
+    if (option && !isNewChatAssistantOption(participant) && !participantOptionInvalidReason(option, runtimeOverride)) {
       props.onSelectedParticipantIdsChange((current) => new Set(current).add(participant.id));
-      props.onSelectedParticipantRunLocationsChange((current) => ({
-        ...current,
-        [participant.id]: normalizeChatRunLocation(patch.remoteExecution)
-      }));
     }
   }
 
@@ -753,9 +737,10 @@ function ParticipantPicker(props: {
         >
           {participantOptions.length === 0 ? (
             <div className="new-chat-menu-empty">No saved members configured.</div>
-          ) : participantOptions.map(({ config: participant, invalidReason, locked }) => {
+          ) : participantOptions.map((option) => {
+            const { config: participant, locked } = option;
             const selected = Boolean(locked) || props.selectedParticipantIds.has(participant.id);
-            const runLocation = runLocationFor(participant);
+            const invalidReason = participantOptionInvalidReason(option, runtimeOverrideFor(participant));
             return (
               <ChatParticipantSelectableRosterRow
                 key={participant.id}
@@ -764,8 +749,9 @@ function ParticipantPicker(props: {
                 selected={selected}
                 locked={locked}
                 disabledReason={invalidReason}
+                // Where it runs stays choosable while only this computer's CLI is not ready.
+                controlsDisabled={Boolean(option.configReason)}
                 roleLabel={props.participantRoleLabel(participant)}
-                remoteExecution={runLocation}
                 runtimeOverride={runtimeOverrideFor(participant)}
                 renderParticipantAvatar={props.renderParticipantAvatar}
                 onToggleSelected={() => {
@@ -773,7 +759,6 @@ function ParticipantPicker(props: {
                     toggleParticipant(participant.id);
                   }
                 }}
-                onRunLocationChange={updateRunLocation}
                 onRuntimeChange={updateRuntime}
               />
             );

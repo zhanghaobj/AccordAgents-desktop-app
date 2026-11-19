@@ -10,10 +10,13 @@ import {
   AWS_WORKER_INSTANCE_TYPE_DEFAULT,
   AWS_WORKER_ROOT_VOLUME_SIZE_GB_DEFAULT
 } from "../../shared/cloudRuns";
+import { EMPTY_MOBILE_CONTROL_SETTINGS } from "../../shared/mobilePairing";
 
 export const DEFAULT_SETTINGS: AppSettings = {
+  chatCustomAvatars: [],
   roundLimitDefault: 2,
   betaUpdates: false,
+  crashReports: true,
   cliAgentRunTimeoutMs: CLI_AGENT_RUN_TIMEOUT_DEFAULT_MS,
   chatParticipantRequestMaxDepth: CHAT_PARTICIPANT_REQUEST_MAX_DEPTH_DEFAULT,
   chatParticipantRequestPromptMaxChars: CHAT_PARTICIPANT_REQUEST_PROMPT_MAX_CHARS_DEFAULT,
@@ -29,6 +32,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     maxRuntimeMs: 24 * 60 * 60_000,
     pollIntervalMs: 2_500
   },
+  mobileControl: EMPTY_MOBILE_CONTROL_SETTINGS,
   providers: [],
   cliProviderHosts: [],
   chatRoleConfigs: [],

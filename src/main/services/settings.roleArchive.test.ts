@@ -9,6 +9,7 @@ import {
 import { CHAT_AUTO_WATCH_WAKE_LIMIT_DEFAULT } from "../../shared/chatAutoWatch";
 import { DEFAULT_CHAT_PROMPT_CONTEXT } from "../../shared/chatPromptContext";
 import { CLI_AGENT_RUN_TIMEOUT_DEFAULT_MS } from "../../shared/cliAgentRunSettings";
+import { EMPTY_MOBILE_CONTROL_SETTINGS } from "../../shared/mobilePairing";
 
 function makeRole(over: Partial<ChatRoleConfig> = {}): ChatRoleConfig {
   return {
@@ -72,14 +73,17 @@ function settingsServiceWith(
     stored = next;
   };
   service.getPublicSettings = async (): Promise<AppSettings> => ({
+    chatCustomAvatars: [],
     roundLimitDefault: stored.roundLimitDefault,
     betaUpdates: service.normalizeBetaUpdates(stored.betaUpdates),
+    crashReports: true,
     cliAgentRunTimeoutMs: stored.cliAgentRunTimeoutMs,
     chatAutoWatchWakeLimit: service.normalizeChatAutoWatchWakeLimit(stored.chatAutoWatchWakeLimit),
     chatParticipantRequestMaxDepth: stored.chatParticipantRequestMaxDepth,
     chatParticipantRequestPromptMaxChars: stored.chatParticipantRequestPromptMaxChars,
     chatPromptContext: service.normalizeChatPromptContextSettings(stored.chatPromptContext),
     cloudRuns: stored.cloudRuns,
+    mobileControl: EMPTY_MOBILE_CONTROL_SETTINGS,
     providers: stored.providers,
     chatRoleConfigs: stored.chatRoleConfigs,
     chatBehaviorRules: stored.chatBehaviorRules,
@@ -134,9 +138,34 @@ test("stored v11 Chat Assistant is reseeded with member greeting", () => {
   const assistant = roles.find((role) => role.id === "administrator");
 
   assert.ok(assistant);
-  assert.equal(assistant.version, 12);
+  assert.equal(assistant.version, 14);
   assert.match(assistant.instructions, /I can help set up roles and members for this chat/);
   assert.doesNotMatch(assistant.instructions, /I can help set up roles and participants for this chat/);
+});
+
+test("stored v13 Chat Assistant is reseeded with removal instructions that follow member management", () => {
+  const { service } = settingsServiceWith();
+  const defaults = (service as any).mergeDefaultRoles(undefined) as ChatRoleConfig[];
+  const currentAssistant = defaults.find((role) => role.id === "administrator");
+  assert.ok(currentAssistant);
+  assert.match(currentAssistant.instructions, /remove_participant_from_chat/);
+
+  const storedAssistant: ChatRoleConfig = {
+    ...currentAssistant,
+    instructions: currentAssistant.instructions.replace(
+      /it can go in the same request as additions\. It follows the same member-management policy as an addition and takes effect after your turn ends\./,
+      "in a request of its own. User always approves a removal on a card, and it takes effect after your turn ends."
+    ),
+    version: 13,
+    updatedAt: "2026-10-22T00:00:00.000Z"
+  };
+  const roles = (service as any).mergeDefaultRoles([storedAssistant]) as ChatRoleConfig[];
+  const assistant = roles.find((role) => role.id === "administrator");
+
+  assert.ok(assistant);
+  assert.equal(assistant.version, 14);
+  assert.match(assistant.instructions, /follows the same member-management policy as an addition/);
+  assert.doesNotMatch(assistant.instructions, /User always approves a removal on a card/);
 });
 
 test("default Workflow Manager only follows implementation workflow when explicitly selected", () => {

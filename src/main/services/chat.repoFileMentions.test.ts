@@ -189,9 +189,10 @@ test("buildPromptParts section sizes stay under baseline caps across envelope br
   ] as const) {
     assert.equal(parts.sections.dynamicHeader, 0, `${label}: dynamicHeader is folded into staticEnvelope when role instructions are included`);
     // Bumped from 7450 when app_chat_send_message was added, then when its guidance
-    // was expanded, then when app_chat_set_title joined the always-on app MCP surface.
+    // was expanded, then when app_chat_set_title joined the always-on app MCP surface,
+    // then from 7950 for the members' long-term memory instructions (~1.2 KB).
     // Intentional growth; keep tightening any further bloat.
-    assert.ok(parts.sections.staticEnvelope < 7950, `${label}: staticEnvelope too large: ${parts.sections.staticEnvelope}`);
+    assert.ok(parts.sections.staticEnvelope < 9200, `${label}: staticEnvelope too large: ${parts.sections.staticEnvelope}`);
     assert.equal(parts.sections.promptContext, 0, `${label}: promptContext should be empty without automatic context`);
     assert.ok(parts.sections.trigger < 350, `${label}: trigger too large: ${parts.sections.trigger}`);
     assert.ok(parts.sections.currentRequest < 130, `${label}: currentRequest too large: ${parts.sections.currentRequest}`);
@@ -201,8 +202,9 @@ test("buildPromptParts section sizes stay under baseline caps across envelope br
   assert.ok(slimRepoRead.sections.total < 1100, `slim repo+repoRead total too large: ${slimRepoRead.sections.total}`);
   assert.ok(slimNoRepoRead.sections.total < 1500, `slim repo+no-repoRead total too large: ${slimNoRepoRead.sections.total}`);
   assert.ok(slimNoRepo.sections.total < 1500, `slim no-repo total too large: ${slimNoRepo.sections.total}`);
-  assert.ok(fullRepoRead.sections.total < 8100, `full repo+repoRead total too large: ${fullRepoRead.sections.total}`);
-  assert.ok(fullNoRepoRead.sections.total < 8200, `full repo+no-repoRead total too large: ${fullNoRepoRead.sections.total}`);
+  // Full totals grew with the staticEnvelope (members' memory instructions).
+  assert.ok(fullRepoRead.sections.total < 9350, `full repo+repoRead total too large: ${fullRepoRead.sections.total}`);
+  assert.ok(fullNoRepoRead.sections.total < 9450, `full repo+no-repoRead total too large: ${fullNoRepoRead.sections.total}`);
   assert.ok(slimRepoRead.sections.total * 4 < fullRepoRead.sections.total, "slim envelope should be at least 4x smaller than full");
 
   // Repo-read state appears once: on the Repository line (and the escalation line when blocked).
@@ -253,6 +255,48 @@ test("buildPrompt addressee guidance ignores non-participant mentions and select
   assert.doesNotMatch(prompt, /First determine who the message is addressed to\./);
   assert.match(prompt, /Referenced repository files/);
   assert.match(prompt, /Selected skills for this turn/);
+});
+
+test("buildPrompt warns that writing a handle triggers that participant", () => {
+  const drew = chatParticipant({}, { id: "participant-drew", handle: "drew" });
+  const taylor = chatParticipant({}, { id: "participant-taylor", handle: "taylor" });
+  const conversation = chatConversation([drew, taylor], "/repo");
+  const triggerMessage = userMessage("trigger-1", "@drew what do you think?");
+  conversation.messages.push(triggerMessage);
+  const service = testService({ canRequestPermissions: true }).service as any;
+  const prompt = service.buildPrompt(conversation, drew, chatSession(drew), triggerMessage, "/workspace", false, {
+    includeRoleInstructions: false,
+    agentMode: "default",
+    permissions: normalizeChatAgentPermissions(defaultChatAgentPermissions())
+  }) as string;
+
+  assert.match(prompt, /Writing another participant's handle:/);
+  assert.match(prompt, /is a request for that participant to run, not a reference to them/);
+  assert.match(prompt, /use their plain name or wrap the handle in backticks/);
+
+  // The block rides along on every participant turn, so it has to stay small.
+  const parts = service.buildPromptParts(conversation, drew, chatSession(drew), triggerMessage, "/workspace", false, {
+    includeRoleInstructions: false,
+    agentMode: "default",
+    permissions: normalizeChatAgentPermissions(defaultChatAgentPermissions())
+  }) as { sections: { mentionTrigger: number } };
+  assert.ok(parts.sections.mentionTrigger > 0, "mentionTrigger section should be measured");
+  assert.ok(parts.sections.mentionTrigger < 260, `mentionTrigger section too large: ${parts.sections.mentionTrigger}`);
+});
+
+test("buildPrompt omits handle-trigger guidance when nobody else can be triggered", () => {
+  const drew = chatParticipant({}, { id: "participant-drew", handle: "drew" });
+  const conversation = chatConversation([drew], "/repo");
+  const triggerMessage = userMessage("trigger-1", "@drew what do you think?");
+  conversation.messages.push(triggerMessage);
+  const service = testService({ canRequestPermissions: true }).service as any;
+  const prompt = service.buildPrompt(conversation, drew, chatSession(drew), triggerMessage, "/workspace", false, {
+    includeRoleInstructions: false,
+    agentMode: "default",
+    permissions: normalizeChatAgentPermissions(defaultChatAgentPermissions())
+  }) as string;
+
+  assert.doesNotMatch(prompt, /Writing another participant's handle:/);
 });
 
 test("sendMessage clears running and emits terminal error when participant run fails", async () => {
@@ -656,6 +700,53 @@ test("respondToChoice returns after ingest and emits terminal error when request
   assert.equal(progress.some((item) => item.phase === "error" && item.message === "choice exploded"), true);
 });
 
+// A phone's own answer was refused as "Selected option was not found." and the
+// phone, told nothing, showed it on its way for an hour (the User, 2026-10-01).
+test("a durable choice answer is taken with the own-answer option and kept on the choice when refused", async () => {
+  const requester = chatParticipant();
+  const conversation = chatConversation([requester], "/repo");
+  const sourceMessage = participantMessage(requester, "choice-message", "Choose an option.");
+  sourceMessage.metadata = {
+    ...sourceMessage.metadata,
+    pendingChoice: { id: "choice-1", title: "Decision", question: "Proceed?", options: [{ id: "yes", label: "Yes" }], status: "pending" }
+  };
+  conversation.messages.push(sourceMessage);
+  const { service, storage } = testService({ conversations: [conversation] });
+  const serviceAny = service as any;
+  serviceAny.ensureHistoryFiles = async () => "/tmp/accordagents-test-history";
+  serviceAny.runParticipantTurnSerialized = async () => [participantMessage(requester, "choice-reply", "Choice handled.")];
+  // An answer from the User's server, as its card's device applies it: named
+  // by the card's answer, refused under the operation it came in.
+  const guard = (operationId: string) => ({ decisionEventId: `card-answer:choice:${sourceMessage.id}:${operationId}`, operationId, beforeApply: async () => undefined });
+  const answer = (patch: Record<string, unknown>, operationId?: string) => service.respondToChoice({
+    conversationId: conversation.id, sourceMessageId: sourceMessage.id, choiceId: "choice-1", ...patch
+  } as never, undefined, undefined, operationId ? guard(operationId) : undefined);
+  // A longer flow in the same chat holds a copy read before any refusal.
+  const stale = structuredClone(await storage.getConversation(conversation.id)) as Conversation;
+  const refusals = async () => (await storage.getConversation(conversation.id))?.messages
+    .find((message) => message.id === sourceMessage.id)?.metadata?.pendingChoice?.refusals?.map((item) => [item.operationId, item.reason]);
+
+  await assert.rejects(answer({ selectedOptionId: "nope" }, "choice:choice-1:nope"), /Selected option was not found\./);
+  await assert.rejects(answer({ selectedOptionId: "__custom__", customAnswer: " " }, "choice:choice-1:__custom__:empty"), /Custom choice answer is required\./);
+  await assert.rejects(answer({ selectedOptionId: "nope" }, "choice:choice-1:nope"), /Selected option was not found\./);
+  assert.deepEqual(await refusals(), [
+    ["choice:choice-1:__custom__:empty", "Custom choice answer is required."],
+    ["choice:choice-1:nope", "Selected option was not found."]
+  ], "each refused answer is kept once, by the operation it was sent under");
+  await assert.rejects(answer({ selectedOptionId: "nope-again" }), /Selected option was not found\./);
+  assert.equal((await refusals())?.length, 2, "an answer that was not a durable decision names no operation to keep");
+  await serviceAny.withChatMutation(stale, async () => {
+    stale.updatedAt = new Date().toISOString();
+    await serviceAny.saveConversation(stale);
+  });
+  assert.equal((await refusals())?.length, 2, "a flow holding an older copy of the waiting choice keeps the refusals recorded since");
+
+  await answer({ selectedOptionId: "__custom__", customAnswer: "the third one" }, "choice:choice-1:__custom__:abc");
+  const choice = (await storage.getConversation(conversation.id))?.messages.find((message) => message.id === sourceMessage.id)?.metadata?.pendingChoice;
+  assert.equal(choice?.status, "selected", "the phone's own answer is taken");
+  assert.equal(choice?.customAnswer, "the third one");
+});
+
 test("respondToChoice releases chat run queue while requester turn continues", async () => {
   const requester = chatParticipant();
   const conversation = chatConversation([requester], "/repo");
@@ -714,7 +805,8 @@ test("respondToChoice releases chat run queue while requester turn continues", a
   assert.equal(savedSelectionMessage.metadata?.hiddenFromTimeline, true);
   assert.equal(savedSelectionMessage.metadata?.threadId, sourceMessage.metadata?.threadId);
   assert.equal(savedSelectionMessage.metadata?.parentMessageId, sourceMessage.id);
-  assert.equal(savedSelectionMessage.metadata?.chatThreadRootId, sourceMessage.id);
+  // A card on the main timeline: the member answers there, not in a thread under the card.
+  assert.equal(savedSelectionMessage.metadata?.chatThreadRootId, undefined);
   assert.match(savedSelectionMessage.content, /^Choice selected for @drew\./);
   assert.match(savedSelectionMessage.content, /Choice: Decision/);
   assert.match(savedSelectionMessage.content, /Question: Proceed\?/);
@@ -1227,11 +1319,18 @@ test("clearInterruptedRuns preserves local run metadata because storage cannot o
   let saved = false;
   const storage = Object.create(StorageService.prototype) as any;
   storage.queryJson = async (sql: string) => {
+    if (sql.includes("from conversation_messages")) {
+      return conversation.messages.map((message, sequence) => ({
+        sequence,
+        payloadHex: Buffer.from(JSON.stringify(message), "utf8").toString("hex").toUpperCase()
+      }));
+    }
     assert.match(sql, /select id from conversations/);
     assert.doesNotMatch(sql, /payload_json as payloadJson/);
     return [{ id: conversation.id }];
   };
-  storage.queryText = async () => JSON.stringify(conversation);
+  // The body carries everything but the messages; those come from their rows.
+  storage.queryText = async () => JSON.stringify({ ...conversation, messages: [] });
   storage.saveConversation = async () => {
     saved = true;
   };
@@ -1256,11 +1355,18 @@ test("clearInterruptedRuns preserves local participant compaction metadata becau
   let saved = false;
   const storage = Object.create(StorageService.prototype) as any;
   storage.queryJson = async (sql: string) => {
+    if (sql.includes("from conversation_messages")) {
+      return conversation.messages.map((message, sequence) => ({
+        sequence,
+        payloadHex: Buffer.from(JSON.stringify(message), "utf8").toString("hex").toUpperCase()
+      }));
+    }
     assert.match(sql, /select id from conversations/);
     assert.doesNotMatch(sql, /payload_json as payloadJson/);
     return [{ id: conversation.id }];
   };
-  storage.queryText = async () => JSON.stringify(conversation);
+  // The body carries everything but the messages; those come from their rows.
+  storage.queryText = async () => JSON.stringify({ ...conversation, messages: [] });
   storage.saveConversation = async () => {
     saved = true;
   };
@@ -1284,12 +1390,20 @@ test("clearInterruptedRuns does not mark local pending turns interrupted at stor
   };
   let saved = false;
   const storage = Object.create(StorageService.prototype) as any;
+  storage.machineProgress = () => ({ overlay: async (_id: string, messages: ChatMessage[]) => messages });
   storage.queryJson = async (sql: string) => {
+    if (sql.includes("from conversation_messages")) {
+      return conversation.messages.map((message, sequence) => ({
+        sequence,
+        payloadHex: Buffer.from(JSON.stringify(message), "utf8").toString("hex").toUpperCase()
+      }));
+    }
     assert.match(sql, /select id from conversations/);
     assert.doesNotMatch(sql, /payload_json as payloadJson/);
     return [{ id: conversation.id }];
   };
-  storage.queryText = async () => JSON.stringify(conversation);
+  // The body carries everything but the messages; those come from their rows.
+  storage.queryText = async () => JSON.stringify({ ...conversation, messages: [] });
   storage.saveConversation = async () => {
     saved = true;
   };
@@ -1333,12 +1447,20 @@ test("clearInterruptedRuns preserves active remote run handles without warning",
   };
   let saved: Conversation | undefined;
   const storage = Object.create(StorageService.prototype) as any;
+  storage.machineProgress = () => ({ overlay: async (_id: string, messages: ChatMessage[]) => messages });
   storage.queryJson = async (sql: string) => {
+    if (sql.includes("from conversation_messages")) {
+      return conversation.messages.map((message, sequence) => ({
+        sequence,
+        payloadHex: Buffer.from(JSON.stringify(message), "utf8").toString("hex").toUpperCase()
+      }));
+    }
     assert.match(sql, /select id from conversations/);
     assert.doesNotMatch(sql, /payload_json as payloadJson/);
     return [{ id: conversation.id }];
   };
-  storage.queryText = async () => JSON.stringify(conversation);
+  // The body carries everything but the messages; those come from their rows.
+  storage.queryText = async () => JSON.stringify({ ...conversation, messages: [] });
   storage.saveConversation = async (next: Conversation) => {
     saved = cloneConversation(next);
   };
@@ -2004,6 +2126,23 @@ test("inferred participant request carrier is hidden and rooted to the source vi
   assert.equal(requestMessage.metadata?.chatThreadRootId, "outer-root");
 });
 
+test("inferred member requests follow the requester's permission as saved, not the turn's older copy", async () => {
+  const savedRequester = chatParticipant({ requestParticipants: "ask" }, { id: "manager", handle: "nikita" });
+  const target = chatParticipant({ repoRead: true }, { id: "codex", handle: "codex" });
+  const conversation = chatConversation([savedRequester, target], "/repo");
+  const { service } = testService({ conversations: [conversation] });
+  // The turn started while it was still allowed; the User switched it to Ask meanwhile.
+  const turnCopy = { ...savedRequester, permissions: { ...normalizeChatAgentPermissions(savedRequester.permissions), requestParticipants: "allow" as const } };
+
+  await (service as any).appendParticipantTurnMessages(conversation, turnCopy, [
+    participantMessage(savedRequester, "source-message", "@codex please verify this.")
+  ]);
+
+  const batch = conversation.messages.find((message) => message.metadata?.participantRequest)?.metadata?.participantRequest;
+  assert.ok(batch);
+  assert.deepEqual(batch.items.map((item) => item.status), ["pending_approval"]);
+});
+
 test("inferred participant requests trigger mentioned participants and rely on addressee guidance", async () => {
   const manager = chatParticipant({}, { id: "manager", handle: "nikita" });
   const codex = chatParticipant({ repoRead: true }, { id: "codex", handle: "codex" });
@@ -2116,15 +2255,25 @@ test("stored refresh preserves inferred accord participant-request auto-allow", 
   const taylor = chatParticipant({ repoRead: true }, { id: "taylor", handle: "taylor-claude-engineer", kind: "claude-code" });
   const stored = chatConversation([manager, drew, taylor], "/repo");
   const current = cloneConversation(stored);
+  const { service } = testService({ conversations: [stored] });
+  // The inferred accord grants it on the flow's copy (allowParticipantRequestsForInferredAccordIfSelected).
+  (service as any).setParticipantRequestPermission(current, drew.id, "allow");
+
+  await (service as any).refreshStoredChatState(current);
+
+  const refreshedDrew = (current.metadata.participants as ChatParticipant[]).find((participant) => participant.id === drew.id);
+  assert.equal(normalizeChatAgentPermissions(refreshedDrew?.permissions).requestParticipants, "allow");
+});
+
+test("stored refresh keeps a request-members permission the User revoked over an older copy's allow", async () => {
+  const manager = chatParticipant({ requestParticipants: "allow" }, { id: "manager", handle: "nikita" });
+  const drew = chatParticipant({ repoRead: true, requestParticipants: "ask" }, { id: "drew", handle: "drew-codex-engineer" });
+  const stored = chatConversation([manager, drew], "/repo");
+  // A flow's copy from before the User changed Drew from Allow to Ask.
+  const current = cloneConversation(stored);
   current.metadata.participants = (current.metadata.participants as ChatParticipant[]).map((participant) =>
     participant.id === drew.id
-      ? {
-          ...participant,
-          permissions: {
-            ...normalizeChatAgentPermissions(participant.permissions),
-            requestParticipants: "allow"
-          }
-        }
+      ? { ...participant, permissions: { ...normalizeChatAgentPermissions(participant.permissions), requestParticipants: "allow" } }
       : participant
   );
   const { service } = testService({ conversations: [stored] });
@@ -2132,7 +2281,7 @@ test("stored refresh preserves inferred accord participant-request auto-allow", 
   await (service as any).refreshStoredChatState(current);
 
   const refreshedDrew = (current.metadata.participants as ChatParticipant[]).find((participant) => participant.id === drew.id);
-  assert.equal(normalizeChatAgentPermissions(refreshedDrew?.permissions).requestParticipants, "allow");
+  assert.equal(normalizeChatAgentPermissions(refreshedDrew?.permissions).requestParticipants, "ask");
 });
 
 test("legacy accord launch metadata does not suppress inferred participant requests", async () => {
@@ -2253,7 +2402,7 @@ test("runParticipantRequest roots inferred recipient replies under the source vi
     }];
   };
 
-  await serviceAny.startParticipantRequestRunner(conversation.id, "request-message", "run-1", 1);
+  await serviceAny.startParticipantRequestRunner(conversation.id, "request-message", 1);
 
   const saved = await storage.getConversation(conversation.id);
   const targetReply = saved?.messages.find((message) => message.id === "target-reply");
@@ -2266,164 +2415,6 @@ test("runParticipantRequest roots inferred recipient replies under the source vi
   assert.equal(targetReply?.metadata?.sourceMessageId, "request-message");
   assert.equal(requestBatch?.status, "answered");
   assert.equal(requestBatch?.items[0].replyMessageId, "target-reply");
-});
-
-test("runParticipantRequest keeps detached remote target running until terminal state", async () => {
-  const requester = chatParticipant({}, { id: "requester", handle: "drew" });
-  const target = chatParticipant({ repoRead: true }, { id: "target", handle: "taylor" });
-  const runId = "remote-target-run";
-  const conversation = chatConversation([requester, target], "/repo");
-  const requestMessage = participantRequestMessageWithItems(requester, [
-    participantRequestItem(target, "running")
-  ]);
-  conversation.messages.push(requestMessage);
-  const { service, storage } = testService({ conversations: [conversation] });
-  const serviceAny = service as any;
-  let autoResumeCount = 0;
-  serviceAny.ensureHistoryFiles = async () => "/tmp/accordagents-test-history";
-  serviceAny.refreshStoredChatState = async () => undefined;
-  serviceAny.autoResumeParticipantRequest = async () => {
-    autoResumeCount += 1;
-  };
-  serviceAny.runParticipantTurnSerialized = async (
-    activeConversation: Conversation,
-    participant: ChatParticipant,
-    trigger: ChatMessage
-  ) => {
-    const reply = participantMessage(participant, "remote-pending-reply", "");
-    reply.status = "pending";
-    reply.metadata = {
-      ...reply.metadata,
-      runId,
-      parentMessageId: trigger.id,
-      sourceMessageId: trigger.id,
-      appMessageSource: "remote-run-provider-output"
-    };
-    activeConversation.metadata = {
-      ...activeConversation.metadata,
-      running: true,
-      runId,
-      activeRunIds: [runId],
-      activeRunParticipantIdsByRunId: { [runId]: participant.id },
-      remoteRunHandles: {
-        [runId]: remoteRunHandle({
-          runId,
-          conversationId: activeConversation.id,
-          participantId: participant.id,
-          participantHandle: participant.handle,
-          providerOutputMessageId: reply.id
-        })
-      },
-      remoteRunReplay: {
-        [runId]: {
-          cursorSeq: 0,
-          appliedRecordIds: [],
-          providerOutputMessageId: reply.id
-        }
-      }
-    };
-    return [reply];
-  };
-
-  await serviceAny.startParticipantRequestRunner(conversation.id, requestMessage.id, "request-run", 1);
-
-  const runningSaved = await storage.getConversation(conversation.id);
-  const runningBatch = runningSaved?.messages.find((message) => message.id === requestMessage.id)?.metadata?.participantRequest;
-  assert.equal(runningBatch?.status, "running");
-  assert.equal(runningBatch?.items[0]?.status, "running");
-  assert.equal(runningBatch?.items[0]?.replyMessageId, "remote-pending-reply");
-  assert.equal(autoResumeCount, 0);
-
-  await service.updateRemoteRunHandleState(conversation.id, runId, {
-    runId,
-    conversationId: conversation.id,
-    participantId: target.id,
-    status: "failed",
-    completedAt: "2026-05-19T12:05:00.000Z",
-    error: "remote worker crashed"
-  });
-  await waitFor(() => autoResumeCount === 1);
-
-  const terminalSaved = await storage.getConversation(conversation.id);
-  const terminalBatch = terminalSaved?.messages.find((message) => message.id === requestMessage.id)?.metadata?.participantRequest;
-  const terminalReply = terminalSaved?.messages.find((message) => message.id === "remote-pending-reply");
-  assert.equal(terminalBatch?.status, "failed");
-  assert.equal(terminalBatch?.items[0]?.status, "failed");
-  assert.equal(terminalBatch?.items[0]?.error, "remote worker crashed");
-  assert.equal(terminalReply?.status, "error");
-  assert.match(terminalReply?.content ?? "", /remote worker crashed/);
-  assert.deepEqual(terminalSaved?.metadata.activeRunIds, undefined);
-  assert.equal(terminalSaved?.metadata.running, false);
-  assert.equal(terminalSaved?.metadata.runId, undefined);
-});
-
-test("reconcileTerminalRemoteRunState repairs persisted terminal remote spinner state", async () => {
-  const requester = chatParticipant({}, { id: "requester", handle: "drew" });
-  const target = chatParticipant({ repoRead: true }, { id: "target", handle: "taylor" });
-  const runId = "persisted-terminal-run";
-  const conversation = chatConversation([requester, target], "/repo");
-  const requestMessage = participantRequestMessageWithItems(requester, [
-    participantRequestItem(target, "running")
-  ]);
-  const pending = participantMessage(target, "persisted-pending-reply", "");
-  pending.status = "pending";
-  pending.metadata = {
-    ...pending.metadata,
-    runId,
-    parentMessageId: requestMessage.id,
-    sourceMessageId: requestMessage.id,
-    appMessageSource: "remote-run-provider-output"
-  };
-  conversation.messages.push(requestMessage, pending);
-  conversation.metadata = {
-    ...conversation.metadata,
-    running: true,
-    runId,
-    activeRunIds: [runId],
-    activeRunParticipantIdsByRunId: { [runId]: target.id },
-    remoteRunHandles: {
-      [runId]: remoteRunHandle({
-        runId,
-        conversationId: conversation.id,
-        participantId: target.id,
-        participantHandle: target.handle,
-        providerOutputMessageId: pending.id,
-        status: "failed",
-        completedAt: "2026-05-19T12:05:00.000Z",
-        error: "persisted failure"
-      })
-    },
-    remoteRunReplay: {
-      [runId]: {
-        cursorSeq: 1,
-        appliedRecordIds: ["terminal-record"],
-        providerOutputMessageId: pending.id,
-        terminalState: "failed"
-      }
-    }
-  };
-  const { service, storage } = testService({ conversations: [conversation] });
-  let autoResumeCount = 0;
-  (service as any).autoResumeParticipantRequest = async () => {
-    autoResumeCount += 1;
-  };
-
-  await service.reconcileTerminalRemoteRunState();
-  await waitFor(() => autoResumeCount === 1);
-
-  const saved = await storage.getConversation(conversation.id);
-  const savedMessage = saved?.messages.find((message) => message.id === pending.id);
-  const savedBatch = saved?.messages.find((message) => message.id === requestMessage.id)?.metadata?.participantRequest;
-  assert.equal(savedMessage?.status, "error");
-  assert.match(savedMessage?.content ?? "", /persisted failure/);
-  assert.equal(savedMessage?.metadata?.remoteRunStatus?.phase, "terminal");
-  assert.equal(savedBatch?.status, "failed");
-  assert.equal(savedBatch?.items[0]?.status, "failed");
-  assert.equal(savedBatch?.items[0]?.replyMessageId, pending.id);
-  assert.equal(savedBatch?.items[0]?.error, "persisted failure");
-  assert.deepEqual(saved?.metadata.activeRunIds, undefined);
-  assert.equal(saved?.metadata.running, false);
-  assert.equal(saved?.metadata.runId, undefined);
 });
 
 test("normalizeInferredParticipantRequestThreads hides legacy carriers and reroots descendants", () => {

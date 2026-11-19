@@ -9,55 +9,58 @@ import type { AppState } from "./app-state";
 import { useChatActions, type ChatActions } from "./use-chat-actions";
 import type { ConversationActions } from "./use-conversation-actions";
 
-test("unavailable saved Assistant provider reports a visible Settings error without creating", async () => {
+test("a saved Assistant CLI that is not ready gives way to a ready one; with none ready the chat is not created", async () => {
   let createCalls = 0;
-  let refreshCalls = 0;
   (globalThis as any).window = {
     consensus: {
       createChatConversation: async () => {
         createCalls += 1;
-        throw new Error("must not create");
+        throw new Error("stop after create request");
       }
     }
   };
-  let error: string | undefined;
   const currentSettings = settings();
   currentSettings.providers = [
     { kind: "claude-code", label: "Claude Code", enabled: true },
     { kind: "codex-cli", label: "Codex", enabled: true }
   ];
   currentSettings.assistantProviderKind = "claude-code";
-  const state = {
-    question: "Draft",
-    agents: [readyAgent("codex-cli")],
-    settings: currentSettings,
-    selectedChatParticipantRuntimeOverrides: {},
-    setError: (value: string | undefined) => { error = value; },
-    setWarnings: () => undefined
-  } as unknown as AppState;
-  let actions: ChatActions | undefined;
-
-  function Harness(): null {
-    actions = useChatActions(state, {
-      refreshAgents: async () => {
-        refreshCalls += 1;
-        return [];
-      }
-    } as ConversationActions);
-    return null;
+  for (const [agents, expected] of [
+    [[readyAgent("codex-cli")], "stop after create request"],
+    [[], "Set up and sign in to at least one CLI provider to start a chat."],
+    [[{ ...readyAgent("codex-cli"), authentication: "required" as const }], "Set up and sign in to at least one CLI provider to start a chat."]
+  ] as const) {
+    let error: string | undefined;
+    let refreshed = false;
+    const state = {
+      question: "Draft",
+      agents,
+      settings: currentSettings,
+      selectedChatParticipantConfigIds: new Set<string>(),
+      selectedChatParticipantRuntimeOverrides: {},
+      startingChatRef: { current: false },
+      chatCreationRef: { current: undefined },
+      chatBeforeActivityRef: { current: undefined }, openConversationRequestRef: { current: 0 }, railViewRef: { current: "chats" },
+      repoPath: "",
+      setError: (value: string | undefined) => { error = value; },
+      setWarnings: () => undefined,
+      setCurrentRunId: () => undefined,
+      setBusy: () => undefined
+    } as unknown as AppState;
+    let actions: ChatActions | undefined;
+    function Harness(): null {
+      actions = useChatActions(state, { refreshAgents: async () => { refreshed = true; return [...agents]; } } as unknown as ConversationActions);
+      return null;
+    }
+    const renderer = create(<Harness />);
+    let started: boolean | undefined;
+    await act(async () => { started = await actions?.startChat(); });
+    assert.equal(started, false);
+    assert.equal(error, expected);
+    assert.equal(refreshed, agents.length === 0, "a fresh check is used as it is");
+    renderer.unmount();
   }
-
-  const renderer = create(<Harness />);
-  let started: boolean | undefined;
-  await act(async () => {
-    started = await actions?.startChat();
-  });
-
-  assert.equal(started, false);
-  assert.equal(createCalls, 0);
-  assert.equal(refreshCalls, 0);
-  assert.equal(error, "Claude Code is not ready. Change the Assistant provider in General Settings.");
-  renderer.unmount();
+  assert.equal(createCalls, 1, "created only when a CLI is ready");
 });
 
 test("stale readiness refreshes before creating without a per-chat provider override", async () => {
@@ -82,9 +85,10 @@ test("stale readiness refreshes before creating without a per-chat provider over
     agents: [staleReadyAgent("claude-code"), staleReadyAgent("codex-cli")],
     settings: currentSettings,
     selectedChatParticipantConfigIds: new Set<string>(),
-    selectedChatParticipantRunLocations: {},
     selectedChatParticipantRuntimeOverrides: {},
     startingChatRef: { current: false },
+    chatCreationRef: { current: undefined },
+    chatBeforeActivityRef: { current: undefined }, openConversationRequestRef: { current: 0 }, railViewRef: { current: "chats" },
     repoPath: "",
     setError: (value: string | undefined) => { error = value; },
     setWarnings: () => undefined,
@@ -167,7 +171,6 @@ test("New Chat runtime overrides are sent for edited Assistant and selected save
     agents: [readyAgent("codex-cli")],
     settings: currentSettings,
     selectedChatParticipantConfigIds: new Set<string>(["member-codex"]),
-    selectedChatParticipantRunLocations: {},
     selectedChatParticipantRuntimeOverrides: {
       "__new-chat-assistant__": {
         model: "assistant-model",
@@ -184,6 +187,8 @@ test("New Chat runtime overrides are sent for edited Assistant and selected save
       }
     },
     startingChatRef: { current: false },
+    chatCreationRef: { current: undefined },
+    chatBeforeActivityRef: { current: undefined }, openConversationRequestRef: { current: 0 }, railViewRef: { current: "chats" },
     repoPath: "",
     setError: (value: string | undefined) => { error = value; },
     setWarnings: () => undefined,
@@ -217,6 +222,8 @@ test("New Chat runtime overrides are sent for edited Assistant and selected save
   assert.equal(member?.reasoningEffort, "low");
   assert.equal(member?.agentMode, "auto");
   assert.equal(member?.permissions?.workspaceWrite, true);
+  // A member still carrying the old cloud-worker flag keeps it: it is what
+  // marks the member as one that needs a machine, and nothing rewrites it.
   assert.equal(member?.remoteExecution, "remote");
   assert.equal(member?.skipToolchainPreflight, true);
   assert.equal(member?.autoWatch, true);
@@ -239,13 +246,14 @@ test("stale New Chat readiness refresh failure fails closed and preserves the co
     agents: [staleReadyAgent()],
     settings: { ...settings(), assistantProviderKind: "claude-code" },
     selectedChatParticipantConfigIds: new Set<string>(),
-    selectedChatParticipantRunLocations: {},
     selectedChatParticipantRuntimeOverrides: {},
     newChatPendingImages: [{ id: "image", filename: "qa.png", mimeType: "image/png", sizeBytes: 3, dataBase64: "YWJj", status: "ready" }],
     newChatRepoFileMentions: [{ path: "src/main.ts" }],
     newChatSkillMentions: [{ frontmatterName: "office-hours" }],
     newChatPluginMentions: [{ name: "fixture-plugin", displayName: "Fixture" }],
     startingChatRef: { current: false },
+    chatCreationRef: { current: undefined },
+    chatBeforeActivityRef: { current: undefined }, openConversationRequestRef: { current: 0 }, railViewRef: { current: "chats" },
     setError: (value: string | undefined) => { error = value; },
     setWarnings: () => undefined
   } as unknown as AppState;
@@ -275,7 +283,6 @@ test("stale New Chat readiness refresh failure fails closed and preserves the co
   assert.equal(state.question, "/office-hours #src/main.ts Draft");
   assert.equal(state.newChatPendingImages.length, 1);
   assert.deepEqual(state.newChatRepoFileMentions, [{ path: "src/main.ts" }]);
-  assert.deepEqual(state.selectedChatParticipantRunLocations, {});
   renderer.unmount();
 });
 
@@ -306,6 +313,10 @@ test("existing chat send clears immediately and restores the composer draft on f
     setChatMessageDraft: (value: SetStateAction<string>) => {
       draft = typeof value === "function" ? value(draft) : value;
       state.chatMessageDraft = draft;
+    },
+    setChatMessageDraftForConversation: (conversationId: string, value: SetStateAction<string>) => {
+      assert.equal(conversationId, "conversation-1");
+      state.setChatMessageDraft(value);
     },
     setConversation: () => undefined,
     setError: (value: string | undefined) => { error = value; },
@@ -376,6 +387,7 @@ function settings(): AppSettings {
   return {
     roundLimitDefault: 2,
     betaUpdates: false,
+    crashReports: true,
     cliAgentRunTimeoutMs: 86_400_000,
     chatParticipantRequestMaxDepth: 2,
     chatParticipantRequestPromptMaxChars: 50_000,

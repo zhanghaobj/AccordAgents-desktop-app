@@ -4,7 +4,6 @@ import type {
   ChatBehaviorRuleConfig,
   ChatAgentMode,
   ChatAgentPermissions,
-  CloudRunRemoteExecutionMode,
   ChatParticipant,
   ChatParticipantConfig,
   ChatProviderKind,
@@ -34,9 +33,10 @@ import {
   cliProviderHostForParticipant
 } from "../../../shared/cliProviderHosts";
 import {
+  NO_READY_CLI_MESSAGE,
   readyProviderKinds
 } from "../../../shared/cliReadiness";
-import { validateChatCliAgents } from "./chat-cli-readiness";
+import { participantOptionInvalidReason, validateChatCliAgents } from "./chat-cli-readiness";
 export { validateChatCliAgents } from "./chat-cli-readiness";
 import {
   defaultChatAvatarId,
@@ -68,13 +68,16 @@ export interface ChatParticipantDraft {
   agentMode: ChatAgentMode;
   permissions: ChatAgentPermissions;
   remoteExecution?: ChatParticipantConfig["remoteExecution"];
+  /** Machine that hosts this member (machines transport); undefined = this computer. */
+  homeMachineId?: string;
+  cloudRun?: ChatParticipantConfig["cloudRun"];
   skipToolchainPreflight: boolean;
   autoWatch: boolean;
 }
 
 export type ChatParticipantRuntimeOverride = Partial<Pick<
   ChatParticipantDraft,
-  "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch"
+  "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "cloudRun" | "homeMachineId" | "skipToolchainPreflight" | "autoWatch"
 >>;
 
 export const NEW_CHAT_ASSISTANT_PARTICIPANT_ID = "__new-chat-assistant__";
@@ -114,7 +117,6 @@ export function newChatAssistantParticipantDraft(
 ): ChatParticipantDraft {
   return chatParticipantConfigToDraftWithRuntimeOverrides(
     newChatAssistantParticipantConfig(kind),
-    {},
     runtimeOverride ? { [NEW_CHAT_ASSISTANT_PARTICIPANT_ID]: runtimeOverride } : {}
   );
 }
@@ -122,6 +124,10 @@ export function newChatAssistantParticipantDraft(
 export interface AddableSavedParticipantConfig {
   config: ChatParticipantConfig;
   invalidReason?: string;
+  /** What keeps the member from being added wherever it runs (its role, rules or handle). */
+  configReason?: string;
+  /** What keeps it from running on this computer: its CLI here is not ready. */
+  localCliReason?: string;
 }
 
 export function chatAgentModeLabel(mode: ChatAgentMode | undefined): string {
@@ -238,20 +244,11 @@ export const CHAT_AGENT_MODE_OPTIONS: Array<{ value: ChatAgentMode; label: strin
   { value: "auto", label: chatAgentModeLabel("auto") }
 ];
 
-export const CHAT_RUN_LOCATION_OPTIONS: Array<{ value: Extract<CloudRunRemoteExecutionMode, "local" | "remote">; label: string }> = [
-  { value: "local", label: "Local" },
-  { value: "remote", label: "Remote" }
-];
+export function chatProviderSupportsCloudRun(kind: ChatProviderKind | undefined): boolean {
+  return kind === "codex-cli" || kind === "claude-code";
+}
 
 export const WORKFLOW_MANAGER_ROLE_ID = "workflow-manager";
-
-export function normalizeChatRunLocation(value: unknown): Extract<CloudRunRemoteExecutionMode, "local" | "remote"> {
-  return value === "remote" ? "remote" : "local";
-}
-
-export function chatRunLocationLabel(value: unknown): string {
-  return normalizeChatRunLocation(value) === "remote" ? "Remote" : "Local";
-}
 
 export const CHAT_SHELL_ACTION_OPTIONS: Array<{ value: ChatShellPermissionAction; label: string }> = [
   { value: "allow", label: "Allow" },
@@ -304,7 +301,9 @@ export function chatParticipantConfigToDraft(
     hostId: participant.hostId?.trim() || undefined,
     agentMode: normalizeChatAgentMode(participant.agentMode),
     permissions: normalizeChatAgentPermissions(participant.permissions),
-    remoteExecution: normalizeChatRunLocation(participant.remoteExecution),
+    remoteExecution: participant.remoteExecution,
+    homeMachineId: participant.homeMachineId || undefined,
+    cloudRun: participant.cloudRun,
     skipToolchainPreflight: participant.skipToolchainPreflight === true,
     autoWatch: participant.roleConfigId === WORKFLOW_MANAGER_ROLE_ID || participant.autoWatchEnabled === true
   };
@@ -313,23 +312,17 @@ export function chatParticipantConfigToDraft(
 export function selectedChatParticipantDrafts(
   participants: ChatParticipantConfig[],
   selectedIds: Set<string>,
-  remoteExecutionByConfigId: Record<string, CloudRunRemoteExecutionMode> = {},
   runtimeOverridesByConfigId: Record<string, ChatParticipantRuntimeOverride> = {}
 ): ChatParticipantDraft[] {
   return participants
     .filter((participant) => selectedIds.has(participant.id))
-    .map((participant) => chatParticipantConfigToDraftWithRuntimeOverrides(
-      participant,
-      remoteExecutionByConfigId,
-      runtimeOverridesByConfigId
-    ));
+    .map((participant) => chatParticipantConfigToDraftWithRuntimeOverrides(participant, runtimeOverridesByConfigId));
 }
 
 export function selectedOrMentionedChatParticipantDrafts(
   participants: ChatParticipantConfig[],
   selectedIds: Set<string>,
   content: string,
-  remoteExecutionByConfigId: Record<string, CloudRunRemoteExecutionMode> = {},
   runtimeOverridesByConfigId: Record<string, ChatParticipantRuntimeOverride> = {}
 ): ChatParticipantDraft[] {
   const nextSelectedIds = new Set(selectedIds);
@@ -344,7 +337,6 @@ export function selectedOrMentionedChatParticipantDrafts(
   return selectedChatParticipantDrafts(
     participants.filter((participant) => !isChatAssistantParticipant(participant)),
     nextSelectedIds,
-    remoteExecutionByConfigId,
     runtimeOverridesByConfigId
   );
 }
@@ -359,9 +351,17 @@ export function addableSavedParticipantConfigs(
     .filter((participant) => !normalizedExistingHandles.has(participant.handle.toLowerCase()))
     .map((config) => {
       const draft = chatParticipantConfigToDraft(config);
+      const cliReason = validateChatCliAgents([{ kind: draft.kind, hostId: draft.hostId }], agents, settings.providers, settings.cliProviderHosts);
+      // A member on an added provider runs on this computer only, so its
+      // provider's problems hold wherever it is set to run.
+      const configReason = validateChatParticipantDrafts([draft], settings.chatRoleConfigs, new Set(), settings.chatBehaviorRules)
+        ?? (draft.hostId ? cliReason : undefined);
+      const localCliReason = draft.hostId ? undefined : cliReason;
       return {
         config,
-        invalidReason: validateChatParticipantDrafts([draft], settings.chatRoleConfigs, new Set(), settings.chatBehaviorRules) ?? validateChatCliAgents([draft], agents, settings.providers, settings.cliProviderHosts)
+        invalidReason: participantOptionInvalidReason({ config, configReason, localCliReason }),
+        configReason,
+        localCliReason
       };
     });
 }
@@ -378,7 +378,9 @@ export function sameParticipantDraft(draft: ChatParticipantDraft, participant: C
     (draft.hostId?.trim() || "") === (participant.hostId?.trim() || "") &&
     normalizeChatAgentMode(draft.agentMode) === normalizeChatAgentMode(participant.agentMode) &&
     chatAgentPermissionsEqual(draft.permissions, participant.permissions) &&
-    normalizeChatRunLocation(draft.remoteExecution) === normalizeChatRunLocation(participant.remoteExecution) &&
+    (draft.homeMachineId || undefined) === (participant.homeMachineId || undefined) &&
+    JSON.stringify(draft.cloudRun) === JSON.stringify(participant.cloudRun) &&
+    (draft.remoteExecution ?? "local") === (participant.remoteExecution ?? "local") &&
     draft.skipToolchainPreflight === (participant.skipToolchainPreflight === true) &&
     draft.autoWatch === (participant.autoWatchEnabled === true)
   );
@@ -435,7 +437,9 @@ export function normalizeChatParticipantDraftForSettings(draft: ChatParticipantD
     hostId: host?.id,
     agentMode: normalizeChatAgentMode(draft.agentMode),
     permissions: normalizeChatAgentPermissions(draft.permissions),
-    remoteExecution: normalizeChatRunLocation(draft.remoteExecution),
+    remoteExecution: draft.remoteExecution,
+    homeMachineId: draft.homeMachineId?.trim() || undefined,
+    cloudRun: draft.cloudRun,
     skipToolchainPreflight: draft.skipToolchainPreflight === true,
     autoWatch: isAutoWatchLockedRole(roleConfigId) || draft.autoWatch === true
   };
@@ -444,7 +448,7 @@ export function normalizeChatParticipantDraftForSettings(draft: ChatParticipantD
 export function updateChatParticipantDraft(
   draft: ChatParticipantDraft,
   settings: AppSettings,
-  patch: Partial<Pick<ChatParticipantDraft, "roleConfigId" | "behaviorRuleIds" | "kind" | "model" | "reasoningEffort" | "avatarId" | "hostId" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch">>
+  patch: Partial<Pick<ChatParticipantDraft, "roleConfigId" | "behaviorRuleIds" | "kind" | "model" | "reasoningEffort" | "avatarId" | "hostId" | "agentMode" | "permissions" | "remoteExecution" | "cloudRun" | "homeMachineId" | "skipToolchainPreflight" | "autoWatch">>
 ): ChatParticipantDraft {
   let next = { ...draft, ...patch };
   const kindChanged = patch.kind !== undefined && patch.kind !== draft.kind;
@@ -471,10 +475,11 @@ export function updateChatParticipantDraft(
       reasoningEffort: normalizeChatReasoningEffort(next.reasoningEffort, next.kind)
     };
   }
-  if (kindChanged && next.kind !== "codex-cli") {
+  if (kindChanged && !chatProviderSupportsCloudRun(next.kind)) {
     next = {
       ...next,
-      remoteExecution: "local"
+      remoteExecution: "local",
+      cloudRun: undefined
     };
   }
   if (!isChatAvatarIdForKind(next.avatarId, next.kind)) {
@@ -570,7 +575,9 @@ export function normalizedChatDrafts(drafts: ChatParticipantDraft[]): ChatPartic
     hostId: draft.hostId?.trim() || undefined,
     agentMode: normalizeChatAgentMode(draft.agentMode),
     permissions: normalizeChatAgentPermissions(draft.permissions),
-    remoteExecution: normalizeChatRunLocation(draft.remoteExecution),
+    remoteExecution: draft.remoteExecution,
+    homeMachineId: draft.homeMachineId?.trim() || undefined,
+    cloudRun: draft.cloudRun,
     skipToolchainPreflight: draft.skipToolchainPreflight === true,
     autoWatch: draft.autoWatch === true
   }));
@@ -623,14 +630,11 @@ export function validateChatParticipantDrafts(
 
 function chatParticipantConfigToDraftWithRuntimeOverrides(
   participant: ChatParticipantConfig,
-  remoteExecutionByConfigId: Record<string, CloudRunRemoteExecutionMode>,
   runtimeOverridesByConfigId: Record<string, ChatParticipantRuntimeOverride>
 ): ChatParticipantDraft {
   const draft = chatParticipantConfigToDraft(participant);
   const runtimeOverride = runtimeOverridesByConfigId[participant.id];
-  const remoteExecutionOverride = remoteExecutionByConfigId[participant.id] ?? runtimeOverride?.remoteExecution;
-  const next = runtimeOverride ? { ...draft, ...runtimeOverride } : draft;
-  return remoteExecutionOverride ? { ...next, remoteExecution: normalizeChatRunLocation(remoteExecutionOverride) } : next;
+  return runtimeOverride ? { ...draft, ...runtimeOverride } : draft;
 }
 
 export function validateChatStartupDrafts(
@@ -646,7 +650,7 @@ export function validateChatStartupDrafts(
       return "Chat Assistant role is required to start an empty chat.";
     }
     if (readyProviderKinds(agents, providers).length === 0) {
-      return "Set up and sign in to at least one CLI provider to start a chat.";
+      return NO_READY_CLI_MESSAGE;
     }
     return undefined;
   }

@@ -1,20 +1,19 @@
+import type { MemberRestartInProgress } from "../../../shared/memberRestart";
+import { memberSessionMoves } from "../../../shared/memberSessionMove";
 import React, { useState } from "react";
 import { ChevronLeft, ChevronRight, Plus, Users } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { IconButton } from "../primitives";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import type {
   ChatParticipant,
   ChatParticipantConfig,
   ChatRoleParticipantDefaults,
-  ChatParticipantWatcherState,
-  CloudRunRemoteExecutionMode
+  ChatParticipantWatcherState
 } from "../../../shared/types";
 import { CHAT_ASSISTANT_ROLE_ID, chatParticipantMentionHandle } from "../conversation/conversation-display";
 import {
-  CHAT_RUN_LOCATION_OPTIONS,
-  chatRunLocationLabel,
-  normalizeChatRunLocation,
   type AddableSavedParticipantConfig
 } from "./chat-participant-drafts";
 import { ChatParticipantRosterRow } from "./chat-participant-roster-row";
@@ -25,7 +24,9 @@ export interface ChatParticipantMenuViewProps {
   participantHasRunById: ReadonlyMap<string, boolean>;
   draft: string;
   addValidation?: string;
-  isRunning: boolean;
+  /** Members whose own work is live (chatMemberIdsWithLiveWork): they cannot
+   *  be removed until it ends. */
+  busyParticipantIds: ReadonlySet<string>;
   participantStatusById: ReadonlyMap<string, ChatParticipantRosterStatus>;
   participantWatchers?: Record<string, ChatParticipantWatcherState>;
   addParticipantEditor: React.ReactNode;
@@ -40,12 +41,17 @@ export interface ChatParticipantMenuViewProps {
   savedParticipantSummary: (participant: ChatParticipantConfig) => string;
   onDraftChange: (value: string) => void;
   onAddParticipant: () => void;
-  onAddSavedParticipant: (participant: ChatParticipantConfig, remoteExecution?: CloudRunRemoteExecutionMode) => void;
+  onAddSavedParticipant: (participant: ChatParticipantConfig) => void;
   onUpdateParticipantRuntime: (
     participantId: string,
     patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch">
   ) => void;
   onCompactParticipant: (participantId: string) => void;
+  onRestartParticipant: (participantId: string, stopBackgroundTasks: boolean) => Promise<boolean>;
+  /** Stops waiting for a restart (its run id). */
+  onStopRestart: (runId: string) => void;
+  /** Members whose restart has not ended. */
+  restartingById?: ReadonlyMap<string, MemberRestartInProgress>;
   onRemoveParticipant: (participantId: string) => void;
   onJumpToParticipantLastMessage: (participantId: string) => void;
   onManageInSettings: () => void;
@@ -55,7 +61,6 @@ export function ChatParticipantMenuView(props: ChatParticipantMenuViewProps): JS
   const [open, setOpen] = useState(false);
   const [view, setView] = useState<"roster" | "create">("roster");
   const [showSaved, setShowSaved] = useState(false);
-  const [savedRunLocations, setSavedRunLocations] = useState<Record<string, CloudRunRemoteExecutionMode>>({});
   const participantCountLabel = `${props.participants.length} ${props.participants.length === 1 ? "member" : "members"}`;
   const activeWatcher = props.participants.find((participant) => participant.autoWatch === true);
 
@@ -78,9 +83,18 @@ export function ChatParticipantMenuView(props: ChatParticipantMenuViewProps): JS
     setOpen(false);
   }
 
+  /** Its own turn or compaction runs: its settings wait for it to end, as a
+   *  dedicated CLI's settings apply to its next turn. */
+  function memberWorking(participant: ChatParticipant): boolean {
+    const status = props.participantStatusById.get(participant.id);
+    return status === "running" || status === "compacting";
+  }
+
   function participantRemoveDisabledReason(participant: ChatParticipant): string | undefined {
-    if (props.isRunning) {
-      return "Members cannot be removed while a turn is running";
+    if (props.busyParticipantIds.has(participant.id)) {
+      return memberWorking(participant)
+        ? "This member is busy."
+        : "This member is waiting for answers from other members.";
     }
     if (participant.id === props.participants.find((item) => item.roleConfigId === CHAT_ASSISTANT_ROLE_ID)?.id) {
       return "Chat Assistant cannot be removed";
@@ -91,34 +105,15 @@ export function ChatParticipantMenuView(props: ChatParticipantMenuViewProps): JS
     return undefined;
   }
 
-  function savedRunLocation(participant: ChatParticipantConfig): CloudRunRemoteExecutionMode {
-    return normalizeChatRunLocation(savedRunLocations[participant.id] ?? participant.remoteExecution);
-  }
-
   return (
     <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger asChild>
-        <Button
-          variant="outline"
-          size="sm"
-          title="Members"
-          aria-label={participantCountLabel}
+        <IconButton
+          label={participantCountLabel}
+          icon={Users}
+          tooltip="Members"
           data-testid="chat-participants-trigger"
-          className="chat-participants-trigger h-8 min-w-0 gap-2 rounded-full pl-1 pr-2.5 text-xs"
-        >
-          {props.participants.length > 0 ? (
-            <span className="chat-roster-avatars" aria-hidden>
-              {props.participants.slice(0, 4).map((participant) => (
-                <span className="chat-roster-avatar" key={participant.handle}>
-                  {props.renderParticipantAvatar(participant)}
-                </span>
-              ))}
-            </span>
-          ) : (
-            <Users size={15} aria-hidden />
-          )}
-          <span className="tabular-nums">{props.participants.length}</span>
-        </Button>
+        />
       </PopoverTrigger>
       <PopoverContent
         align="end"
@@ -129,14 +124,7 @@ export function ChatParticipantMenuView(props: ChatParticipantMenuViewProps): JS
         {view === "create" ? (
           <div className="chat-participant-create">
             <div className="chat-participant-create-head">
-              <button
-                type="button"
-                className="chat-participant-back"
-                onClick={() => setView("roster")}
-                aria-label="Back to members"
-              >
-                <ChevronLeft size={16} aria-hidden />
-              </button>
+              <IconButton size="xs" label="Back to members" icon={ChevronLeft} onClick={() => setView("roster")} />
               <span className="chat-popover-section-title">New member</span>
             </div>
             {props.addParticipantEditor}
@@ -147,7 +135,7 @@ export function ChatParticipantMenuView(props: ChatParticipantMenuViewProps): JS
               </Button>
               <Button
                 size="sm"
-                disabled={Boolean(props.addValidation) || props.isRunning}
+                disabled={Boolean(props.addValidation)}
                 onClick={() => {
                   props.onAddParticipant();
                   setView("roster");
@@ -166,7 +154,7 @@ export function ChatParticipantMenuView(props: ChatParticipantMenuViewProps): JS
                   key={participant.id}
                   participant={participant}
                   removeDisabledReason={participantRemoveDisabledReason(participant)}
-                  isRunning={props.isRunning}
+                  busy={memberWorking(participant)}
                   status={props.participantStatusById.get(participant.id) ?? "idle"}
                   autoWatchDisabledReason={
                     activeWatcher && activeWatcher.id !== participant.id
@@ -178,11 +166,15 @@ export function ChatParticipantMenuView(props: ChatParticipantMenuViewProps): JS
                   renderParticipantAvatar={props.renderParticipantAvatar}
                   participantRoleLabel={props.participantRoleLabel}
                   participantRoleArchived={props.participantRoleArchived}
-                  runLocationLocked={props.participantHasRunById.get(participant.id) === true}
+                  runLocationLocked={props.participantHasRunById.get(participant.id) === true && !memberSessionMoves(participant)}
+                  runLocationMoves={props.participantHasRunById.get(participant.id) === true && memberSessionMoves(participant)}
                   onInsertMention={insertParticipantMention}
                   onJumpToLastMessage={jumpToParticipantLastMessage}
                   onUpdateParticipantRuntime={props.onUpdateParticipantRuntime}
                   onCompactParticipant={props.onCompactParticipant}
+                  onRestartParticipant={props.onRestartParticipant}
+                  onStopRestart={props.onStopRestart}
+                  restartStatus={props.restartingById?.get(participant.id)}
                   onRemoveParticipant={props.onRemoveParticipant}
                 />
               ))}
@@ -212,32 +204,11 @@ export function ChatParticipantMenuView(props: ChatParticipantMenuViewProps): JS
                         <span>{props.savedParticipantRoleLabel(config)} · {props.savedParticipantSummary(config)}</span>
                         {invalidReason && <small>{invalidReason}</small>}
                       </span>
-                      {config.kind === "codex-cli" && (
-                        <label className="chat-saved-run-location" title={`Run ${chatRunLocationLabel(savedRunLocation(config)).toLowerCase()}`}>
-                          <span>Run</span>
-                          <select
-                            aria-label={`Run location for @${config.handle}`}
-                            value={savedRunLocation(config)}
-                            disabled={Boolean(invalidReason) || props.isRunning}
-                            onChange={(event) => {
-                              const remoteExecution = event.currentTarget.value as CloudRunRemoteExecutionMode;
-                              setSavedRunLocations((current) => ({
-                                ...current,
-                                [config.id]: normalizeChatRunLocation(remoteExecution)
-                              }));
-                            }}
-                          >
-                            {CHAT_RUN_LOCATION_OPTIONS.map((option) => (
-                              <option value={option.value} key={option.value}>{option.label}</option>
-                            ))}
-                          </select>
-                        </label>
-                      )}
                       <Button
                         variant="outline"
                         size="sm"
-                        disabled={Boolean(invalidReason) || props.isRunning}
-                        onClick={() => props.onAddSavedParticipant(config, savedRunLocation(config))}
+                        disabled={Boolean(invalidReason)}
+                        onClick={() => props.onAddSavedParticipant(config)}
                       >
                         <Plus size={16} />
                         Add

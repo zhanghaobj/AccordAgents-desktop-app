@@ -4,8 +4,8 @@ import type {
   ChatImageInput,
   ChatParticipant,
   ChatParticipantConfig,
-  CloudRunRemoteExecutionMode,
   ChatSkillMention,
+  Conversation,
   RepoFileMention
 } from "../../shared/types";
 import {
@@ -13,6 +13,7 @@ import {
   chatParticipants
 } from "../components/chat/chat-conversation-data";
 import { chatParticipantMentionHandle } from "../components/conversation/conversation-display";
+import { applyConversationUpdate, messagePageAfterUpdate } from "../../shared/conversationUpdates";
 import type { ChatParticipantDraft } from "../components/chat/chat-participant-drafts";
 import {
   activeChatRoleConfigs,
@@ -34,14 +35,14 @@ import {
 import type { AppState } from "./app-state";
 import type { ConversationActions } from "./use-conversation-actions";
 import { upsertConversationSummary } from "./conversation-summaries";
-import { normalizeAutoChatTitle, normalizeManualChatTitle } from "../../shared/chatTitles";
+import { newChatTitle } from "../../shared/newChat";
 import { persistLastViewedAt } from "./storage";
+import { cleanIpcError } from "../lib/ipc-error";
 import { serializeComposerDraft } from "../components/chat/chat-composer-draft-utils";
 import { revokePendingImageUrls } from "../components/chat/use-chat-composer-images";
 import {
-  cliProviderMetadata,
   isAgentSnapshotStale,
-  readinessForProvider,
+  NO_READY_CLI_MESSAGE,
   resolveAssistantProviderKind
 } from "../../shared/cliReadiness";
 
@@ -53,12 +54,14 @@ export interface ChatActions {
   sendChatMessage: (options?: SendChatMessageOptions) => Promise<boolean>;
   respondToChatMentions: (sourceMessageId: string, targetParticipantIds: string[], approve: boolean, continueRequester?: boolean) => Promise<void>;
   toggleChatReaction: (messageId: string, emoji: string) => Promise<void>;
+  dismissTurnFinishedNote: (messageId: string) => Promise<void>;
   respondToChatChoice: (sourceMessageId: string, choiceId: string, response: ChatChoiceResponse) => Promise<void>;
   addChatParticipant: () => Promise<void>;
-  addSavedChatParticipant: (config: ChatParticipantConfig, remoteExecution?: CloudRunRemoteExecutionMode) => Promise<void>;
-  updateChatParticipantRuntime: (participantId: string, patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch">) => Promise<void>;
+  addSavedChatParticipant: (config: ChatParticipantConfig) => Promise<void>;
+  updateChatParticipantRuntime: (participantId: string, patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "cloudRun" | "homeMachineId" | "skipToolchainPreflight" | "autoWatch">) => Promise<boolean>;
   removeChatParticipant: (participantId: string) => Promise<void>;
   compactChatParticipant: (participantId: string, options?: ChatRunScopeOptions) => Promise<boolean>;
+  restartChatParticipant: (participantId: string, stopBackgroundTasks?: boolean) => Promise<boolean>;
   startChatAccord: (options: StartChatAccordOptions) => Promise<boolean>;
   respondToChatAppToolApproval: (
     approvalId: string,
@@ -114,6 +117,9 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
       providers: state.settings.providers,
       explicitKind: state.settings.assistantProviderKind
     });
+    // The Assistant's CLI the screen showed: settings made for it in the
+    // member list do not carry over to another one.
+    const shownAssistantKind = resolveProvider(state.agents);
     let agents = state.agents;
     if (isAgentSnapshotStale(agents)) {
       try {
@@ -125,17 +131,13 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
     }
     const assistantProviderKind = resolveProvider(agents);
     if (!assistantProviderKind) {
-      const savedKind = state.settings.assistantProviderKind;
-      if (savedKind) {
-        const label = cliProviderMetadata(savedKind).label;
-        const readiness = readinessForProvider(savedKind, agents, state.settings.providers);
-        state.setError(`${label} is ${readiness === "disabled" ? "disabled" : "not ready"}. Change the Assistant provider in General Settings.`);
-      } else {
-        state.setError("Could not initialize an Assistant provider. Check General Settings and try again.");
-      }
+      // The saved Assistant CLI gives way to any ready one: none is ready.
+      state.setError(NO_READY_CLI_MESSAGE);
       return false;
     }
-    const assistantRuntimeOverride = state.selectedChatParticipantRuntimeOverrides[NEW_CHAT_ASSISTANT_PARTICIPANT_ID];
+    const assistantRuntimeOverride = assistantProviderKind === shownAssistantKind
+      ? state.selectedChatParticipantRuntimeOverrides[NEW_CHAT_ASSISTANT_PARTICIPANT_ID]
+      : undefined;
     const participants = [
       ...(hasChatParticipantRuntimeOverride(assistantRuntimeOverride)
         ? [newChatAssistantParticipantDraft(assistantProviderKind, assistantRuntimeOverride)]
@@ -144,7 +146,6 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
         state.settings.chatParticipantConfigs,
         state.selectedChatParticipantConfigIds,
         initialMessage,
-        state.selectedChatParticipantRunLocations,
         state.selectedChatParticipantRuntimeOverrides
       )
     ];
@@ -165,19 +166,45 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
     }
     state.startingChatRef.current = true;
     const runId = crypto.randomUUID();
+    const creation = new AbortController();
+    state.chatCreationRef.current = creation;
     state.setCurrentRunId(runId);
     state.setBusy(true);
     let createdConversationId: string | undefined;
+    // An Activity preview opened meanwhile is the User's later choice: the new
+    // chat must not replace it (Back from Activity lands on the new chat).
+    const openRequestAtStart = state.openConversationRequestRef.current;
+    const previewingElsewhere = (): boolean =>
+      state.railViewRef.current === "activity" && state.openConversationRequestRef.current !== openRequestAtStart;
+    // So is a chat opened from the sidebar or search while this one was being
+    // created: once it is on screen, the new chat does not take its place. An
+    // empty screen (still on New chat, or back from Activity) shows the new chat.
+    const showCreated = (created: Conversation): void => {
+      state.setConversation((current) =>
+        current && current.id !== created.id && state.openConversationRequestRef.current !== openRequestAtStart
+          ? current
+          : created);
+    };
     try {
       const result = await window.consensus.createChatConversation({
+        runId,
         title: initialChatTitle(initialMessage, imageAttachments),
         repoPath: state.repoPath.trim() || undefined,
         skipDefaultParticipants: participants.length === 0,
         participants
       });
       createdConversationId = result.conversation.id;
-      state.setConversation(result.conversation);
-      state.setWarnings(result.warnings);
+      creation.signal.throwIfAborted();
+      state.chatCreationRef.current = undefined;
+      if (!previewingElsewhere()) {
+        showCreated(result.conversation);
+        state.setWarnings(result.warnings);
+      }
+      // Opened Activity while this chat was being created: Back lands on it,
+      // not on an empty new-chat screen.
+      if (state.chatBeforeActivityRef.current && !state.chatBeforeActivityRef.current.conversationId) {
+        state.chatBeforeActivityRef.current = { conversationId: result.conversation.id };
+      }
       const sendResult = await window.consensus.sendChatMessage({
         conversationId: result.conversation.id,
         runId,
@@ -186,8 +213,10 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
         skillMentions,
         imageAttachments
       });
-      state.setConversation(mergeProgressIntoConversation(sendResult.conversation, state.progressLogRef.current.filter((item) => item.runId === runId)));
-      state.setWarnings([...result.warnings, ...sendResult.warnings]);
+      if (!previewingElsewhere()) {
+        showCreated(mergeProgressIntoConversation(sendResult.conversation, state.progressLogRef.current.filter((item) => item.runId === runId)));
+        state.setWarnings([...result.warnings, ...sendResult.warnings]);
+      }
       await refreshPersistedProviderPreference();
       state.setQuestion("");
       state.setNewChatPendingImages((current) => {
@@ -197,32 +226,38 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
       state.setNewChatRepoFileMentions([]);
       state.setNewChatSkillMentions([]);
       state.setNewChatPluginMentions([]);
-      state.setSelectedChatParticipantRunLocations({});
       state.setSelectedChatParticipantRuntimeOverrides({});
-      await conversationActions.refreshConversations();
+      await conversationActions.refreshConversations().catch(() => undefined);
       return true;
     } catch (caught) {
       const message = errorText(caught);
       if (createdConversationId) {
-        // Ingest failed before the first message was persisted, so the created
-        // conversation is empty. Soft-delete it and return to the new-chat screen
-        // with the text restored instead of stranding an empty conversation.
-        state.setConversation(undefined);
-        state.setQuestion(draftMessage);
-        try {
-          await window.consensus.setChatArchived({ conversationId: createdConversationId, archived: true });
-          await conversationActions.refreshConversations();
-        } catch {
-          // Best-effort cleanup; leave the empty conversation if archiving fails.
+        const conversationId = createdConversationId;
+        // A failed send can already have persisted. Check under the service's
+        // mutation lock so a concurrent message is never archived as empty.
+        const saved = await window.consensus.setChatArchived({
+          conversationId, archived: true, onlyIfEmpty: true
+        }).catch(() => window.consensus.getConversation(conversationId).catch(() => undefined));
+        if (saved?.metadata.archived === true) {
+          state.setConversation((current) => current?.id === conversationId ? undefined : current);
+          // Back from Activity returns to the restored draft, not the archived chat.
+          if (state.chatBeforeActivityRef.current?.conversationId === conversationId) {
+            state.chatBeforeActivityRef.current = {};
+          }
+          state.setQuestion(draftMessage);
+        } else if (saved && !previewingElsewhere()) {
+          showCreated(saved);
         }
+        await conversationActions.refreshConversations().catch(() => undefined);
       }
       if (message.toLowerCase().includes("cancel")) {
-        state.setWarnings((current) => [...current, "Chat turn cancelled."]);
+        state.setWarnings((current) => [...current, creation.signal.aborted ? "Chat creation cancelled." : "Chat turn cancelled."]);
       } else {
         state.setError(message);
       }
       return false;
     } finally {
+      state.chatCreationRef.current = undefined;
       state.setBusy(false);
       state.setCurrentRunId(undefined);
       state.startingChatRef.current = false;
@@ -271,14 +306,19 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
         throw new Error("Chat was not found.");
       }
       const wasActive = state.conversation?.id === conversationId;
+      state.clearChatMessageDraft(conversationId);
       state.archivedConversationIdsRef.current.delete(conversationId);
       state.setUnreadConversationIds((current) => {
         const next = new Set(current);
         next.delete(conversationId);
         return next;
       });
-      const { [conversationId]: _removedRevision, ...remainingRevisions } = state.activityRevisionByConversationRef.current;
-      state.activityRevisionByConversationRef.current = remainingRevisions;
+      // Keep a revision tombstone until outstanding list reads finish, so an
+      // older refresh cannot put the deleted chat back into the sidebar.
+      state.activityRevisionByConversationRef.current = {
+        ...state.activityRevisionByConversationRef.current,
+        [conversationId]: (state.activityRevisionByConversationRef.current[conversationId] ?? 0) + 1
+      };
       const { [conversationId]: _removedLastViewed, ...remainingLastViewed } = state.lastViewedAtRef.current;
       state.lastViewedAtRef.current = remainingLastViewed;
       persistLastViewedAt(remainingLastViewed);
@@ -295,6 +335,9 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
 
   async function sendChatMessage(options: SendChatMessageOptions = {}): Promise<boolean> {
     if (!state.conversation || state.conversation.kind !== "chat") return false;
+    // The draft belongs to the chat it was typed in; by the time the send
+    // settles the User may have opened another chat.
+    const conversationId = state.conversation.id;
     const draftBeforeSend = state.chatMessageDraft;
     const content = (options.content ?? state.chatMessageDraft).trim();
     const imageAttachments = options.imageAttachments ?? [];
@@ -311,11 +354,11 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
     state.setError(undefined);
     state.setWarnings([]);
     if (!options.chatThreadRootId) {
-      state.setChatMessageDraft("");
+      state.setChatMessageDraftForConversation(conversationId, "");
     }
     try {
       const result = await window.consensus.sendChatMessage({
-        conversationId: state.conversation.id,
+        conversationId,
         runId,
         content,
         skillMentions,
@@ -325,11 +368,16 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
         parentMessageId: options.parentMessageId,
         chatThreadRootId: options.chatThreadRootId
       });
-      state.setConversation((current) =>
-        current && current.id === result.conversation.id
-          ? mergeProgressIntoConversation(result.conversation, state.progressLogRef.current.filter((item) => item.runId === runId))
-          : current
-      );
+      state.setConversation((current) => {
+        if (!current || current.id !== result.conversation.id) {
+          return current;
+        }
+        // The reply carries the whole history; keep the window the user had
+        // loaded instead of turning it into every message of the chat.
+        const applied = applyConversationUpdate(current, result.conversation);
+        state.setMessagePage((previous) => messagePageAfterUpdate(previous, applied));
+        return mergeProgressIntoConversation(applied.conversation, state.progressLogRef.current.filter((item) => item.runId === runId));
+      });
       if (result.warnings.length > 0) {
         state.setWarnings(result.warnings);
       }
@@ -337,7 +385,7 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
       return true;
     } catch (caught) {
       if (!options.chatThreadRootId) {
-        state.setChatMessageDraft((current) => current || draftBeforeSend);
+        state.setChatMessageDraftForConversation(conversationId, (current) => current || draftBeforeSend);
       }
       const message = errorText(caught);
       if (message.toLowerCase().includes("cancel")) {
@@ -351,6 +399,7 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
 
   async function respondToChatMentions(sourceMessageId: string, targetParticipantIds: string[], approve: boolean, continueRequester = false): Promise<void> {
     await runBusyChatAction("Mention approval run cancelled.", async (runId) => {
+      const openRequest = state.openConversationRequestRef.current;
       const result = await window.consensus.respondToChatMentions({
         conversationId: state.conversation!.id,
         sourceMessageId,
@@ -359,8 +408,8 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
         continueRequester,
         runId
       });
-      state.setConversation(mergeProgressIntoConversation(result.conversation, state.progressLogRef.current.filter((item) => item.runId === runId)));
-      state.setWarnings(result.warnings);
+      updateIfStillOpen(result.conversation, runId);
+      if (state.openConversationRequestRef.current === openRequest) state.setWarnings(result.warnings);
       await conversationActions.refreshConversations();
     });
   }
@@ -371,7 +420,7 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
     try {
       const saved = await window.consensus.toggleChatReaction({ conversationId: state.conversation.id, messageId, emoji });
       if (saved) {
-        state.setConversation(saved);
+        updateIfStillOpen(saved);
         state.setSummaries((current) => upsertConversationSummary(current, saved));
       }
     } catch (caught) {
@@ -379,8 +428,21 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
     }
   }
 
+  // The note goes from the chat on every device: the main process removes it
+  // and the chat's next update shows it gone.
+  async function dismissTurnFinishedNote(messageId: string): Promise<void> {
+    if (!state.conversation || state.conversation.kind !== "chat") return;
+    state.setError(undefined);
+    try {
+      await window.consensus.dismissTurnFinishedNote({ conversationId: state.conversation.id, messageId });
+    } catch (caught) {
+      state.setError(errorText(caught));
+    }
+  }
+
   async function respondToChatChoice(sourceMessageId: string, choiceId: string, response: ChatChoiceResponse): Promise<void> {
     await runBusyChatAction("Choice response cancelled.", async (runId) => {
+      const openRequest = state.openConversationRequestRef.current;
       const result = await window.consensus.respondToChatChoice({
         conversationId: state.conversation!.id,
         sourceMessageId,
@@ -388,8 +450,8 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
         ...response,
         runId
       });
-      state.setConversation(mergeProgressIntoConversation(result.conversation, state.progressLogRef.current.filter((item) => item.runId === runId)));
-      state.setWarnings(result.warnings);
+      updateIfStillOpen(result.conversation, runId);
+      if (state.openConversationRequestRef.current === openRequest) state.setWarnings(result.warnings);
       await conversationActions.refreshConversations();
     });
   }
@@ -403,17 +465,13 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
     }
   }
 
-  async function addSavedChatParticipant(config: ChatParticipantConfig, remoteExecution?: CloudRunRemoteExecutionMode): Promise<void> {
-    const draft = chatParticipantConfigToDraft(config);
-    const participant = normalizedChatDrafts([{
-      ...draft,
-      remoteExecution: remoteExecution ?? draft.remoteExecution
-    }])[0];
+  async function addSavedChatParticipant(config: ChatParticipantConfig): Promise<void> {
+    const participant = normalizedChatDrafts([chatParticipantConfigToDraft(config)])[0];
     await commitChatParticipant(participant);
   }
 
-  async function updateChatParticipantRuntime(participantId: string, patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "skipToolchainPreflight" | "autoWatch">): Promise<void> {
-    if (!state.conversation || state.conversation.kind !== "chat") return;
+  async function updateChatParticipantRuntime(participantId: string, patch: Pick<ChatParticipant, "model" | "reasoningEffort" | "agentMode" | "permissions" | "remoteExecution" | "cloudRun" | "homeMachineId" | "skipToolchainPreflight" | "autoWatch">): Promise<boolean> {
+    if (!state.conversation || state.conversation.kind !== "chat") return false;
     state.setError(undefined);
     try {
       const saved = await window.consensus.updateChatParticipantRuntime({
@@ -424,13 +482,17 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
         agentMode: patch.agentMode,
         permissions: patch.permissions,
         remoteExecution: patch.remoteExecution,
+        homeMachineId: patch.homeMachineId,
+        cloudRun: patch.cloudRun,
         skipToolchainPreflight: patch.skipToolchainPreflight,
         autoWatch: patch.autoWatch
       });
-      if (saved) state.setConversation(saved);
+      if (saved) updateIfStillOpen(saved);
       await conversationActions.refreshConversations();
+      return true;
     } catch (caught) {
       state.setError(errorText(caught));
+      return false;
     }
   }
 
@@ -439,7 +501,7 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
     state.setError(undefined);
     try {
       const saved = await window.consensus.removeChatParticipant({ conversationId: state.conversation.id, participantId });
-      if (saved) state.setConversation(saved);
+      if (saved) updateIfStillOpen(saved);
       await conversationActions.refreshConversations();
     } catch (caught) {
       state.setError(errorText(caught));
@@ -470,6 +532,21 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
       return true;
     } catch (caught) {
       state.setError(errorText(caught));
+      return false;
+    }
+  }
+
+  /** Restarts a member's CLI process. The line its restart wrote arrives as
+   *  a chat update; an error stays in the chat's error banner. */
+  async function restartChatParticipant(participantId: string, stopBackgroundTasks = false): Promise<boolean> {
+    if (!state.conversation || state.conversation.kind !== "chat") return false;
+    const conversationId = state.conversation.id;
+    state.setError(undefined);
+    try {
+      await window.consensus.restartChatParticipant({ conversationId, participantId, runId: crypto.randomUUID(), stopBackgroundTasks });
+      return true;
+    } catch (caught) {
+      state.setError(cleanIpcError(caught));
       return false;
     }
   }
@@ -507,10 +584,9 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
     state.setError(undefined);
     try {
       const saved = await window.consensus.respondToChatAppToolApproval({ conversationId: state.conversation.id, approvalId, approve, scope, draftOverride, codexDecisionId });
-      const [nextSettings, nextSummaries] = await Promise.all([window.consensus.getSettings(), window.consensus.listConversations()]);
+      const [nextSettings] = await Promise.all([window.consensus.getSettings(), conversationActions.refreshConversations()]);
       state.setSettings(nextSettings);
-      if (saved) state.setConversation(saved);
-      state.setSummaries(nextSummaries);
+      if (saved) updateIfStillOpen(saved);
     } catch (caught) {
       state.setError(errorText(caught));
     }
@@ -527,7 +603,7 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
     state.setError(undefined);
     try {
       const saved = await window.consensus.addChatParticipant({ conversationId: state.conversation.id, participant });
-      if (saved) state.setConversation(saved);
+      if (saved) updateIfStillOpen(saved);
       await conversationActions.refreshConversations();
       return true;
     } catch (caught) {
@@ -560,6 +636,20 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
     }
   }
 
+  // An answer can take seconds to come back, and by then the User may be in
+  // another chat or previewing one in Activity. It updates its own chat only
+  // while that chat is still the one loaded, and never brings it back on
+  // screen: answering a card and moving on used to throw the User back to the
+  // card's chat once the answer landed.
+  function updateIfStillOpen(conversation: Conversation, runId?: string): void {
+    state.setConversation((current) => {
+      if (current?.id !== conversation.id) return current;
+      return runId
+        ? mergeProgressIntoConversation(conversation, state.progressLogRef.current.filter((item) => item.runId === runId))
+        : conversation;
+    });
+  }
+
   async function refreshPersistedProviderPreference(): Promise<void> {
     try {
       state.setSettings(await window.consensus.getSettings());
@@ -570,17 +660,13 @@ export function useChatActions(state: AppState, conversationActions: Conversatio
 
   return {
     startChat, renameChatConversation, setChatArchived, deleteChatConversation, sendChatMessage, respondToChatMentions,
-    toggleChatReaction, respondToChatChoice, addChatParticipant, addSavedChatParticipant,
-    updateChatParticipantRuntime, removeChatParticipant, compactChatParticipant, startChatAccord, respondToChatAppToolApproval
+    toggleChatReaction, dismissTurnFinishedNote, respondToChatChoice, addChatParticipant, addSavedChatParticipant,
+    updateChatParticipantRuntime, removeChatParticipant, compactChatParticipant, restartChatParticipant, startChatAccord, respondToChatAppToolApproval
   };
 }
 
 function initialChatTitle(initialMessage: string, imageAttachments: ChatImageInput[]): string {
-  if (initialMessage) {
-    return normalizeAutoChatTitle(initialMessage);
-  }
-  const filename = imageAttachments[0]?.filename?.trim();
-  return normalizeManualChatTitle(filename ? `Image: ${filename}` : "Image chat");
+  return newChatTitle(initialMessage, imageAttachments[0]?.filename);
 }
 
 function hasMultipleMentionedParticipants(content: string, conversation: Parameters<typeof chatAppToolApprovals>[0]): boolean {

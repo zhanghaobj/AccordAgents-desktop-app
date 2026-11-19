@@ -1,0 +1,558 @@
+# Machines transport — installing and upgrading a machine
+
+A machine is a computer that runs the app without a window. Getting the runtime
+onto it, and replacing it later, is the only thing in the machines transport
+that uses SSH. Which SSH paths exist, and the rule that a new one needs the
+User's approval before it is built, are in `docs/parity-requirements.md`
+("Every device talks only to the User's own server"). Installing also
+reads the identity the new runtime signs its requests with (the `identity`
+phase below), so the User's server admits the machine before it first
+connects. No chat ever travels over SSH: since 2026-10-29 the machine reads
+every chat from the User's server, which owns them (until then a copy of every
+chat went over this connection at setup). No message, chat change, turn,
+progress frame, approval, or Stop travels over SSH.
+
+`MachineInstallerService` (`src/main/services/machineInstaller.ts`) is that
+setup path. `scripts/machine-install-transport-guard.test.mjs` fails the build
+if `chat.ts`, `machineLink.ts`, `machineHost.ts`, `machineApprovalExecutor.ts`
+or the machine runtime entrypoint ever imports it.
+
+## Where it lives
+
+Settings → General → **Machines** → a machine row → **Set up** (or **Upgrade**).
+The panel takes the address, user, SSH key file, which provider the members on
+this machine will use, and an optional install directory; it then shows the
+steps below as a checklist, and **Put project on machine** does the one-time
+mirror bootstrap.
+
+`MachineInstallerService` is wired in `src/main/main.ts` and reached through
+`machines:install`, `machines:upgrade`, `machines:install-probe`,
+`machines:bootstrap-mirror` and `machines:install-list`, with progress pushed on
+`machines:install-progress`.
+
+## What the User sees
+
+One phase at a time, in this order, each with a message the Machines settings
+section can show verbatim:
+
+| Phase | What happens |
+|---|---|
+| `preflight` | `CloudRunDoctorService` checks and, if needed, repairs the machine: Node, git, `sqlite3`, the Codex sandbox kernel setting, and **the provider sign-in, performed on the machine**. `authUrl`/`authCode` on the snapshot are the device-auth handoff. |
+| `bundle` | The local `dist/machine` bundle is read and fingerprinted. |
+| `transfer` | The bundle is copied into `releases/<version>-<digest>` beside whatever is already there. |
+| `dependencies` | `npm ci --omit=dev` inside that release. |
+| `enroll` | The enrollment package is written to `enrollment.json` (mode 600). |
+| `drain` | The running runtime, its native supervisor and any provider process it owns are stopped, and their absence is **proven**. This step always runs, including on a first install. |
+| `identity` | At setup, and at an upgrade of a machine whose identity this desktop does not know: the staged runtime prints the identity it signs its requests with (`--device-identity`, made once and kept in the machine's own database; the private key never leaves), and this desktop records it, so the User's server's roster names the machine and its settings can be sealed for it before it first connects. Runs while nothing runs there. A failure here replaces nothing and starts the old runtime again (`old-runtime-still-installed`). |
+| `activate` | `current` is repointed at the new release and `install-state.json` records it. |
+| `service` | The systemd unit is written and enabled. |
+| `starting` | The unit is started. |
+| `verify` | The desktop waits for a hello that arrives **after** the restart and reports the new version, then reads back which release the machine actually runs. Not "systemd says it started", and not "something answered". |
+| `ready` | Done. |
+
+Terminal failures are `error` (nothing was attempted or nothing changed) and
+`needs-attention` (something on the machine needs the User). Every failure
+carries a `recovery` block naming what is true on the machine right now:
+`nothing-changed`, `old-runtime-still-installed`, `rolled-back`,
+`new-runtime-installed-not-started`, or `manual-drain-required`.
+
+## One deployment, one data directory, one unit
+
+The install directory decides the rest. `~/accordagents-machine` keeps the
+documented defaults (`~/.accordagents/machine`, unit `accordagents-machine`);
+any other directory gets `~/.accordagents/<name>` and the unit `<name>`. The
+machine computes this in the probe, so the desktop and the machine cannot
+disagree about it.
+
+That is not tidiness. Two deployments sharing one user-data directory are two
+executors for the same participant session, and a second install under the
+default unit name would take over the first one's service. Both happened during
+QA before this was fixed.
+
+## Where the runtime payload comes from
+
+The desktop installs a payload it carries itself; there is no download and no
+source checkout involved.
+
+| Where the app runs | Payload directory | Source |
+|---|---|---|
+| Packaged application | `<App>.app/Contents/Resources/machine` (Windows: `resources/machine`) | `packaged` |
+| Checkout | `dist/machine` | `checkout` |
+| `ACCORDAGENTS_MACHINE_BUNDLE_DIR` set | that directory | `override` |
+
+It ships as a **loose resource, never inside the asar**: `rsync` copies real
+files to the machine and nothing inside an asar has a path on disk. Packaging
+excludes `dist/machine` from the asar so the same 6 MB is not shipped twice,
+and `npm run build` produces it, so every packaging path — `npm run package`,
+`npm run make`, and the signed release through `signed:mac-arm64` — includes it
+by construction rather than by remembering.
+
+Windows has no `rsync`. From there the payload (and a project mirror, and the
+portable skills bundle) travels as one tar stream over `ssh`
+(`machineDirectoryUpload.ts`): into an empty folder it is unpacked directly,
+otherwise into a private folder that the machine's own `rsync` applies with
+the same options, so deletions and protected paths follow the same rules.
+Windows keeps no POSIX modes: a file is executable when git records it so or
+when it starts with `#!`. A mirror checked out with `core.autocrlf=true` gets
+LF line ends on the machine, as a Linux checkout of the same files has them.
+
+A payload may contain only regular files and directories. Anything else — a
+symbolic link, a pipe, a device — is **refused**, by the bundler when it builds
+the payload and by the desktop when it reads one. Skipping them, as both
+scanners first did, was a real hole: `rsync -a` copies a symbolic link to the
+machine as a link, so a payload could carry content that the manifest never
+described and the digest never covered. Verified on the real machine before the
+guard existed: a link `appSkills/escape.md` arrived and resolved to `/etc/hosts`
+there.
+
+`npm run build:machine` writes `payload.json` next to the bundle: the version
+and, for every file, its size and SHA-256. A packaged application cannot
+rebuild its payload, so it verifies it instead — exact file set, exact sizes,
+exact hashes — and refuses a payload that does not match the build rather than
+installing a runtime that cannot start. The manifest is excluded from the
+bundle digest that names the release directory on a machine, so adding it did
+not change how existing releases are identified.
+
+Two more refusals guard the same path. The payload's version must match the
+desktop's, so a stale payload cannot put a runtime on a machine that this
+desktop was never built against; and the manifest's version must match the
+payload's own `package.json`, which catches a payload assembled from two
+different builds. The override deliberately skips the version check, because
+that is what it exists for.
+
+Settings → Machines shows the result before anything is set up: *Runtime to
+install: 1.10.4-beta.2 · 8 files · 6.1 MB*, or, when the payload is missing or
+damaged, why — with "reinstall it from the release you downloaded" for a
+packaged application and "build it with `npm run build:machine`" for a checkout.
+
+## Layout on the machine
+
+```
+~/accordagents-machine/
+  enrollment.json          0600, the pairing key and the server's address; never replaced by an upgrade
+  install-state.json       {version, digest, installedAt, release}
+  releases/<version>-<digest>/    one directory per installed version
+  current -> releases/<...>       what the unit runs
+  workspace/mirrors/<slug>/repo   project mirror, and participant worktrees beside it
+~/.accordagents/machine/   the machine's own data — never touched by an upgrade
+```
+
+Releases are kept, not replaced in place. A running Node process is never asked
+to read a file that is being rewritten underneath it, and a rollback is a
+symlink flip rather than a re-download.
+
+## Why the upgrade is ordered the way it is
+
+**Stage first, drain second — but always drain.** Copying and `npm install`
+happen while the old runtime is still serving members, so the machine is down
+for seconds instead of minutes, and a failure during transfer changes nothing
+that runs. By the time the switch happens the probe is minutes old, so its
+"nothing is running" reading is not trusted: the drain runs unconditionally.
+Skipping it on a stale reading would flip the symlink under a live runtime, and
+the connect check would then see the *old* process answer and call the upgrade
+done.
+
+**A drain that cannot be proven refuses the upgrade.** After `systemctl stop`
+the drain waits for the unit to leave the active states and then looks for
+three things: the runtime process, its `nativeProcessSupervisor` process, and
+any provider process carrying this machine's `ACCORDAGENTS_USER_DATA_DIR`. If
+any of them is still there after SIGTERM, the upgrade stops with
+`manual-drain-required`, the staged release unused and the old version still
+running. It does not escalate to SIGKILL. The supervisor's whole purpose is to
+outlive a crashed runtime so it can close and verify provider trees; killing it
+destroys that proof and can leave a provider process alive — which is precisely
+the duplicate executor §2.4 of the accord forbids. A machine that keeps working
+on the old version is a better outcome than a machine running one member twice.
+
+**"Installed" means connected, running the new release.** After the machine
+says hello, the desktop re-reads `install-state.json` and the unit state: a
+connection alone can come from an older process that never restarted. If the
+machine does not connect within three minutes, or connects on the old release,
+an upgrade flips `current` back to the previous release, restarts it, and
+reports `rolled-back` with the tail of the service log. A first install has nothing to roll back to, so it reports
+`new-runtime-installed-not-started` with the same log.
+
+**A version fence, with semver precedence.** Installing an older runtime over a
+newer one would open the machine's SQLite with an old binary, so it is refused
+unless the User explicitly allows a downgrade. `1.10.4-beta.2` is correctly
+older than `1.10.4`: getting that backwards would refuse the one upgrade a beta
+tester needs.
+
+**An interrupted setup is never resumed silently.** If the desktop closes
+mid-install, the record is marked `needs-attention` on the next start. A retry
+re-probes the machine before changing anything; a half-finished drain is
+re-proven, not assumed.
+
+## Secrets
+
+The enrollment package carries the key the machine's first hello is sealed
+with, and the address of the User's server. It is written from **stdin**
+to a file created with `umask 077`, never interpolated into a script, never
+placed on a command line (so it is invisible in `ps` on the machine), never
+logged, and never stored in the install record. A regression test asserts all
+four. Provider credentials are never copied from the desktop: the machine logs
+in natively through the doctor's device-auth handoff, and the URL and code
+surface on the install snapshot.
+
+The tail of the service log is stored in settings and shown to the User, so
+key-shaped runs (40+ base64url or hex characters) are replaced with
+`[redacted]` before it is written down. A machine's log should never print a
+key; this does not depend on that being true.
+
+SSH access itself reuses what the desktop already has — the AWS worker key
+material or a configured host — through `cloudRunSshOptionArgs`, including
+connection multiplexing.
+
+### The automatic-stop key
+
+A machine on the app's AWS instance stops that instance itself after three
+idle hours, so the desktop does not have to be running. It needs its own AWS
+key for that, and the app cannot create IAM keys, so the one-time setup command
+creates it. The command makes three IAM users and prints their keys in one
+paste result: `accordagents-worker-<device>` for the app,
+`accordagents-power-<device>` for the machine, with only the inline policy
+`accordagents-machine-power` (`machinePowerPolicy`: describe instances in the
+region, start and stop app-tagged instances in the region), and the start key
+the User's server wakes the machine with (below).
+
+The command is pasted into the User's own shell, which on macOS is zsh, so it
+never relies on an unquoted variable being split into words. It never deletes
+a key that is still in use: the app's current key, the stop key the app has
+not handed over yet, and the stop key each of its machines on the instance
+runs with are passed in as keys to keep, and at IAM's two-key limit only a key
+outside that set is removed. A stop key a machine refused, and no machine
+holds, is not kept, so setting automatic stop up again can replace it. With
+both slots in use no new stop key is made, the result is printed without one,
+and the app keeps the stop key it has. If the account refuses any stop-key
+step, the app's key is still printed. The app's previous key stays valid until
+the next run of the command removes it.
+
+The key is handed over by the installer, never put on a command line:
+
+1. It goes only to a target whose pinned host key is the instance's own
+   (`accordagents-<instanceId>`).
+2. While the runtime still serves members, the installer runs
+   `accordagents-machine --check-power` from the release about to run, with
+   the key on stdin. The machine checks it is that instance (IMDSv2), then asks
+   AWS whether the key can read and, as a dry run, stop it. A new IAM key is
+   retried for up to a minute while IAM catches up. Nothing is written.
+3. A key AWS or the instance refuses exits with `MACHINE_POWER_REFUSED_EXIT_CODE`
+   (3). That refusal is recorded on the install record (`powerError`), and the
+   automatic update does not hand that key over again; the Update button does.
+   Any other failure (an unreachable AWS, a dropped connection, a busy host) is
+   temporary (`powerRetry`), and the automatic update tries the key again an
+   hour later. Either way a runtime that only needed the key is not stopped.
+4. After the drain, `--configure-power` seals the checked key into the
+   machine's settings; it takes a moment.
+5. The key counts as taken (`power` on the record) only once the runtime has
+   started with it and connected on the new release. If the runtime does not
+   come back, `--revert-power` puts back the key it had before (or none), the
+   runtime is started again either way, and the new key is tried again later
+   rather than marked refused, because the cause may as well be the server or
+   the release.
+
+Automatic updates hand a new key over in the same idle-gated update that
+replaces the runtime, so a member's turn is never cut off for it. Pasting a new
+setup result re-checks machines right away.
+
+Settings → AWS shows automatic stop as one switch. Turning it on without a stop
+key opens a dialog with the setup command for the instance's region, ready to
+copy, and the box for its result; the switch reads on once that result is
+applied (`cloud-runs:aws-auto-stop` saves the key, sets
+`machineAutoStopEnabled` and sends the settings to connected machines). With a
+key saved, the switch turns automatic stop off and on again without the
+command. The setting travels to machines in the settings snapshot, because the
+machine decides when to stop; switched off, its runtime never stops the
+instance, and this desktop's own idle stop is held too.
+
+Agents working keep the instance up by design and are not reported. Anything
+else that keeps a switched-on instance from stopping by itself is shown only in
+Diagnostics, in plain words and with what fixes it: AWS does not accept the
+stop key (set up again), the machine could not take the key (Try again, which
+clears the retry count and asks the automatic update to hand the key over once
+the machine is idle, with new turns held), or the machine cannot check whether
+agents are working. Switching automatic stop back on counts three idle hours
+from then.
+
+The program on the machine is brought back by the desktop itself
+(`MachineRecoveryService`). It looks when the instance has been running for
+five minutes and the program has been out of touch for five minutes by this
+desktop's own watch; the watch counts only while this desktop is in the
+machine's room on the User's server and starts again after a sleep (timer
+ticks far apart, even during a check) or a stop of the instance. It then asks
+the machine over SSH, having renewed this device's SSH access; nothing is
+started, grown or held to the configured size for it:
+
+- the program runs (its unit is active and the unit's own process has been
+  up for a minute; one its unit keeps restarting does not count): it is left
+  alone.
+  Being out of touch is then the link, which a new setup would not fix, and
+  every restart would count as work and keep the instance from stopping.
+  Half an hour after the instance started, Diagnostics says this computer has
+  not heard from it.
+- it does not run, but agents of this deployment still do: they are waited
+  for; a wait that outlasts one look is said in Diagnostics.
+- it does not run and no agent does: the program of the machine that was
+  watched is set up again the way choosing Cloud run does, with that
+  machine's turns held meanwhile. Having asked the machine itself, the setup
+  is not held back by what the program last reported or by a turn waiting
+  for it. A program back by the time the setup starts is left to the
+  automatic update; such a setup is marked (`recovery-…`) and its drain
+  refuses a program that reconnected while the new release was being staged,
+  which the Machines row does not show as a failure. The Settings button
+  that sets the program up takes the usual way to the instance, size check
+  included; only the automatic recovery never starts or grows it.
+
+The machine is looked at again after fifteen minutes; after a failed setup
+the wait doubles, up to four hours. Only what did not come back is shown, in
+Diagnostics, as itself rather than as a detail of automatic stop, with the
+reason and with what happens next; there is nothing to press. An update the
+desktop's closing cut short (`interrupted`) is finished by the automatic
+update, not held back as a failure.
+
+Agents run on the machine as the same OS user, so they can read the sealed key
+and the key that seals it. What they can do with it is what the policy allows:
+read every instance in the region, and start or stop app-tagged instances in
+the region.
+
+### The start key
+
+A stopped machine is started by the User's server, with a third key from the
+same setup command: `accordagents-wake-<device>` with only the inline policy
+`accordagents-machine-wake` (`machineWakePolicy`: start app-tagged instances
+in the region). It cannot read, stop or delete anything. The command makes it
+only once: while the start key the app holds still exists in IAM, a rerun
+makes none, and the app keeps the one it has. A permission update uses its own
+command, which touches no key.
+
+The desktop gives the key to the server (`PUT /v1/machine-wake`, accepted only
+from the desktop that set the server up), and only while a phone is paired
+with it; with no phone paired the server holds no key. The server starts the
+machine when work for one of its members has waited unread for half a minute,
+and when the phone's Wake button asks it to. The phone holds no key.
+
+A phone paired the old way, through the relay, was given a copy of the key in
+its pairing link and keeps it; the app does not remind of it. To end that copy: delete the access key of
+`accordagents-wake-<device>` in AWS IAM, run the setup command again (it makes
+a new start key because the app's no longer exists), and paste the result.
+
+## The project mirror
+
+`bootstrapProjectMirror` puts a project on a machine **once**. After that the
+mirror is the machine's own working copy: the participant pulls, commits,
+pushes and opens pull requests from it.
+
+- An existing clean mirror is **reused**; nothing is copied.
+- A mirror with uncommitted changes is **refused** and left untouched.
+- Only a project the machine does not have is copied, and then `rsync --delete`
+  cannot destroy anything because there is nothing there.
+- Worktrees a participant created beside the mirror are listed and never
+  touched. The app creates no worktrees, here or anywhere.
+- There is no automatic resync, no file watcher, and no write-back.
+
+## How large this gets, and where it ends up
+
+Measured on 2026-09-07 against the real `npm run build:machine` output at
+`1.10.4-beta.2`: **6,397,743 bytes in 8 files**, of which 4.0 MB is the source
+map and 2.0 MB the runtime bundle. One verified read — per-file hashes for the
+manifest check and the release digest in the same pass — takes about 30 ms, and
+it runs once per install and once when the Machines screen opens.
+
+That payload is also what every packaged application now carries: 6.1 MB added
+to the app bundle once, not per machine and not per install.
+
+It travels as an `rsync -az` stream over SSH. It does not go through argv, a
+SQLite statement, a frame in the server's rooms, or an HTTP body. The remote
+scripts are 1–4 KB of static text with paths substituted, delivered on stdin
+(or as one argument when stdin carries the enrollment) — far below `ARG_MAX`,
+and they contain no chat data at any size.
+
+What is stored on the desktop is one `MachineInstallRecord` per machine in
+`settings.json` (`machineInstalls`): SSH target, paths, service name, installed
+version and the last operation snapshot — a few hundred bytes, bounded, one per
+machine. It is deliberately excluded from `exportMachineSettingsSnapshot`,
+because it carries this desktop's way into the machine, and it is deleted with
+the machine record.
+
+## What is verified, and what is not
+
+### Real machine, real relay, real UI — 2026-09-06/07
+
+Driven through the Settings → Machines panel of an isolated Electron instance
+(own profile, CDP port 9236) against the User's EC2 (`i-0943b28f7231ab93c`,
+Ubuntu 24.04, Linux x64, Node 22.23.1, systemd 255) over the public relay
+`wss://relay.accordagents.com/v1/relay`. Codex was already signed in on the
+machine as `ubuntu`; nothing was copied from the desktop. A separate install
+root (`~/accordagents-installer-qa`), data directory and unit were used, and the
+existing `~/accordagents-machine` deployment, `~/.accordagents/machine-qa` and
+every repository, worktree and uncommitted file on the box were left untouched
+(verified before and after).
+
+| # | Scenario | Result |
+|---|---|---|
+| 1 | Install from nothing | `ready` in 16 s. Unit `accordagents-installer-qa.service` active, `enrollment.json` mode 600, own data directory created, hello reported `1.10.4-beta.2`. |
+| 2 | Upgrade blocked by a process this install owns that will not exit | 213 s, `needs-attention` / `manual-drain-required`, blocking pid reported, `current` and `install-state.json` unchanged, the staged release unused. |
+| 3 | Upgrade `1.10.4-beta.2` → `1.10.5-qa.2` | `ready` in 16 s. Hello reported the **new** version, both releases kept, enrollment and machine data preserved (`machine-outbox.json` survived). |
+| 4 | Upgrade to a build that exits on start | 197 s, rolled back to `1.10.5-qa.2`, machine connected again, journal tail shown, broken release kept but not active. |
+| 5 | Project mirror: bootstrap, then dirty, then clean | `created`; after uncommitted edits `refused` with both changes intact and a participant-created `git worktree` untouched; after committing on the machine `reused`, nothing copied, the machine's own commit still there. |
+| 6 | Desktop killed during `verify` of an upgrade | After restart: `needs-attention` / `new-runtime-installed-not-started`, retryable, nothing resumed automatically, the machine exactly where it was left. |
+| 7 | Downgrade | Refused with the versions named; nothing on the machine changed. |
+| 8 | Forward upgrade over the broken build | `ready` in 16 s; the machine recovered from a crash-looping release. |
+| 9 | Preflight with "Provider to sign in: Codex CLI" | Passed; the machine was already signed in. |
+
+Screenshots: `screenshots/qa-machine-install-ready.png`,
+`screenshots/qa-machine-installer-settings.png`.
+
+Two defects were found by this QA and fixed here, neither of which the unit
+tests could have caught, because they fed the installer canned probe output:
+
+1. The probe was told to use the default unit name, so a deployment in its own
+   directory installed itself as `accordagents-machine.service` — the exact
+   collision the derived layout exists to prevent.
+2. After a refused drain the message said "the machine keeps working". The drain
+   stops the unit before it discovers the stray process, so the machine was in
+   fact down. It now says that, and says why it is deliberately not restarted.
+
+### Focused checks
+
+31 cases in `machineInstaller.test.js` plus the transport/shell guard: the phase
+order, the drain running before the switch even on a first install, the derived
+unit name, the enrollment never reaching a command line or a log, a refused
+drain replacing nothing (machine up and machine down), rollback after a failed
+connect and after a connect on the old release, the required-provider check and
+the sign-in hand-off, an upgrade keeping its pairing, the no-op re-install, the
+Node-20 refusal, the node-pty/build-tools failure message, the version fence
+including betas, log redaction, interrupted-setup recovery, and the three mirror
+outcomes. Every generated script is parsed by a real `bash -n`, including with a
+hostile path containing a quote.
+
+### Packaged macOS application — 2026-09-07
+
+Built locally with `npm run build && npx electron-forge package
+--platform=darwin --arch=arm64`, launched from
+`out/AccordAgents-darwin-arm64/AccordAgents.app/Contents/MacOS/AccordAgents`
+with an isolated user-data directory and CDP port 9237, and read through the
+real Settings → Machines screen:
+
+- Healthy payload: *Runtime to install: 1.10.4-beta.2 · 8 files · 6.1 MB*,
+  `data-source="packaged"` — located and hashed from the application's own
+  resources, with no checkout involved.
+- `accordagents-machine.cjs` truncated to 200 bytes in the packaged app:
+  *"… is damaged: accordagents-machine.cjs does not match the build. This copy
+  of AccordAgents is incomplete; reinstall it from the release you downloaded."*
+- `Contents/Resources/machine` removed entirely: *"The machine runtime payload
+  is missing from … This copy of AccordAgents is incomplete; reinstall it…"*
+- Payload restored; the packaged-contents test passes again.
+
+Screenshots: `screenshots/qa-machine-payload-packaged.png`,
+`screenshots/qa-machine-payload-corrupt.png`.
+`scripts/packaged-app-contents.test.mjs` now checks any packaged application in
+`out/` for the payload, every file's size and hash against the manifest, and
+that the payload version equals the application version — and that the asar
+contains no `dist/machine` entry.
+
+### Packaged payload onto the real machine — 2026-09-07
+
+A **component check**, not Settings UI QA: the same rsync invocation
+`defaultBundleUpload` builds (same helpers, same flags) copying
+`AccordAgents.app/Contents/Resources/machine` to a scratch directory on the
+User's EC2 (`i-0943b28f7231ab93c`, `100.48.98.97`). 6,397,257 bytes in 8 files
+arrived in 2.0 s; every file was re-hashed **on the machine** against
+`payload.json` with zero mismatches, and `find ! -type f ! -type d` found
+nothing. The scratch directory was removed afterwards. This proves the packaged
+resource directory is transferable and arrives intact; it does not prove the
+Settings flow, which is blocked below.
+
+### Not verified
+
+- The interactive provider sign-in hand-off. The machine was already signed in,
+  and signing Codex out on the shared box would have destroyed another
+  engineer's authentication. The desktop's relaying of the URL and code is
+  covered by a focused test, not by a real device-auth round trip.
+- A user-scope (`systemctl --user`) install: this machine has passwordless
+  sudo, so every real run took the system-unit path.
+- Windows and macOS as machine targets. This is Linux only.
+- **Installing onto a Linux machine from the packaged application, through
+  Settings.** Blocked on this Mac by the macOS secret store, not by the
+  installer. Details below.
+- Signing and notarization of the new loose resource: the release path's
+  `osxSign` pass over `Contents/Resources/machine` has not been exercised.
+
+#### The exact blocker for packaged-app pairing
+
+macOS keeps one safe-storage keychain item per application name. On this Mac
+`AccordAgents Safe Storage` / `AccordAgents Key` already exists in the login
+keychain (created 2026-06-07 by the installed, Developer-ID-signed app). A
+locally packaged build has a different code identity, so:
+
+- **Unsigned local package:** the lookup fails with
+  `errSecAuthFailed (-25293)`, `safeStorage.isEncryptionAvailable()` is false,
+  and `machines:create` refuses with "Machine enrollments need the system secret
+  store, which is not available on this computer." No machine can be added, so
+  no install can start.
+- **Ad-hoc signed local package:** macOS raises a modal Keychain authorization
+  dialog for that existing item and the app blocks before its debugging port is
+  reachable. Nothing in an unattended session can answer it, and answering it
+  would grant a locally built binary access to the real application's encrypted
+  settings.
+- **Renaming the product does not help.** A build packaged as `AccordAgentsQA`
+  with its own bundle id still reached the `AccordAgents` item and created no
+  item of its own, so a QA build cannot get a separate secret store this way.
+
+The unblock is a package signed with the same identity as the installed
+application (`Developer ID Application: … (VPQ8HUMJ2S)`, which is present in the
+keychain) and the same bundle identifier — that is, the real release path. That
+uses the User's signing key, so it is her call, not an engineer's. Everything on
+the installer side that does not need a secret is proven: the packaged app
+locates, hashes and version-checks its payload through the real Settings screen,
+and that payload transfers to the real machine intact.
+
+## Automatic idle stop on a shared instance
+
+Idle is measured per deployment: each has its own user-data directory, its own
+SQLite and its own scheduler. The instance they run on is shared. Without
+coordination the first deployment to reach three hours idle would stop the
+instance underneath another deployment's provider turn or maintenance lease,
+destroying work it cannot see.
+
+Every runtime publishes one claim file in `/tmp/accordagents-host-power`
+(cleared on boot, readable across OS users) saying what it is doing, refreshes
+it on every idle poll, and reads the others before it allows a stop. The rules
+are deliberately one-sided: a claim from another boot or from a process that is
+gone is pruned, and a claim whose process is alive but has stopped refreshing
+counts as **busy**. A machine that never stops is a visible cost; a stop that
+kills another deployment's turn is lost work. If the directory cannot be used
+at all, automatic stop is suspended with a visible warning rather than taken
+without coordination.
+
+**Residual, stated rather than hidden:** the check runs immediately before the
+local fence, so the window in which another deployment could start work
+unnoticed is sub-second rather than hours. Closing it completely needs a
+host-wide admission lock that every deployment consults before admitting native
+work; that is not in this change.
+
+## Upgrading a release that predates maintenance
+
+`--maintenance` did not always exist. An older runtime's argument parser
+ignores unknown flags, so `node <old runtime> --maintenance --user-data <dir>
+-- <command>` would not run the command at all — it would start a **second
+runtime on that user-data directory**, which is the duplicate executor the
+transport forbids.
+
+Every payload now ships a `maintenance-v1` marker, the probe reports whether
+the installed release has one, and the wrapper refuses rather than exec a
+release without it. An upgrade from an older release is still protected: the
+steps before staging only create a new release directory — they cannot disturb
+a running runtime or an existing stop fence — and from the drain onward the
+wrapper uses the release that was just staged, which always understands the
+flag. The User sees a warning saying exactly that.
+
+## Still open
+
+- A crash-looping release restarts every 3 s for the whole three-minute connect
+  window (56 restarts observed) before the rollback. It is bounded and it
+  recovers, but a start limit is worth considering.
+- The provider selector defaults to "Do not check", which preserves the previous
+  behaviour exactly. Whether it should default to Codex — so a machine that
+  cannot host anything is caught at setup rather than at the first turn — is a
+  product decision for the User, not one to make here.

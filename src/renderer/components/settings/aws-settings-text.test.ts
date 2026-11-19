@@ -1,0 +1,91 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { updateFailureText } from "./aws-program-section";
+import { setupItems } from "./aws-setup-section";
+import { formatBytes, keptText } from "./use-aws-disk";
+import { deleteQuestion } from "./aws-disk-browser";
+import { awsStatusNeedsAttention } from "./use-aws-attention";
+import type { AwsWorkerStatus } from "../../../shared/types";
+
+test("a failed update reads as one sentence with its cause", () => {
+  assert.equal(updateFailureText("1.11.2-beta.3", "the machine's disk is full"), "The update to 1.11.2-beta.3 failed: the machine's disk is full.");
+  assert.equal(updateFailureText("1.11.2-beta.3", "Runtime update failed: ssh exited with code 1: npm ERR! network."),
+    "The update to 1.11.2-beta.3 failed: ssh exited with code 1: npm ERR! network.");
+  assert.equal(updateFailureText(undefined, undefined), "The last update failed.");
+  // A cause that starts with an acronym keeps its capitals.
+  assert.equal(updateFailureText("1.2.0", "SSH connection failed"), "The update to 1.2.0 failed: SSH connection failed.");
+  assert.equal(updateFailureText("1.2.0", "AWS did not return an address"), "The update to 1.2.0 failed: AWS did not return an address.");
+  assert.equal(updateFailureText("1.2.0", "Npm could not reach the registry"), "The update to 1.2.0 failed: npm could not reach the registry.");
+});
+
+test("sizes read the way Finder shows them", () => {
+  assert.equal(formatBytes(2_260_000_000), "2.3 GB");
+  assert.equal(formatBytes(900_000_000), "900 MB");
+  assert.equal(formatBytes(4_000), "4 KB");
+  // A value that rounds up to the next unit is said in that unit.
+  assert.equal(formatBytes(0), "0 B");
+  assert.equal(formatBytes(999), "999 B");
+  assert.equal(formatBytes(999_600), "1 MB");
+  assert.equal(formatBytes(999_400), "999 KB");
+  assert.equal(formatBytes(999_600_000), "1.0 GB");
+  assert.equal(formatBytes(999_400_000), "999 MB");
+  assert.equal(formatBytes(1e9), "1.0 GB");
+});
+
+test("what a change kept is said by its reason, and an error is not called in use", () => {
+  assert.equal(keptText([]), undefined);
+  assert.equal(keptText([{ path: "/a", reason: "error", message: "Permission denied" }]), "1 item could not be removed: Permission denied.");
+  assert.equal(keptText([{ path: "/a", reason: "in-use" }, { path: "/b", reason: "unpushed" }, { path: "/c", reason: "in-use" }]),
+    "3 items stayed: in use right now; has commits not pushed anywhere.");
+});
+
+test("setup rows speak in product words; a provider's install and sign-in are one row", () => {
+  const items = setupItems([
+    { id: "connect", label: "SSH connection", status: "pass" },
+    { id: "codex", label: "Codex CLI", status: "pass" },
+    { id: "codex-auth", label: "Codex signed in", status: "fail", fixable: true },
+    { id: "claude", label: "Claude Code CLI", status: "warn", fixable: true },
+    { id: "claude-auth", label: "Claude Code signed in", status: "warn", fixable: true },
+    { id: "gh", label: "GitHub CLI", status: "fail", fixable: true },
+    { id: "sudo", label: "Passwordless sudo", status: "pass" },
+    { id: "userns", label: "Unprivileged user namespaces", status: "fail", fixable: true }
+  ] as never);
+  const byKey = Object.fromEntries(items.map((item) => [item.key, item]));
+  assert.equal(byKey["codex-auth"].label, "Codex");
+  assert.equal(byKey["codex-auth"].fix, "sign-in");
+  assert.equal(byKey["codex-auth"].provider, "codex-cli");
+  assert.equal(byKey["codex-auth"].required, true);
+  // Claude is not used here: not installed is said, but it is not a failure.
+  assert.equal(byKey.claude.required, false);
+  assert.equal(byKey.claude.fix, "install");
+  assert.equal(byKey["claude-auth"], undefined, "one row per provider");
+  assert.equal(byKey.gh.label, "GitHub CLI");
+  assert.match(byKey.gh.detail, /cannot open pull requests/);
+  assert.equal(byKey.userns.label, "Codex sandbox");
+  assert.equal(byKey.userns.fix, "fix");
+  assert.equal(byKey.sudo.label, "Administrator rights");
+  assert.equal(byKey.connect.ok, true);
+});
+
+test("what a running setup has not reached yet does not mark AWS in Settings", () => {
+  const notInstalled = { configured: true, state: "running", autoStop: { enabled: true, needsSetup: false,
+    problem: { message: "Works once the cloud program is installed (see Cloud program)." } } } as AwsWorkerStatus;
+  assert.equal(awsStatusNeedsAttention(notInstalled), true);
+  assert.equal(awsStatusNeedsAttention({ ...notInstalled, operation: { operationId: "op", phase: "setting-up", message: "", updatedAt: "" } }), false);
+  assert.equal(awsStatusNeedsAttention({ ...notInstalled, operation: { operationId: "op", phase: "error", message: "", updatedAt: "" } }), true);
+});
+
+test("the delete question names what goes, how much, and whose work goes with it", () => {
+  const one = deleteQuestion([{ name: "AccordAgents-0a6205133d", bytes: 2_971_062_272, work: ["changes", "unpushed"] }], 2_971_062_272);
+  assert.equal(one.title, "Delete AccordAgents-0a6205133d?");
+  assert.equal(one.description, "AccordAgents-0a6205133d (3.0 GB) will be deleted from the instance. Its members' work goes with it: uncommitted changes, unpushed commits. The instance has no trash, so this cannot be undone.");
+  const many = deleteQuestion([
+    { name: "a", bytes: 1000, work: ["worktree"] }, { name: "b", bytes: 1000, work: ["unpushed"] },
+    { name: "c", bytes: 1000, work: [] }, { name: "d", bytes: 1000, work: [] }, { name: "e", bytes: 1000, work: [] }
+  ], 5000);
+  assert.equal(many.title, "Delete 5 items?");
+  assert.equal(many.description, "a, b, c and 2 more (5 KB) will be deleted from the instance. 2 of them hold members' work, which goes with them: member's worktree, unpushed commits. The instance has no trash, so this cannot be undone.");
+  assert.equal(deleteQuestion([{ name: "logs", bytes: 2_000_000, work: [] }], 2_000_000).description,
+    "logs (2 MB) will be deleted from the instance. The instance has no trash, so this cannot be undone.");
+});

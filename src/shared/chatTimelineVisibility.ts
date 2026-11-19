@@ -1,4 +1,5 @@
 import { ARTIFACT_NOTE_MESSAGE_SOURCE } from "./artifacts";
+import { turnFinishedNoteOf } from "./turnFinishedNoteSource";
 import type { ChatMessage } from "./types";
 
 export function isParticipantRequestWaitingStatus(content: string): boolean {
@@ -26,5 +27,26 @@ export function isChatMessageHiddenFromTimeline(
   if (message.metadata?.appMessageSource === ARTIFACT_NOTE_MESSAGE_SOURCE) {
     return false;
   }
+  // So is the note that a member finished answering above the newest messages.
+  if (turnFinishedNoteOf(message)) {
+    return false;
+  }
   return options.showSystemMessages !== true;
+}
+
+/** A message an auto-watching member reacts to: a finished user message, or
+ *  another member's finished reply, shown on the timeline. */
+export function isAutoWatchStableMessage(
+  message: Pick<ChatMessage, "role" | "content" | "metadata" | "status" | "participantId">,
+  participantId: string
+): boolean {
+  if (message.metadata?.autoWatchTrigger || isChatMessageHiddenFromTimeline(message)) {
+    return false;
+  }
+  if (message.role === "user") {
+    return message.status !== "pending";
+  }
+  return message.role === "participant" &&
+    message.participantId !== participantId &&
+    message.status !== "pending";
 }

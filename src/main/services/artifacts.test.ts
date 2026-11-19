@@ -3,19 +3,38 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { ArtifactService } from "./artifacts";
+import { ArtifactService, SUBMIT_OWN_DRAFT_FIRST_MESSAGE } from "./artifacts";
 import { ArtifactStore } from "./artifactStore";
+import { ARTIFACT_REVISION_SCHEMA } from "./artifactRevisions";
 import type { ArtifactDraftRecord, ArtifactOperationRecord } from "./artifactStore";
-import { runCommand } from "./command";
+import { CommandError, runCommand } from "./command";
 import { resolveSqliteExecutable } from "./sqliteCli";
 import { parseMarkdownInline } from "../../shared/markdownInline";
 import { unifiedLineDiff } from "../../shared/artifactDiff";
+import { artifactNoteActorLabel, artifactNoteVerb, parseArtifactNoteCard } from "../../shared/artifactNoteCard";
 import type { ArtifactError, ArtifactReadResult, ArtifactResult, PublishedArtifactReadResult } from "../../shared/types";
 
 const CONVERSATION_ID = "chat-1";
 const MEMBERS = ["user", "gera", "codex", "drew"];
 const NOW_FOR_LEGACY = "2026-07-13T12:00:00.000Z";
 const SQLITE_EXECUTABLE = resolveSqliteExecutable({ appPath: process.cwd() });
+
+test("a maximum-size artifact is written over stdin and signatures never embed its body", async () => {
+  const h = await harness();
+  try {
+    const content = "'".repeat(512 * 1024);
+    const created = expectPublished(expectOk(await h.service.create("gera", { conversationId: CONVERSATION_ID,
+      name: "Maximum payload", content, requiredSigners: ["user"] })));
+    assert.equal(created.version.content, content);
+    expectOk(await h.service.sign("user", { conversationId: CONVERSATION_ID, artifactId: created.summary.id,
+      versionEventId: created.version.versionEventId, contentHash: created.version.contentHash }));
+    const signatures = await h.store.listSignatures(created.summary.id);
+    assert.ok(Buffer.byteLength(JSON.stringify(signatures)) < 1024);
+    const reread = await attach(h.dbPath).store.getVersion(created.summary.id, 1);
+    assert.equal(reread?.contentHash, created.version.contentHash);
+    assert.equal(reread?.content, content);
+  } finally { await h.cleanup(); }
+});
 
 interface Harness {
   dbPath: string;
@@ -676,6 +695,68 @@ test("chat notes carry a stable-id link and never the artifact body", async () =
   }
 });
 
+test("every chat note the service writes reads as a timeline card", async () => {
+  const h = await harness();
+  try {
+    const created = expectPublished(expectOk(await h.service.create("gera", {
+      conversationId: CONVERSATION_ID,
+      name: "Memory plan",
+      content: "v1",
+      requiredSigners: ["user", "drew"]
+    })));
+    const id = created.summary.id;
+    expectOk(await h.service.revise("gera", { conversationId: CONVERSATION_ID, artifactId: id, baseVersion: 1, content: "v2",
+      note: "Choice rule: project knowledge — repo, private — memory" }));
+    expectOk(await h.service.revise("user", { conversationId: CONVERSATION_ID, artifactId: id, baseVersion: 2, content: "v3" }));
+    expectOk(await h.service.sign("user", { conversationId: CONVERSATION_ID, artifactId: id }));
+    expectOk(await h.service.sign("drew", { conversationId: CONVERSATION_ID, artifactId: id, version: 1 }));
+    expectOk(await h.service.rename("gera", { conversationId: CONVERSATION_ID, artifactId: id, newName: "Memory plan v2" }));
+    expectOk(await h.service.setArchived("user", { conversationId: CONVERSATION_ID, artifactId: id, archived: true }));
+    expectOk(await h.service.setArchived("gera", { conversationId: CONVERSATION_ID, artifactId: id, archived: false }));
+
+    assert.deepEqual(h.notes.map(parseArtifactNoteCard), [
+      { actor: "gera", action: "created", artifactId: id, label: "Memory plan", details: ["v1"] },
+      { actor: "gera", action: "revised", artifactId: id, label: "Memory plan", details: ["v2"],
+        note: "Choice rule: project knowledge — repo, private — memory" },
+      { actor: "user", action: "revised", artifactId: id, label: "Memory plan", details: ["v3"] },
+      { actor: "user", action: "signed", artifactId: id, label: "Memory plan", details: ["v3", "1/2 signed"] },
+      { actor: "drew", action: "signed", artifactId: id, label: "Memory plan", details: ["v1"] },
+      { actor: "gera", action: "renamed", artifactId: id, label: "Memory plan v2", details: ['was "Memory plan"'] },
+      { actor: "user", action: "archived", artifactId: id, label: "Memory plan v2", details: [] },
+      { actor: "gera", action: "restored", artifactId: id, label: "Memory plan v2", details: [] }
+    ]);
+    assert.equal(artifactNoteActorLabel("user"), "You");
+    assert.equal(artifactNoteActorLabel("assistant"), "Chat Assistant");
+    assert.equal(artifactNoteActorLabel("gera"), "@gera");
+    assert.equal(artifactNoteVerb("withdrew-draft"), "withdrew a draft");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("a note the card does not know stays a plain message", () => {
+  // Notes already in the User's chats use these exact sentences.
+  assert.deepEqual(parseArtifactNoteCard("@taylor revised [Память участников — план v1](#artifact:ab-1) · v4 — Правило выбора"), {
+    actor: "taylor", action: "revised", artifactId: "ab-1", label: "Память участников — план v1", details: ["v4"], note: "Правило выбора"
+  });
+  for (const text of [
+    "",
+    "Chat started.",
+    "@taylor revised the plan",
+    "@taylor revised [Plan](#artifact:ab-1)",
+    "@taylor revised [Plan](#artifact:ab-1) · v4 extra",
+    "@taylor deleted [Plan](#artifact:ab-1)",
+    "@taylor signed [Plan](https://example.com) v2",
+    "someone signed [Plan](#artifact:ab-1) v2",
+    // The service names the User "User"; a member cannot pass as her.
+    "@user signed [Plan](#artifact:ab-1) v2",
+    "@User revised [Plan](#artifact:ab-1) · v2"
+  ]) {
+    assert.equal(parseArtifactNoteCard(text), undefined, text);
+  }
+  assert.equal(parseArtifactNoteCard(undefined), undefined);
+});
+
 test("artifact reference tokens parse into artifact links (rename-safe by id)", () => {
   const labeled = parseMarkdownInline("See [Release Plan](#artifact:0b9f3d3a-1) for details.");
   const link = labeled.find((node) => node.type === "artifactLink");
@@ -836,6 +917,7 @@ test("collecting lifecycle enforces draft ACLs, blocks early publication, and pu
       conversationId: CONVERSATION_ID,
       artifactId: created.summary.id,
       content: "PUBLISHED-V1",
+      note: "Ship on Monday,\n  after the fix.",
       requiredSigners: ["gera", "codex", "drew"],
       sources: [
         { draftId: ownerSubmitted.id, disposition: "considered" },
@@ -848,6 +930,7 @@ test("collecting lifecycle enforces draft ACLs, blocks early publication, and pu
       conversationId: CONVERSATION_ID,
       artifactId: created.summary.id,
       content: "PUBLISHED-V1",
+      note: "Ship on Monday,\n  after the fix.",
       requiredSigners: ["gera", "codex", "drew"],
       sources: [
         { draftId: ownerSubmitted.id, disposition: "considered" },
@@ -864,10 +947,18 @@ test("collecting lifecycle enforces draft ACLs, blocks early publication, and pu
     assert.equal(published.sources?.length, 3);
     assert.equal(publishedRetry.version.version, 1);
     assert.equal(h.notes.filter((note) => note.includes(" published ")).length, 1);
+    // The publication's note carries the version's note, read back as the
+    // card's outcome; on one line, as a revision's.
+    const publishedNote = parseArtifactNoteCard(h.notes.find((note) => note.includes(" published "))!);
+    assert.deepEqual([publishedNote?.action, publishedNote?.details, publishedNote?.note], ["published", ["v1"], "Ship on Monday, after the fix."]);
     assert.ok(published.sources?.every((source) => /^[a-f0-9]{64}$/.test(source.contentHash)));
 
     const publicNotes = h.notes.join("\n");
     assert.ok(publicNotes.includes("submitted a draft"));
+    assert.deepEqual(
+      [...new Set(h.notes.map((note) => parseArtifactNoteCard(note)?.action ?? `unread: ${note}`))],
+      ["created-collection", "submitted-draft", "published"]
+    );
     for (const secret of ["OWNER-PRIVATE", "CODEX-PRIVATE", "DREW-PRIVATE"]) {
       assert.ok(!publicNotes.includes(secret), `public notes must not leak ${secret}`);
     }
@@ -1074,6 +1165,8 @@ test("replacement and withdrawal preserve frozen provenance and readiness", asyn
       assert.equal(afterWithdraw.readyToPublish, false);
       assert.deepEqual(afterWithdraw.missingRequiredAuthors, ["gera"]);
     }
+    assert.ok(h.notes.some((note) => parseArtifactNoteCard(note)?.action === "withdrew-draft"));
+    assert.ok(h.notes.every((note) => parseArtifactNoteCard(note)), "every note reads as a card");
   } finally {
     await h.cleanup();
   }
@@ -1251,6 +1344,7 @@ test("store guards reject stale-roster and post-publication draft writes", async
       operationId: "guard:submit"
     }));
     assert.equal((await h.store.getById(collecting.summary.id))?.updatedAt, submitted.updatedAt);
+    const beforePublish = (await h.store.getById(collecting.summary.id))!;
     expectOk(await h.service.publish("gera", {
       conversationId: CONVERSATION_ID,
       artifactId: collecting.summary.id,
@@ -1259,6 +1353,16 @@ test("store guards reject stale-roster and post-publication draft writes", async
       sources: [{ draftId: submitted.id, disposition: "considered" }],
       operationId: "guard:publish"
     }));
+    const sources = await h.store.listVersionSources(collecting.summary.id, 1);
+    const rejectedEventId = "guard:losing-publication";
+    assert.equal(await h.store.publishFirstVersion(beforePublish,
+      { artifactId: collecting.summary.id, version: 1, content: "losing v1", author: "gera", createdAt: submitted.updatedAt },
+      sources, [], operationForArtifact("guard:losing-publish", collecting.summary.id, "publish_v1", "losing"),
+      eventRecord(rejectedEventId, collecting.summary.id, "published", submitted.updatedAt)), false);
+    const residue = await runCommand(SQLITE_EXECUTABLE, [h.dbPath], {
+      input: `select count(*) from artifact_bound_sources where version_event_id = '${rejectedEventId}';`, primeLoginShellEnv: false
+    });
+    assert.equal(residue.stdout.trim(), "0");
     const lateDraft = draftRecord("guard-late", collecting.summary.id, "too late");
     assert.equal(
       await h.store.saveDraft(lateDraft, 0, updated.summary.draftRosterRevision, operationRecord("guard:save:late", lateDraft)),
@@ -1412,10 +1516,21 @@ test("legacy published artifacts migrate without changing v1 read or signing beh
         insert into artifact_versions values (
           'legacy-id', 1, 'legacy body', 'gera', null, '${NOW_FOR_LEGACY}'
         );
+        insert into artifact_signatures values ('legacy-id', 1, 'user', '${NOW_FOR_LEGACY}');
       `,
       primeLoginShellEnv: false
     });
+    await runCommand(SQLITE_EXECUTABLE, [dbPath], { input: `${ARTIFACT_REVISION_SCHEMA}
+      create trigger migration_disk_full before insert on artifact_bound_signatures begin select raise(abort, 'SQLITE_FULL'); end;`, primeLoginShellEnv: false });
     const migrated = attach(dbPath);
+    await assert.rejects(migrated.store.init(), error => error instanceof CommandError && /SQLITE_FULL/.test(error.result.stderr));
+    const legacyResult = JSON.stringify({ artifactId: "legacy-id", value: { lifecycle: "published", version: {
+      version: 1, content: "legacy body", author: "gera", createdAt: NOW_FOR_LEGACY, signatures: []
+    }, history: [] } });
+    await runCommand(SQLITE_EXECUTABLE, [dbPath], { input: `
+      drop trigger migration_disk_full;
+      insert into artifact_operations(conversation_id, artifact_id, actor, operation_kind, operation_id, request_hash, result_json, created_at, applied)
+        values ('${CONVERSATION_ID}', 'legacy-id', 'gera', 'publish_v1', 'legacy-publish', 'legacy-hash', '${legacyResult}', '${NOW_FOR_LEGACY}', 1);`, primeLoginShellEnv: false });
     const read = expectPublished(expectOk(await migrated.service.read("user", {
       conversationId: CONVERSATION_ID,
       artifactId: "legacy-id"
@@ -1423,11 +1538,21 @@ test("legacy published artifacts migrate without changing v1 read or signing beh
     assert.equal(read.summary.lifecycle, "published");
     assert.equal(read.summary.headVersion, 1);
     assert.equal(read.version.content, "legacy body");
+    assert.equal(read.version.signatures[0].signedAt, NOW_FOR_LEGACY);
+    assert.equal(read.version.signatures[0].versionEventId, read.version.versionEventId);
+    assert.equal(read.version.signatures[0].contentHash, read.version.contentHash);
+    const replay = await migrated.store.getOperation(CONVERSATION_ID, "gera", "publish_v1", "legacy-publish");
+    assert.equal(JSON.parse(replay!.resultJson).value.version.versionEventId, read.version.versionEventId);
+    assert.equal(JSON.parse(replay!.resultJson).value.version.contentHash, read.version.contentHash);
     const signed = expectOk(await migrated.service.sign("user", {
       conversationId: CONVERSATION_ID,
       artifactId: "legacy-id"
     }));
     assert.equal(signed.approval.state, "approved");
+    await assert.rejects(runCommand(SQLITE_EXECUTABLE, ["-bail", dbPath], {
+      input: `insert into artifact_versions values ('legacy-id', 2, 'old app write', 'gera', null, '${NOW_FOR_LEGACY}');`,
+      primeLoginShellEnv: false
+    }), error => error instanceof CommandError && /upgrade AccordAgents/.test(error.result.stderr));
     await new ArtifactStore(dbPath, SQLITE_EXECUTABLE).init();
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -1747,6 +1872,152 @@ test("selected readers can inspect editing drafts while unselected members canno
   }
 });
 
+test("a required author cannot read other drafts until their own draft is submitted, so authors can draft in parallel", async () => {
+  const h = await harness();
+  try {
+    const collecting = expectOk(await h.service.create("gera", {
+      conversationId: CONVERSATION_ID,
+      name: "Parallel drafts",
+      initialState: "collecting_drafts",
+      allowedDraftAuthors: ["gera", "codex", "drew"],
+      requiredDraftAuthors: ["gera", "codex", "drew"],
+      audiencePolicyByAuthor: {
+        gera: { allowedReaders: [], requiredReaders: [] },
+        codex: { allowedReaders: ["gera"], requiredReaders: ["gera"] },
+        drew: { allowedReaders: ["gera"], requiredReaders: ["gera"] }
+      },
+      operationId: "parallel:create"
+    }));
+    const artifactId = collecting.summary.id;
+    const ref = { conversationId: CONVERSATION_ID, artifactId };
+    const codexEditing = expectOk(await h.service.saveDraft("codex", {
+      ...ref,
+      expectedEditRevision: 0,
+      content: "CODEX-PARALLEL",
+      readers: ["gera"],
+      operationId: "parallel:codex:save"
+    }));
+    const codexSubmitted = expectOk(await h.service.submitDraft("codex", {
+      ...ref,
+      draftId: codexEditing.id,
+      expectedEditRevision: codexEditing.editRevision,
+      operationId: "parallel:codex:submit"
+    }));
+    const drewEditing = expectOk(await h.service.saveDraft("drew", {
+      ...ref,
+      expectedEditRevision: 0,
+      content: "DREW-IN-PROGRESS",
+      readers: ["gera"],
+      operationId: "parallel:drew:save"
+    }));
+
+    for (const draftId of [codexSubmitted.id, drewEditing.id]) {
+      const denied = expectError(await h.service.readDraft("gera", { ...ref, draftId }), "access_denied");
+      assert.equal(denied.message, SUBMIT_OWN_DRAFT_FIRST_MESSAGE);
+    }
+    const listedBefore = expectOk(await h.service.listDrafts("gera", ref));
+    assert.deepEqual(listedBefore.map((draft) => [draft.author, draft.hasContent]), [["codex", false], ["drew", false]]);
+    const readBefore = expectOk(await h.service.read("gera", ref));
+    assert.equal(readBefore.lifecycle, "collecting_drafts");
+    assert.deepEqual(readBefore.lifecycle === "collecting_drafts" ? readBefore.drafts.map((draft) => draft.hasContent) : [], [false, false]);
+    for (const view of [listedBefore, readBefore]) {
+      assert.ok(!JSON.stringify(view).includes("CODEX-PARALLEL") && !JSON.stringify(view).includes("DREW-IN-PROGRESS"));
+    }
+    assert.equal(expectOk(await h.service.readDraft("user", { ...ref, draftId: codexSubmitted.id })).content, "CODEX-PARALLEL",
+      "User always reads every draft");
+
+    const geraEditing = expectOk(await h.service.saveDraft("gera", {
+      ...ref,
+      expectedEditRevision: 0,
+      content: "GERA-OWN",
+      readers: [],
+      operationId: "parallel:gera:save"
+    }));
+    expectError(await h.service.readDraft("gera", { ...ref, draftId: codexSubmitted.id }), "access_denied");
+    assert.equal(expectOk(await h.service.readDraft("gera", { ...ref, draftId: geraEditing.id })).content, "GERA-OWN",
+      "an author always reads their own work in progress");
+
+    const geraSubmitted = expectOk(await h.service.submitDraft("gera", {
+      ...ref,
+      draftId: geraEditing.id,
+      expectedEditRevision: geraEditing.editRevision,
+      operationId: "parallel:gera:submit"
+    }));
+    assert.equal(expectOk(await h.service.readDraft("gera", { ...ref, draftId: codexSubmitted.id })).content, "CODEX-PARALLEL");
+    assert.equal(expectOk(await h.service.readDraft("gera", { ...ref, draftId: drewEditing.id })).content, "DREW-IN-PROGRESS");
+    const listedAfter = expectOk(await h.service.listDrafts("gera", ref));
+    assert.ok(listedAfter.every((draft) => draft.hasContent));
+    const readAfter = expectOk(await h.service.read("gera", ref));
+    const codexView = readAfter.lifecycle === "collecting_drafts" ? readAfter.drafts.find((draft) => draft.id === codexSubmitted.id) : undefined;
+    assert.equal(codexView && "content" in codexView ? codexView.content : undefined, "CODEX-PARALLEL");
+
+    expectOk(await h.service.withdrawDraft("gera", { ...ref, draftId: geraSubmitted.id, operationId: "parallel:gera:withdraw" }));
+    assert.equal(expectOk(await h.service.readDraft("gera", { ...ref, draftId: codexSubmitted.id })).content, "CODEX-PARALLEL",
+      "a withdrawn draft was still submitted unseen first");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("only required authors are held back, and a held-back owner cannot drop themselves from the roster to read", async () => {
+  const h = await harness();
+  try {
+    const collecting = expectOk(await h.service.create("gera", {
+      conversationId: CONVERSATION_ID,
+      name: "Roster gate",
+      initialState: "collecting_drafts",
+      allowedDraftAuthors: ["gera", "codex", "drew"],
+      requiredDraftAuthors: ["gera", "codex"],
+      audiencePolicyByAuthor: {
+        gera: { allowedReaders: [], requiredReaders: [] },
+        codex: { allowedReaders: ["gera", "drew"], requiredReaders: ["gera"] },
+        drew: { allowedReaders: [], requiredReaders: [] }
+      },
+      operationId: "roster-gate:create"
+    }));
+    const ref = { conversationId: CONVERSATION_ID, artifactId: collecting.summary.id };
+    const codexEditing = expectOk(await h.service.saveDraft("codex", {
+      ...ref,
+      expectedEditRevision: 0,
+      content: "CODEX-BODY",
+      readers: ["gera", "drew"],
+      operationId: "roster-gate:codex:save"
+    }));
+    const codexSubmitted = expectOk(await h.service.submitDraft("codex", {
+      ...ref,
+      draftId: codexEditing.id,
+      expectedEditRevision: codexEditing.editRevision,
+      operationId: "roster-gate:codex:submit"
+    }));
+    assert.equal(expectOk(await h.service.readDraft("drew", { ...ref, draftId: codexSubmitted.id })).content, "CODEX-BODY",
+      "an optional author is never locked out");
+    expectError(await h.service.readDraft("gera", { ...ref, draftId: codexSubmitted.id }), "access_denied");
+
+    const selfRemoval = {
+      ...ref,
+      expectedDraftRosterRevision: collecting.summary.draftRosterRevision,
+      allowedDraftAuthors: ["gera", "codex", "drew"],
+      requiredDraftAuthors: ["codex"],
+      audiencePolicyByAuthor: {
+        gera: { allowedReaders: [], requiredReaders: [] },
+        codex: { allowedReaders: ["gera", "drew"], requiredReaders: ["gera"] },
+        drew: { allowedReaders: [], requiredReaders: [] }
+      }
+    };
+    assert.match(expectError(await h.service.updateDraftRoster("gera", {
+      ...selfRemoval,
+      operationId: "roster-gate:self-removal"
+    }), "access_denied").message, /Submit your own draft before removing yourself/);
+    expectError(await h.service.readDraft("gera", { ...ref, draftId: codexSubmitted.id }), "access_denied");
+
+    expectOk(await h.service.updateDraftRoster("user", { ...selfRemoval, operationId: "roster-gate:user-change" }));
+    assert.equal(expectOk(await h.service.readDraft("gera", { ...ref, draftId: codexSubmitted.id })).content, "CODEX-BODY",
+      "User may still change who must write");
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("delayed operation retries return immutable original responses after state advances", async () => {
   const h = await harness();
   try {
@@ -2013,3 +2284,54 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
   return { promise: new Promise<T>((done) => { resolve = done; }), resolve };
 }
+
+test("usage signals: a document for several signers is started, and signed only when all sign its newest version", async () => {
+  const h = await harness();
+  try {
+    assert.deepEqual(await h.store.multiSignerDocumentStatus(), { started: false, signed: false });
+    expectOk(await h.service.create("gera", { conversationId: CONVERSATION_ID, name: "Solo drafts", initialState: "collecting_drafts",
+      allowedDraftAuthors: ["gera"], requiredDraftAuthors: ["gera"], audiencePolicyByAuthor: { gera: { allowedReaders: [], requiredReaders: [] } },
+      operationId: "usage:solo-drafts" }));
+    const solo = expectPublished(expectOk(await h.service.create("gera", { conversationId: CONVERSATION_ID,
+      name: "One signer", content: "solo", requiredSigners: ["user"] })));
+    expectOk(await h.service.sign("user", { conversationId: CONVERSATION_ID, artifactId: solo.summary.id,
+      versionEventId: solo.version.versionEventId, contentHash: solo.version.contentHash }));
+    assert.deepEqual(await h.store.multiSignerDocumentStatus(), { started: false, signed: false }, "a one-signer document does not count");
+
+    const shared = expectPublished(expectOk(await h.service.create("gera", { conversationId: CONVERSATION_ID,
+      name: "Resolution", content: "v1", requiredSigners: ["gera", "drew"] })));
+    assert.deepEqual(await h.store.multiSignerDocumentStatus(), { started: true, signed: false });
+    const sign = async (actor: string, version: PublishedArtifactReadResult["version"]) => expectOk(await h.service.sign(actor, {
+      conversationId: CONVERSATION_ID, artifactId: shared.summary.id, versionEventId: version.versionEventId, contentHash: version.contentHash }));
+    await sign("gera", shared.version);
+    assert.deepEqual(await h.store.multiSignerDocumentStatus(), { started: true, signed: false });
+    await sign("drew", shared.version);
+    assert.deepEqual(await h.store.multiSignerDocumentStatus(), { started: true, signed: true });
+
+    // A newer version: the signatures on the old one no longer count.
+    const revised = expectPublished(expectOk(await h.service.revise("gera", { conversationId: CONVERSATION_ID,
+      artifactId: shared.summary.id, baseVersion: 1, content: "v2" })));
+    assert.deepEqual(await h.store.multiSignerDocumentStatus(), { started: true, signed: false });
+    await sign("gera", revised.version);
+    assert.deepEqual(await h.store.multiSignerDocumentStatus(), { started: true, signed: false });
+    await sign("drew", revised.version);
+    assert.deepEqual(await h.store.multiSignerDocumentStatus(), { started: true, signed: true });
+
+    // Drafts for several authors start one too, before anything is signed.
+    const other = await harness();
+    try {
+      expectOk(await other.service.create("gera", { conversationId: CONVERSATION_ID, name: "Collecting", initialState: "collecting_drafts",
+        contributors: ["drew"], allowedDraftAuthors: ["gera", "drew"], requiredDraftAuthors: ["gera", "drew"],
+        audiencePolicyByAuthor: { gera: { allowedReaders: [], requiredReaders: [] }, drew: { allowedReaders: ["gera"], requiredReaders: ["gera"] } },
+        operationId: "usage:collecting" }));
+      assert.deepEqual(await other.store.multiSignerDocumentStatus(), { started: true, signed: false });
+    } finally { await other.cleanup(); }
+
+    // Counted from a moment after all of that (a copy of older documents):
+    // neither is new. A draft for several authors made since then is.
+    const later = new Date(Date.now() + 60_000).toISOString();
+    assert.deepEqual(await h.store.multiSignerDocumentStatus(later), { started: false, signed: false });
+    const before = new Date(Date.now() - 60 * 60_000).toISOString();
+    assert.deepEqual(await h.store.multiSignerDocumentStatus(before), { started: true, signed: true });
+  } finally { await h.cleanup(); }
+});
